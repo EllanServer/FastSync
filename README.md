@@ -32,24 +32,9 @@ FastSync 需要以下外部服务：
 
 ### 2. 安装后端插件（Paper / Folia）
 
-从 `build/libs/` 复制以下文件到 **每个 Paper/Folia 服务端的 `plugins/` 目录**：
+把 `build/libs/FastSync-1.0.0.jar` 放到 **每个 Paper/Folia 服务端的 `plugins/` 目录** 即可。
 
-```
-FastSync-1.0.0.jar
-lib/
-├── HikariCP-5.1.0.jar
-├── caffeine-3.2.3.jar
-├── lettuce-core-6.4.0.RELEASE.jar
-├── lz4-java-1.8.0.jar
-├── mysql-connector-j-9.0.0.jar
-├── reactive-streams-1.0.4.jar
-├── sparrow-nbt-0.18.8.jar
-├── sparrow-redis-message-broker-0.0.7.jar
-├── sparrow-yaml-1.0.7.jar
-└── ...（其他运行时依赖）
-```
-
-运行时依赖放在 `lib/` 目录下，`FastSync-1.0.0.jar` 的 MANIFEST 已配置 `Class-Path`，无需 shade 或重定位。插件 jar 的 manifest 同时声明了 `paperweight-mappings-namespace: mojang`，因此 Paper 1.20.5+ 会跳过 `PluginRemapper`，`lib/` 目录中的依赖类可以正常加载。
+Sparrow 系列库（不在 Maven Central）已经 shade 进了 jar 里；HikariCP、Lettuce、Caffeine、MySQL 驱动等 Maven Central 依赖会在首次启动时由 Paper 自动下载。无需手动复制任何 `lib/` 目录。
 
 ### 3. 安装 Velocity 代理插件（可选）
 
@@ -110,9 +95,8 @@ git submodule update --init --recursive
 
 产物位于 `build/libs/`：
 
-- `FastSync-1.0.0.jar`：Paper/Folia 后端插件
+- `FastSync-1.0.0.jar`：Paper/Folia 后端插件（Sparrow 已 shade，Maven Central 依赖自动下载）
 - `FastSync-Proxy-1.0.0.jar`：Velocity 代理插件
-- `lib/` 目录下的 jar：运行时依赖，需要随 `FastSync-1.0.0.jar` 一起复制到服务端的 `plugins/` 目录
 
 ## 常见问题
 

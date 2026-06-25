@@ -1,14 +1,9 @@
-import java.io.File
-import java.io.FileOutputStream
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
-import java.util.jar.JarFile
-import java.util.jar.JarOutputStream
-import java.util.zip.ZipEntry
 import org.gradle.api.file.DuplicatesStrategy
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 
 plugins {
     java
+    id("com.gradleup.shadow") version "8.3.5"
 }
 
 repositories {
@@ -29,17 +24,14 @@ val paperVersion: String = property("paper.version") as String
 // Dependencies
 // =============================================================================
 //
-// Pattern: NO shade. The JAR is built with the runtime classpath, but
-// those classes are NOT bundled inside the JAR. Instead, the runtime
-// artifacts are copied to build/libs/ via the `copyRuntimeLibs` task.
-// Paper's plugin loader picks up the lib/ folder automatically.
-//
-// The JAR manifest declares `paperweight-mappings-namespace: mojang`, so
-// Paper 1.20.5+ skips its plugin remapper and the Class-Path manifest
-// resolves correctly against lib/.
-//
-// This avoids relocation conflicts when multiple plugins depend on
-// different versions of the same library.
+// Strategy:
+//   - Sparrow libraries (not on Maven Central) → implementation, shaded into
+//     the JAR by the shadowJar task. No relocation needed since FastSync is
+//     the only consumer.
+//   - Maven Central libraries (HikariCP, Lettuce, Caffeine, etc.) → compileOnly
+//     for compilation; declared in plugin.yml `libraries:` so Paper downloads
+//     them automatically at startup.
+//   - Paper API → compileOnly (provided by the server).
 // =============================================================================
 dependencies {
     // Compile-only: provided by Paper/Folia at runtime
@@ -54,19 +46,17 @@ dependencies {
     compileOnly("io.netty:netty-codec:4.1.115.Final")
     compileOnly("io.netty:netty-resolver:4.1.115.Final")
 
-    // Implementation: these classes are referenced from main code, so they
-    // must be on compileClasspath. The `jar` task excludes them from the
-    // main JAR and the `copyRuntimeLibs` task copies them to a `lib/`
-    // folder next to the main JAR, which is Paper's standard dependency
-    // pattern (no shade, no relocation).
-    implementation("com.zaxxer:HikariCP:5.1.0")
-    implementation("org.lz4:lz4-java:1.8.0")
-    implementation("com.mysql:mysql-connector-j:9.0.0")
-    implementation("io.lettuce:lettuce-core:6.4.0.RELEASE")
-    implementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
-    implementation("org.reactivestreams:reactive-streams:1.0.4")
-    // Sparrow libraries ship with FastSync in the lib/ folder. They are not
-    // part of a vanilla Paper server, so they must be runtime dependencies.
+    // Maven Central runtime deps: compileOnly because Paper will download them
+    // via plugin.yml `libraries:` at startup.
+    compileOnly("com.zaxxer:HikariCP:5.1.0")
+    compileOnly("org.lz4:lz4-java:1.8.0")
+    compileOnly("com.mysql:mysql-connector-j:9.0.0")
+    compileOnly("io.lettuce:lettuce-core:6.4.0.RELEASE")
+    compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.3")
+    compileOnly("org.reactivestreams:reactive-streams:1.0.4")
+
+    // Sparrow libraries: shaded into the JAR (not on Maven Central, so Paper
+    // cannot auto-download them).
     implementation("net.momirealms:sparrow-nbt:0.18.8")
     implementation("net.momirealms:sparrow-yaml:1.0.7")
     implementation("net.momirealms:sparrow-redis-message-broker:0.0.7")
@@ -82,9 +72,14 @@ dependencies {
     testImplementation("org.mockito:mockito-junit-jupiter:5.12.0")
     testImplementation("org.openjdk.jmh:jmh-core:1.37")
     testImplementation("org.openjdk.jmh:jmh-generator-annprocess:1.37")
-    // Paper API must be on the test *runtime* classpath too, because
-    // production classes loaded by tests reference Bukkit/Paper classes.
+    // Paper API + Maven Central runtime deps needed at test runtime.
     testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
+    testImplementation("com.zaxxer:HikariCP:5.1.0")
+    testImplementation("org.lz4:lz4-java:1.8.0")
+    testImplementation("com.mysql:mysql-connector-j:9.0.0")
+    testImplementation("io.lettuce:lettuce-core:6.4.0.RELEASE")
+    testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
+    testImplementation("org.reactivestreams:reactive-streams:1.0.4")
 }
 
 java {
@@ -114,29 +109,18 @@ tasks.withType<Test>().configureEach {
 // =============================================================================
 // Task groups: ci / build / test
 // =============================================================================
-//
-//   ./gradlew test           - run unit + integration tests
-//   ./gradlew build          - compile + test + assemble (both JARs + libs)
-//   ./gradlew ci             - clean + build + verify (full CI pipeline)
-//
-// Visible via `./gradlew tasks --group=ci`, `--group=build`, `--group=test`.
-// =============================================================================
 
-// `build` task: keep Gradle's default assemble + test, ensure velocityJar
-// is included and copyRuntimeLibs runs at assemble time.
 tasks.named("build") {
     group = "build"
-    description = "Compiles, tests, and assembles both Paper/Folia and Velocity JARs + lib/."
+    description = "Compiles, tests, and assembles both Paper/Folia and Velocity JARs."
 }
 
-// `ci` task: full pipeline for CI systems (GitHub Actions, Jenkins, etc.)
 val ci = tasks.register("ci") {
     group = "ci"
     description = "Full CI pipeline: clean, build, and test."
     dependsOn("clean", "build", "check")
 }
 
-// `testGroup`: explicit alias in the `test` group for clarity in CI logs
 val testGroup = tasks.register("testGroup") {
     group = "test"
     description = "Runs unit and integration tests (alias for the standard 'test' task)."
@@ -146,10 +130,6 @@ val testGroup = tasks.register("testGroup") {
 // =============================================================================
 // Velocity proxy module (custom source set + jar task)
 // =============================================================================
-// `runtimeOnly` is also non-resolvable by design (it's consumed at runtime,
-// not at compile time). The source set's compile classpath already extends
-// from `main` and inherits its `compileOnly` dependencies automatically, so we
-// only need to add the main source set's compiled output here.
 sourceSets {
     create("velocity") {
         java {
@@ -158,29 +138,16 @@ sourceSets {
         resources {
             srcDir("src/velocity/resources")
         }
-        // Pull `compileOnly` deps from the main configuration into the velocity
-        // source set's compile classpath. We use `get()` (lazy) and
-        // `incoming.resolutionResult` to avoid resolving the non-resolvable
-        // `compileOnly` configuration directly.
         compileClasspath += sourceSets["main"].output
         runtimeClasspath += sourceSets["main"].output
     }
 }
 
-// `processVelocityResources` inherits the main source set's output by default
-// (which carries `plugin.yml`). The main source set is rebuilt every time, so
-// the same `plugin.yml` shows up as a duplicate in the velocity resource
-// destination. Exclude it here — the Paper plugin descriptor is consumed only
-// by the main `jar` task.
 tasks.named<Copy>("processVelocityResources") {
     exclude("plugin.yml")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-// Surface `compileOnly` (which holds `velocity-api`, `slf4j-api`, `netty-*`,
-// `sparrow-*`) to the velocity source set's compile classpath. The dependency
-// `velocityOnly` block is consumed by the velocity source set's `velocityCompileClasspath`
-// configuration but never enters the main compile classpath.
 val velocityOnly by configurations.creating
 dependencies {
     add("velocityOnly", "com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
@@ -193,8 +160,6 @@ dependencies {
 }
 sourceSets["velocity"].compileClasspath += velocityOnly
 
-// Manually register the velocityJar task (Gradle's auto-jar is only created
-// for source sets that exist at the time the `java` plugin is applied).
 val velocityJar = tasks.register<Jar>("velocityJar") {
     group = "build"
     description = "Packages the Velocity proxy plugin JAR."
@@ -211,107 +176,50 @@ val velocityJar = tasks.register<Jar>("velocityJar") {
 }
 
 // =============================================================================
-// Main JAR: Paper/Folia backend plugin (NO shade — lib/ folder pattern)
+// Main JAR: Paper/Folia backend plugin
 // =============================================================================
-val generateClasspathListing = tasks.register("generateClasspathListing") {
+// Sparrow libraries are shaded into this JAR (no relocation). Maven Central
+// dependencies are declared in plugin.yml `libraries:` and auto-downloaded by
+// Paper at startup. The manifest declares `paperweight-mappings-namespace:
+// mojang` so Paper skips its PluginRemapper.
+tasks.named<ShadowJar>("shadowJar") {
     group = "build"
-    description = "Builds a Class-Path manifest string from the copied runtime libs."
-    val outFile = layout.buildDirectory.file("classpath.txt")
-    outputs.file(outFile)
-    dependsOn("copyRuntimeLibs")
-    doLast {
-        val libsDir = layout.buildDirectory.dir("libs").get().asFile
-        val libNames = libsDir.listFiles { f -> f.isFile && f.name.endsWith(".jar") }
-            ?.filter { it.name != "FastSync-${project.version}.jar" && it.name != "FastSync-Proxy-${project.version}.jar" }
-            ?.sortedBy { it.name }
-            ?.joinToString(" ") { "lib/${it.name}" }
-            ?: ""
-        outFile.get().asFile.writeText(libNames)
-    }
-}
-
-tasks.jar {
-    group = "build"
-    description = "Packages the Paper/Folia backend plugin JAR (no shade — uses lib/ folder)."
+    description = "Packages the Paper/Folia backend plugin JAR with Sparrow libraries shaded in."
     archiveBaseName.set("FastSync")
     archiveVersion.set(version.toString())
-    dependsOn(generateClasspathListing)
+    archiveClassifier.set("")
 
-    // Strip META-INF signatures that get rejected on reload
+    // Only shade Sparrow libraries; exclude everything else that might leak
+    // into runtimeClasspath (e.g. transitive deps of Sparrow that are also on
+    // Maven Central and declared in plugin.yml libraries).
+    dependencies {
+        include(dependency("net.momirealms:sparrow-nbt:"))
+        include(dependency("net.momirealms:sparrow-yaml:"))
+        include(dependency("net.momirealms:sparrow-redis-message-broker:"))
+    }
+
+    // Strip META-INF signatures and duplicate metadata
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",
             "META-INF/maven/**", "META-INF/LICENSE*", "META-INF/NOTICE*")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
     manifest {
         attributes(
             "Implementation-Title" to "FastSync",
             "Implementation-Version" to project.version.toString(),
             "Multi-Release" to "true",
-            // Tell Paper 1.20.5+ that this plugin is already Mojang-mapped,
-            // so it skips the PluginRemapper. This keeps the Class-Path
-            // manifest valid relative to the plugin jar.
             "paperweight-mappings-namespace" to "mojang"
         )
     }
-
-    // After the JAR is built, inject the Class-Path entry that points at
-    // the lib/ folder. We read the listing from generateClasspathListing
-    // and update the manifest in-place using the standard Java JAR API.
-    doLast {
-        val classpath = generateClasspathListing.get().outputs.files.singleFile.readText()
-        val manifestFile = archiveFile.get().asFile
-        if (classpath.isBlank()) return@doLast
-
-        val originalManifest = JarFile(manifestFile).use { it.manifest }
-        originalManifest.mainAttributes.putValue("Class-Path", classpath)
-
-        val tmp = File(manifestFile.parentFile, manifestFile.name + ".tmp")
-        JarFile(manifestFile).use { src ->
-            JarOutputStream(FileOutputStream(tmp), originalManifest).use { dst ->
-                val entries = src.entries()
-                while (entries.hasMoreElements()) {
-                    val entry = entries.nextElement()
-                    if (entry.name == "META-INF/MANIFEST.MF") continue
-                    dst.putNextEntry(ZipEntry(entry.name))
-                    src.getInputStream(entry).use { input ->
-                        input.copyTo(dst)
-                    }
-                    dst.closeEntry()
-                }
-            }
-        }
-        Files.move(tmp.toPath(), manifestFile.toPath(),
-            StandardCopyOption.REPLACE_EXISTING)
-    }
 }
 
-// =============================================================================
-// Copy runtime dependencies to build/libs (for distribution convenience)
-// =============================================================================
-val copyRuntimeLibs = tasks.register<Copy>("copyRuntimeLibs") {
-    group = "build"
-    description = "Copies runtime dependencies to build/libs for distribution."
-    from(configurations.runtimeClasspath)
-    into(layout.buildDirectory.dir("libs"))
-    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
-    duplicatesStrategy = DuplicatesStrategy.INCLUDE
-
-    // Composite builds (Sparrow submodules) may produce jars with identical
-    // base filenames (e.g. core.jar). Rename duplicates so both make it into
-    // the lib/ folder and the Class-Path manifest.
-    val seen = mutableSetOf<String>()
-    eachFile {
-        var newName = name
-        var counter = 1
-        while (!seen.add(newName)) {
-            newName = name.removeSuffix(".jar") + "-$counter.jar"
-            counter++
-        }
-        name = newName
-    }
+// Disable the plain jar task — shadowJar is the main artifact.
+tasks.named("jar") {
+    enabled = false
 }
 
 tasks.named("assemble") {
-    dependsOn(velocityJar, copyRuntimeLibs)
+    dependsOn("shadowJar", velocityJar)
 }
 
 tasks.named("check") {

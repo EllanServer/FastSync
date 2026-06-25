@@ -46,20 +46,12 @@ jobs:
       - name: Prepare E2E plugins directory
         run: |
           rm -rf e2e/plugins
-          mkdir -p e2e/plugins/lib
+          mkdir -p e2e/plugins
+          # Single JAR: Sparrow libs are shaded in, Maven Central deps are
+          # auto-downloaded by Paper via plugin.yml libraries.
           cp build/libs/FastSync-1.0.0.jar e2e/plugins/
-          for jar in build/libs/*.jar; do
-            name="$(basename "$jar")"
-            if [[ "$name" != "FastSync-1.0.0.jar" && "$name" != "FastSync-Proxy-1.0.0.jar" ]]; then
-              cp "$jar" e2e/plugins/lib/
-            fi
-          done
-          # The itzg/minecraft-server container runs as uid 1000 and needs
-          # write access to /data/plugins for Paper's .paper-remapped cache
-          # (for any remaining Spigot-mapped plugins or server internals).
           chmod -R 777 e2e/plugins
           echo "Plugin: $(ls -1 e2e/plugins)"
-          echo "Runtime libs: $(ls -1 e2e/plugins/lib | wc -l)"
 
       - name: Start Paper E2E environment
         run: |
