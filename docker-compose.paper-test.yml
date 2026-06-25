@@ -75,6 +75,8 @@ services:
       # Paper 1.21.4 needs to write the .paper-remapped cache under
       # /data/plugins, so this bind mount must be read-write.
       - ./e2e/plugins:/data/plugins
+      # Per-server FastSync config (server-name, DB/Redis hosts, etc.)
+      - ./e2e/server-a:/data/plugins/FastSync
       - paper-a-data:/data
     stdin_open: true
     tty: true
@@ -108,6 +110,8 @@ services:
     volumes:
       # Must be read-write so Paper can create the .paper-remapped cache.
       - ./e2e/plugins:/data/plugins
+      # Per-server FastSync config (server-name, DB/Redis hosts, etc.)
+      - ./e2e/server-b:/data/plugins/FastSync
       - paper-b-data:/data
     stdin_open: true
     tty: true
