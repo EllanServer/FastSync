@@ -32,21 +32,12 @@ FastSync 需要以下外部服务：
 
 ### 2. 安装后端插件（Paper / Folia）
 
-从 `build/libs/` 复制以下文件到 **每个 Paper/Folia 服务端的 `plugins/` 目录**：
+推荐把 `build/libs/FastSync-All-1.0.0.jar` 放到 **每个 Paper/Folia 服务端的 `plugins/` 目录** 即可。这是一个 fat jar，已经把 HikariCP、MySQL 驱动、Lettuce、LZ4、Caffeine、Sparrow 等运行时依赖全部打包（无 shade / 无 relocation）， Paper 启动时无需额外下载。
 
-```
-FastSync-1.0.0.jar
-lib/
-├── HikariCP-5.1.0.jar
-├── lz4-java-1.8.0.jar
-├── mysql-connector-j-9.0.0.jar
-├── lettuce-core-6.4.0.RELEASE.jar
-├── caffeine-3.2.3.jar
-├── reactive-streams-1.0.4.jar
-└── ...（其他运行时依赖）
-```
-
-运行时依赖放在 `lib/` 目录下，`FastSync-1.0.0.jar` 的 MANIFEST 已配置 `Class-Path`，无需 shade 或重定位。如果目录结构不一致，Paper 可能找不到依赖。
+> **为什么不能只用 `FastSync-1.0.0.jar` + `lib/` 目录？**
+> Paper 的 `PluginRemapper` 会把插件 jar 复制到 `.paper-remapped/` 并忽略原 jar 的 `Class-Path` manifest，导致 `lib/` 目录中的依赖类加载失败。因此生产环境建议直接上 `FastSync-All-1.0.0.jar`。
+>
+> 如果你确实不想用 fat jar，可以让 Paper 通过 `plugin.yml` 的 `libraries:` 自动下载 Maven Central 上的依赖（HikariCP、Lettuce、Caffeine 等），但 **Sparrow 系列库不在公开仓库**，仍需要手动放到 classpath 中。
 
 ### 3. 安装 Velocity 代理插件（可选）
 
@@ -107,7 +98,8 @@ git submodule update --init --recursive
 
 产物位于 `build/libs/`：
 
-- `FastSync-1.0.0.jar`：Paper/Folia 后端插件
+- `FastSync-All-1.0.0.jar`：**推荐**，Paper/Folia 后端插件（fat jar，包含全部运行时依赖）
+- `FastSync-1.0.0.jar`：Paper/Folia 后端插件（不包含依赖，需要自行提供 classpath）
 - `FastSync-Proxy-1.0.0.jar`：Velocity 代理插件
 
 ## 常见问题
