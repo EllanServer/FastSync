@@ -78,6 +78,13 @@ dependencies {
     // ConfigManager (and other production classes loaded by tests) reference
     // JavaPlugin directly. testCompileOnly caused ClassNotFoundException at test time.
     testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
+    // Sparrow libraries are compileOnly at runtime (provided by Paper), but tests
+    // load production classes that reference them directly, so they must also be
+    // on the test runtime classpath. Composite builds resolve these to the local
+    // sparrow submodules.
+    testImplementation("net.momirealms:sparrow-nbt:0.18.8")
+    testImplementation("net.momirealms:sparrow-yaml:1.0.7")
+    testImplementation("net.momirealms:sparrow-redis-message-broker:0.0.7")
 }
 
 java {
