@@ -106,7 +106,7 @@ services:
       JAVA_TOOL_OPTIONS: "-Dpaper.disable-plugin-rewriting=true"
     ports:
       - "25566:25565"
-      - "25576:25575"
+      - "25576:25576"
     volumes:
       # Must be read-write so Paper can create the .paper-remapped cache.
       - ./e2e/plugins:/data/plugins
