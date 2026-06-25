@@ -67,7 +67,7 @@ services:
       OPS: ""
       # Disable Paper's plugin remapping so the Class-Path manifest in
       # FastSync.jar resolves relative to the plugin jar (not .paper-remapped).
-      JVM_OPTS: "-Dpaper.disable-plugin-rewriting=true"
+      JAVA_TOOL_OPTIONS: "-Dpaper.disable-plugin-rewriting=true"
     ports:
       - "25565:25565"
       - "25575:25575"
@@ -99,10 +99,12 @@ services:
       MAX_PLAYERS: "10"
       MOTD: "FastSync Test Server B"
       OPS: ""
-      JVM_OPTS: "-Dpaper.disable-plugin-rewriting=true"
+      # Disable Paper's plugin remapping so the Class-Path manifest in
+      # FastSync.jar resolves relative to the plugin jar (not .paper-remapped).
+      JAVA_TOOL_OPTIONS: "-Dpaper.disable-plugin-rewriting=true"
     ports:
       - "25566:25565"
-      - "25576:25576"
+      - "25576:25575"
     volumes:
       # Must be read-write so Paper can create the .paper-remapped cache.
       - ./e2e/plugins:/data/plugins
