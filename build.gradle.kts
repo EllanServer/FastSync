@@ -46,10 +46,6 @@ dependencies {
     compileOnly("io.netty:netty-buffer:4.1.115.Final")
     compileOnly("io.netty:netty-codec:4.1.115.Final")
     compileOnly("io.netty:netty-resolver:4.1.115.Final")
-    // sparrow is provided by Paper (NBT, YAML, and Redis message broker)
-    compileOnly("net.momirealms:sparrow-nbt:0.18.8")
-    compileOnly("net.momirealms:sparrow-yaml:1.0.7")
-    compileOnly("net.momirealms:sparrow-redis-message-broker:0.0.7")
 
     // Implementation: these classes are referenced from main code, so they
     // must be on compileClasspath. The `jar` task excludes them from the
@@ -62,6 +58,11 @@ dependencies {
     implementation("io.lettuce:lettuce-core:6.4.0.RELEASE")
     implementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
     implementation("org.reactivestreams:reactive-streams:1.0.4")
+    // Sparrow libraries ship with FastSync in the lib/ folder. They are not
+    // part of a vanilla Paper server, so they must be runtime dependencies.
+    implementation("net.momirealms:sparrow-nbt:0.18.8")
+    implementation("net.momirealms:sparrow-yaml:1.0.7")
+    implementation("net.momirealms:sparrow-redis-message-broker:0.0.7")
 
     // Test
     testImplementation(platform("org.junit:junit-bom:5.11.0"))
@@ -78,13 +79,6 @@ dependencies {
     // ConfigManager (and other production classes loaded by tests) reference
     // JavaPlugin directly. testCompileOnly caused ClassNotFoundException at test time.
     testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
-    // Sparrow libraries are compileOnly at runtime (provided by Paper), but tests
-    // load production classes that reference them directly, so they must also be
-    // on the test runtime classpath. Composite builds resolve these to the local
-    // sparrow submodules.
-    testImplementation("net.momirealms:sparrow-nbt:0.18.8")
-    testImplementation("net.momirealms:sparrow-yaml:1.0.7")
-    testImplementation("net.momirealms:sparrow-redis-message-broker:0.0.7")
 }
 
 java {
@@ -215,20 +209,18 @@ val velocityJar = tasks.register<Jar>("velocityJar") {
 // =============================================================================
 val generateClasspathListing = tasks.register("generateClasspathListing") {
     group = "build"
-    description = "Builds a Class-Path manifest string from runtimeClasspath."
+    description = "Builds a Class-Path manifest string from the copied runtime libs."
     val outFile = layout.buildDirectory.file("classpath.txt")
     outputs.file(outFile)
+    dependsOn("copyRuntimeLibs")
     doLast {
-        val libNames = StringBuilder()
-        val cfg = configurations["runtimeClasspath"]
-        val files: Set<File> = cfg.files
-        files.forEach { f ->
-            if (f.name.endsWith(".jar")) {
-                if (libNames.isNotEmpty()) libNames.append(' ')
-                libNames.append("lib/").append(f.name)
-            }
-        }
-        outFile.get().asFile.writeText(libNames.toString())
+        val libsDir = layout.buildDirectory.dir("libs").get().asFile
+        val libNames = libsDir.listFiles { f -> f.isFile && f.name.endsWith(".jar") }
+            ?.filter { it.name != "FastSync-${project.version}.jar" && it.name != "FastSync-Proxy-${project.version}.jar" }
+            ?.sortedBy { it.name }
+            ?.joinToString(" ") { "lib/${it.name}" }
+            ?: ""
+        outFile.get().asFile.writeText(libNames)
     }
 }
 
@@ -291,6 +283,21 @@ val copyRuntimeLibs = tasks.register<Copy>("copyRuntimeLibs") {
     from(configurations.runtimeClasspath)
     into(layout.buildDirectory.dir("libs"))
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+
+    // Composite builds (Sparrow submodules) may produce jars with identical
+    // base filenames (e.g. core.jar). Rename duplicates so both make it into
+    // the lib/ folder and the Class-Path manifest.
+    val seen = mutableSetOf<String>()
+    eachFile {
+        var newName = name
+        var counter = 1
+        while (!seen.add(newName)) {
+            newName = name.removeSuffix(".jar") + "-$counter.jar"
+            counter++
+        }
+        name = newName
+    }
 }
 
 tasks.named("assemble") {
