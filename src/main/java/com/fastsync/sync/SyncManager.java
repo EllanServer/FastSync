@@ -2,6 +2,8 @@ package com.fastsync.sync;
 
 import com.fastsync.FastSync;
 import com.fastsync.api.FastSyncEvents;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.java.JavaPlugin;
 import com.fastsync.concurrent.AsyncExecutor;
 import com.fastsync.concurrent.LatencyTracker;
 import com.fastsync.config.ConfigManager;
@@ -17,6 +19,7 @@ import com.fastsync.redis.RedisManager;
 import com.fastsync.redis.stream.StreamEvent;
 import com.fastsync.redis.stream.StreamEventType;
 import com.fastsync.redis.stream.StreamManager;
+import com.fastsync.util.SchedulerUtil;
 import com.fastsync.serialization.CompressionUtil;
 import com.fastsync.serialization.PlayerDataSerializer;
 import com.fastsync.snapshot.SnapshotManager;
@@ -938,20 +941,32 @@ public class SyncManager {
     /**
      * Save a single player's data asynchronously (for periodic saves).
      */
+    /**
+     * Save a single player's data asynchronously (for periodic saves).
+     *
+     * <p><b>Folia compatibility:</b> On Folia, {@code collectPlayerData} must run
+     * on the entity's region thread, not the global region thread. We dispatch
+     * the data collection via {@link SchedulerUtil#runAtEntity}, then perform
+     * the async DB save from the collected data.
+     */
     public void savePlayerAsync(Player player) {
         if (!activePlayers.containsKey(player.getUniqueId())) {
             return;
         }
 
         UUID uuid = player.getUniqueId();
-        PlayerData data = collectPlayerData(player);
+        Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
 
-        pendingSaveCount.incrementAndGet();
-        asyncExecutor.execute(() -> {
-            try {
-                byte[] serialized = PlayerDataSerializer.serialize(data);
-                byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
-                long checksum = DatabaseManager.computeChecksum(serialized);
+        // Collect player data on the entity's region thread (Folia-safe)
+        SchedulerUtil.runAtEntity(plugin, player, () -> {
+            PlayerData data = collectPlayerData(player);
+
+            pendingSaveCount.incrementAndGet();
+            asyncExecutor.execute(() -> {
+                try {
+                    byte[] serialized = PlayerDataSerializer.serialize(data);
+                    byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
+                    long checksum = DatabaseManager.computeChecksum(serialized);
                 long expectedVersion = data.getVersion();
                 long fencingToken = data.getFencingToken();
                 boolean saved = databaseManager.saveData(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
@@ -972,6 +987,7 @@ public class SyncManager {
                 pendingSaveCount.decrementAndGet();
             }
         });
+        }, null); // retired callback: do nothing if entity is no longer valid
     }
 
     // ==================== Cleanup ====================

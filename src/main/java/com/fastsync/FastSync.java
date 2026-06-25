@@ -6,6 +6,7 @@ import com.fastsync.listeners.PlayerListener;
 import com.fastsync.log.OperationLog;
 import com.fastsync.serialization.ItemStackCompat;
 import com.fastsync.sync.SyncManager;
+import com.fastsync.util.SchedulerUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.command.Command;
@@ -14,7 +15,6 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.scheduler.BukkitTask;
 import org.jetbrains.annotations.NotNull;
 
 import java.sql.SQLException;
@@ -45,8 +45,8 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     private DatabaseManager databaseManager;
     private SyncManager syncManager;
 
-    private BukkitTask cleanupTask;
-    private BukkitTask periodicSaveTask;
+    private Object cleanupTask;
+    private Object periodicSaveTask;
 
     @Override
     public void onEnable() {
@@ -92,14 +92,14 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         }
 
         // Start cleanup task (every 5 minutes = 6000 ticks)
-        cleanupTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
+        cleanupTask = SchedulerUtil.runAsyncTimer(this, () -> {
             syncManager.cleanupStaleEntries();
         }, 6000L, 6000L);
 
         // Start periodic save task (if enabled)
         if (configManager.isPeriodicSave()) {
             long intervalTicks = configManager.getPeriodicSaveIntervalSeconds() * 20L;
-            periodicSaveTask = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            periodicSaveTask = SchedulerUtil.runGlobalTimer(this, () -> {
                 for (Player player : Bukkit.getOnlinePlayers()) {
                     syncManager.savePlayerAsync(player);
                 }
@@ -117,13 +117,9 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
     @Override
     public void onDisable() {
-        // Cancel scheduled tasks
-        if (cleanupTask != null) {
-            cleanupTask.cancel();
-        }
-        if (periodicSaveTask != null) {
-            periodicSaveTask.cancel();
-        }
+        // Cancel scheduled tasks (Paper/Folia compatible)
+        SchedulerUtil.cancel(cleanupTask);
+        SchedulerUtil.cancel(periodicSaveTask);
 
         // Save all online players synchronously
         if (syncManager != null) {
@@ -180,7 +176,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             }
             case "saveall" -> {
                 sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saving all online players...");
-                Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+                SchedulerUtil.runAsync(this, () -> {
                     syncManager.saveAllOnlinePlayers();
                     sender.sendMessage(ChatColor.GREEN + "[FastSync] All players saved!");
                 });
@@ -204,7 +200,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     }
                 }
                 final UUID fuuid = targetUuid;
-                Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+                SchedulerUtil.runAsync(this, () -> {
                     List<OperationLog> logs = syncManager.queryOperationLog(fuuid, limit);
                     if (logs.isEmpty()) {
                         sender.sendMessage(ChatColor.YELLOW + "[FastSync] No operation log entries for " + args[1]);

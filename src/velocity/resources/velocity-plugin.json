@@ -1,0 +1,8 @@
+{
+  "id": "fastsync-proxy",
+  "name": "FastSync Proxy",
+  "version": "1.0.0",
+  "description": "Cross-server player data synchronization coordinator for Velocity",
+  "authors": ["FastSync"],
+  "main": "com.fastsync.velocity.FastSyncProxy"
+}

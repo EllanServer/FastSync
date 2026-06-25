@@ -128,6 +128,20 @@ public class ConfigManager {
         this.yaml = SparrowYaml.builder().build();
     }
 
+    /**
+     * Test-only constructor. Skips the plugin reference so unit tests
+     * can construct a ConfigManager without instantiating a real
+     * {@link JavaPlugin} (which has many final methods in modern Paper).
+     * <p>Do not use this in production code.</p>
+     */
+    public ConfigManager(boolean testMode) {
+        if (!testMode) {
+            throw new IllegalArgumentException("Use ConfigManager(JavaPlugin) for production");
+        }
+        this.plugin = null;
+        this.yaml = null;
+    }
+
     public void load() {
         // Copy config.yml from the JAR if it does not already exist (Bukkit handles this)
         plugin.saveDefaultConfig();

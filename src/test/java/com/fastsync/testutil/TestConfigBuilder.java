@@ -7,21 +7,16 @@ import java.lang.reflect.Field;
 /**
  * Builds a {@link ConfigManager} using reflection for unit/integration tests.
  *
- * <p>Avoids the need to mock the Bukkit JavaPlugin API and sparrow-yaml,
- * making database tests lightweight and deterministic.</p>
+ * <p>Uses the package-private test constructor of ConfigManager that bypasses
+ * the JavaPlugin reference. Tests set fields directly via reflection, so the
+ * Sparrow-yaml config file is never read.</p>
  */
 public class TestConfigBuilder {
 
     private final ConfigManager config;
 
-    public TestConfigBuilder() throws ReflectiveOperationException {
-        // Use a subclass to avoid requiring JavaPlugin in constructor
-        this.config = new ConfigManager(null) {
-            @Override
-            public void load() {
-                // no-op
-            }
-        };
+    public TestConfigBuilder() {
+        this.config = new ConfigManager(true);
     }
 
     public TestConfigBuilder defaults() throws ReflectiveOperationException {

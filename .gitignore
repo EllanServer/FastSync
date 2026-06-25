@@ -1,25 +1,32 @@
-target/
+# Gradle
+.gradle/
+build/
+out/
 *.class
-*.log
-*.jar
-*.war
 
-# IDE
+# IntelliJ IDEA
 .idea/
 *.iml
-.vscode/
-.project
+*.ipr
+*.iws
+
+# Eclipse
 .classpath
+.project
 .settings/
+bin/
+
+# VS Code
+.vscode/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Maven
-maven-archiver/
-maven-status/
-surefire-reports/
+# Logs
+*.log
 
-# JMH
-jmh_generated/
+# Local config (don't ship secrets)
+**/config-local.yml
+**/secrets.yml
+target/
