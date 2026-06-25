@@ -331,6 +331,10 @@ public class DatabaseManager {
      * @return the new sequence number (monotonically increasing per UUID)
      */
     public long incrementOpSeq(UUID uuid) throws SQLException {
+        // Ensure the player row exists before incrementing; otherwise the UPDATE
+        // would affect zero rows and LAST_INSERT_ID() would return 0.
+        ensurePlayerExists(uuid);
+
         try (Connection conn = dataSource.getConnection()) {
             // Atomically increment op_seq and set it as LAST_INSERT_ID for this connection
             String updateSql = String.format(
