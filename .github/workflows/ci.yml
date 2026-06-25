@@ -25,10 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout (with Sparrow submodules)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -102,10 +100,8 @@ jobs:
           --health-timeout=5s
           --health-retries=5
     steps:
-      - name: Checkout (with Sparrow submodules)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -168,11 +164,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout (with Sparrow submodules)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          submodules: recursive
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4

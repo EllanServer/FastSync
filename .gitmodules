@@ -1,9 +1,0 @@
-[submodule "sparrow/sparrow-nbt"]
-	path = sparrow/sparrow-nbt
-	url = https://github.com/Xiao-MoMi/sparrow-nbt
-[submodule "sparrow/sparrow-yaml"]
-	path = sparrow/sparrow-yaml
-	url = https://github.com/Xiao-MoMi/sparrow-yaml
-[submodule "sparrow/sparrow-redis-message-broker"]
-	path = sparrow/sparrow-redis-message-broker
-	url = https://github.com/Xiao-MoMi/sparrow-redis-message-broker

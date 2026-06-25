@@ -16,7 +16,9 @@ repositories {
     maven("https://repo.papermc.io/repository/maven-public/")
     maven("https://oss.sonatype.org/content/repositories/snapshots/")
     maven("https://jitpack.io")
-    // Sparrow 库通过 Git Submodule + Composite Build 引入（见 settings.gradle.kts），不再需要 mavenLocal。
+    // Sparrow 系列库（sparrow-nbt / sparrow-yaml / sparrow-redis-message-broker）
+    // 由 Xiao-MoMi 维护并发布到此仓库。
+    maven("https://repo.momirealms.net/releases/")
 }
 
 group = property("group") as String
