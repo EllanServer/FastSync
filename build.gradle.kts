@@ -62,7 +62,7 @@ dependencies {
     implementation("net.momirealms:sparrow-redis-message-broker:0.0.7")
 
     // Test
-    testImplementation(platform("org.junit:junit-bom:5.11.0"))
+    testImplementation(platform("org.junit:junit-bom:6.1.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation("org.testcontainers:testcontainers:1.20.1")
     testImplementation("org.testcontainers:mysql:1.20.1")
