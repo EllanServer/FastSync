@@ -1,0 +1,67 @@
+# Dependabot: 自动检查并提交依赖更新
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates
+#
+# 每 7 天检查一次：
+#   - Gradle 依赖（build.gradle.kts / gradle.properties）
+#   - GitHub Actions 版本（.github/workflows/*.yml）
+#   - Docker Compose 镜像版本（docker-compose.paper-test.yml）
+# 自动创建 PR，CI 通过后人工 merge 即可。
+
+version: 2
+
+updates:
+  # Gradle 依赖
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+      - "gradle"
+    groups:
+      sparrow:
+        patterns:
+          - "net.momirealms:sparrow-*"
+      netty:
+        patterns:
+          - "io.netty:*"
+      junit:
+        patterns:
+          - "org.junit.jupiter:*"
+          - "org.junit:*"
+      testcontainers:
+        patterns:
+          - "org.testcontainers:*"
+      mockito:
+        patterns:
+          - "org.mockito:*"
+
+  # GitHub Actions 版本
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  # Docker Compose 镜像版本
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "docker"
+    labels:
+      - "dependencies"
+      - "docker"
