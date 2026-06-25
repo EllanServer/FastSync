@@ -143,13 +143,14 @@ class DatabaseManagerTest {
         LockResult lock2 = databaseManager.acquireLock(uuid, "server-b");
         assertTrue(lock2.acquired());
 
-        // Save with newer data
+        // Save with newer data, using the current DB version as expectedVersion
         byte[] data2 = new byte[]{4, 5, 6};
         long checksum2 = DatabaseManager.computeChecksum(data2);
-        assertTrue(databaseManager.saveData(uuid, data2, checksum2, 0, lock2.fencingToken(), "server-b"));
+        VersionedData current = databaseManager.loadData(uuid);
+        assertTrue(databaseManager.saveData(uuid, data2, checksum2, current.version(), lock2.fencingToken(), "server-b"));
 
         // Now the original server tries to write with stale version 0
-        // This should be rejected because DB version is now 1
+        // This should be rejected because DB version is now 2
         byte[] staleData = new byte[]{7, 8, 9};
         long staleChecksum = DatabaseManager.computeChecksum(staleData);
         boolean saved = databaseManager.saveData(uuid, staleData, staleChecksum, 0, lock.fencingToken(), "server-a");
@@ -175,12 +176,15 @@ class DatabaseManagerTest {
         LockResult lockB = databaseManager.acquireLock(uuid, "server-b");
         byte[] dataB = new byte[]{4, 5, 6};
         long checksumB = DatabaseManager.computeChecksum(dataB);
-        assertTrue(databaseManager.saveData(uuid, dataB, checksumB, 0, lockB.fencingToken(), "server-b"));
+        VersionedData current = databaseManager.loadData(uuid);
+        assertTrue(databaseManager.saveData(uuid, dataB, checksumB, current.version(), lockB.fencingToken(), "server-b"));
 
-        // Server A (token 1) tries to write again — should be rejected by fencing token
+        // Server A (token 1) tries to write again with the current version —
+        // should still be rejected because the stored fencing token (2) > lockA's token (1)
+        VersionedData afterB = databaseManager.loadData(uuid);
         byte[] dataA2 = new byte[]{7, 8, 9};
         long checksumA2 = DatabaseManager.computeChecksum(dataA2);
-        boolean saved = databaseManager.saveData(uuid, dataA2, checksumA2, 0, lockA.fencingToken(), "server-a");
+        boolean saved = databaseManager.saveData(uuid, dataA2, checksumA2, afterB.version(), lockA.fencingToken(), "server-a");
         assertFalse(saved, "Lower fencing token write should be rejected (Kleppmann)");
     }
 
