@@ -14,7 +14,7 @@ database:
   idle-timeout: 300000
   max-lifetime: 1800000
   leak-detection-threshold: 60000
-  parameters: "useSSL=false&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true"
+  parameters: "useSSL=false&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&allowPublicKeyRetrieval=true"
 
 redis:
   enabled: true
