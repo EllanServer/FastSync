@@ -69,7 +69,9 @@ services:
       - "25565:25565"
       - "25575:25575"
     volumes:
-      - ./e2e/plugins:/data/plugins:ro
+      # Paper 1.21.4 needs to write the .paper-remapped cache under
+      # /data/plugins, so this bind mount must be read-write.
+      - ./e2e/plugins:/data/plugins
       - paper-a-data:/data
     stdin_open: true
     tty: true
@@ -98,7 +100,8 @@ services:
       - "25566:25565"
       - "25576:25576"
     volumes:
-      - ./e2e/plugins:/data/plugins:ro
+      # Must be read-write so Paper can create the .paper-remapped cache.
+      - ./e2e/plugins:/data/plugins
       - paper-b-data:/data
     stdin_open: true
     tty: true
