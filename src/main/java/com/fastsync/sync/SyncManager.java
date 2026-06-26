@@ -406,15 +406,22 @@ public class SyncManager {
                 return LoadResult.success();
             }
 
-            // Verify checksum (Dynamo-style data integrity)
-            if (config.isVerifyChecksum() && !DatabaseManager.verifyChecksum(loaded.data(), loaded.checksum())) {
+            // Step 3: Decompress
+            startTime = System.nanoTime();
+
+            byte[] decompressed = CompressionUtil.unwrap(loaded.data());
+
+            // Verify checksum AFTER decompression — checksum is computed on
+            // the raw serialized data (not the compressed blob). This prevents
+            // false corruption warnings when compression changes the byte layout.
+            if (config.isVerifyChecksum() && !DatabaseManager.verifyChecksum(decompressed, loaded.checksum())) {
                 logger.warning("[Checksum] Data corruption detected for " + uuid +
                     "! Stored checksum: " + loaded.checksum() +
                     ". Rejecting load to prevent applying corrupted data.");
 
                 // Log checksum failure
                 logOperation(uuid, OperationType.CHECKSUM_FAIL, fencingToken, loaded.version(),
-                    loaded.data() != null ? loaded.data().length : 0,
+                    decompressed != null ? decompressed.length : 0,
                     "Checksum mismatch: stored=" + loaded.checksum());
 
                 if (loadLatency != null) loadLatency.recordError();
@@ -427,10 +434,6 @@ public class SyncManager {
                 return LoadResult.error("Data checksum mismatch - possible corruption");
             }
 
-            // Step 3: Decompress and deserialize
-            startTime = System.nanoTime();
-
-            byte[] decompressed = CompressionUtil.unwrap(loaded.data());
             PlayerData data = PlayerDataSerializer.deserialize(decompressed);
 
             // Set the version from DB for optimistic concurrency (Dynamo-style)
@@ -650,16 +653,14 @@ public class SyncManager {
     public void collectAndSavePlayerData(Player player) {
         UUID uuid = player.getUniqueId();
 
-        // Remove from active players
-        activePlayers.remove(uuid);
-        playerVersions.remove(uuid);
-        playerFencingTokens.remove(uuid);
-
         // Check if player has pending data (was kicked during pre-login, never joined)
         if (pendingData.containsKey(uuid) || pendingEmptyData.contains(uuid)) {
             pendingData.remove(uuid);
             pendingEmptyData.remove(uuid);
             pendingLoadTimes.remove(uuid);
+            activePlayers.remove(uuid);
+            playerVersions.remove(uuid);
+            playerFencingTokens.remove(uuid);
             // Release lock without saving
             pendingSaveCount.incrementAndGet();
             asyncExecutor.execute(() -> {
@@ -678,8 +679,17 @@ public class SyncManager {
             return;
         }
 
-        // Collect data on main thread
+        // IMPORTANT: collect data BEFORE removing from maps.
+        // collectPlayerData() reads version and fencing token from playerVersions
+        // and playerFencingTokens. If we remove first, the save will use default
+        // version=0 and fencingToken=0, causing saveData() to fail or overwrite.
         PlayerData data = collectPlayerData(player);
+
+        // Now safe to remove from active tracking.
+        // playerVersions and playerFencingTokens are NOT removed here — they
+        // are cleaned up after the async save completes (in the finally block),
+        // because the per-UUID lock check in periodic save still references them.
+        activePlayers.remove(uuid);
 
         // Save asynchronously using dedicated thread pool.
         // Per-UUID lock ensures this save runs AFTER any in-flight periodic save,
@@ -728,7 +738,19 @@ public class SyncManager {
                         ", actual v" + actualVersion + "/ft" + actualFencingToken);
 
                     if (saveLatency != null) saveLatency.recordError();
+
+                    // Release the DB lock on conflict — another server has newer data,
+                    // holding the lock here would block the other server from writing.
+                    // Data safety is still guaranteed by version/fencing CAS.
+                    try {
+                        databaseManager.releaseLock(uuid, config.getServerName());
+                    } catch (SQLException lockEx) {
+                        logger.log(Level.WARNING, "Failed to release lock after conflict for " + uuid, lockEx);
+                    }
                 } else {
+                    // Save succeeded — advance local version so the next periodic save
+                    // uses the correct expectedVersion (v -> v+1).
+                    advanceVersion(uuid, expectedVersion);
                     // Success - create snapshot only when configured to do so on save.
                     // Snapshot creation is controlled by snapshot.save-trigger config.
                     // Values: "never" (default, only conflict-driven snapshots),
@@ -772,6 +794,9 @@ public class SyncManager {
             } finally {
                 saveLock.unlock();
                 playerSaveLocks.remove(uuid, saveLock);
+                // Clean up version/token tracking now that save is complete
+                playerVersions.remove(uuid);
+                playerFencingTokens.remove(uuid);
                 pendingSaveCount.decrementAndGet();
             }
         });
@@ -1269,39 +1294,66 @@ public class SyncManager {
      * until every save has completed. This avoids saving every player synchronously
      * on the main thread, which would hang the server during shutdown.
      */
+    /**
+     * Save all online players' data synchronously (for shutdown / /fastsync saveall).
+     *
+     * <p><b>Folia-safe:</b> Data collection is dispatched per-player via
+     * {@link SchedulerUtil#runAtEntity} to ensure it runs on the correct
+     * region thread. Serialization + DB write happen async, and we wait
+     * for all futures to complete before returning.
+     */
     public void saveAllOnlinePlayers() {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
+        Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
+
         for (Player player : Bukkit.getOnlinePlayers()) {
             if (!activePlayers.containsKey(player.getUniqueId())) {
                 continue;
             }
             UUID uuid = player.getUniqueId();
-            // Collect on the calling (main) thread - Bukkit API is not thread-safe.
-            PlayerData data = collectPlayerData(player);
 
-            // Serialize + DB write happen async, but we wait for all of them below.
-            futures.add(asyncExecutor.submit(() -> {
+            // Collect on the entity's region thread (Folia-safe), then save async.
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            SchedulerUtil.runAtEntity(plugin, player, () -> {
                 try {
-                    byte[] serialized = PlayerDataSerializer.serialize(data);
-                    byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
-                    long checksum = DatabaseManager.computeChecksum(serialized);
-                    long expectedVersion = data.getVersion();
-                    long fencingToken = data.getFencingToken();
-                    boolean saved = databaseManager.saveData(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
-                    if (!saved) {
-                        long actualVersion = databaseManager.getCurrentVersion(uuid);
-                        conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
-                    }
-                    notifyLockReleased(uuid);
+                    PlayerData data = collectPlayerData(player);
+                    pendingSaveCount.incrementAndGet();
+                    asyncExecutor.execute(() -> {
+                        try {
+                            byte[] serialized = PlayerDataSerializer.serialize(data);
+                            byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
+                            long checksum = DatabaseManager.computeChecksum(serialized);
+                            long expectedVersion = data.getVersion();
+                            long fencingToken = data.getFencingToken();
+                            boolean saved = databaseManager.saveData(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                            if (!saved) {
+                                long actualVersion = databaseManager.getCurrentVersion(uuid);
+                                conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
+                                try {
+                                    databaseManager.releaseLock(uuid, config.getServerName());
+                                } catch (SQLException lockEx) {
+                                    logger.log(Level.WARNING, "Failed to release lock after bulk save conflict for " + uuid, lockEx);
+                                }
+                            } else {
+                                advanceVersion(uuid, expectedVersion);
+                            }
+                            notifyLockReleased(uuid);
+                        } catch (Exception e) {
+                            logger.log(Level.SEVERE, "Failed to save data for " + uuid + " during bulk save", e);
+                        } finally {
+                            pendingSaveCount.decrementAndGet();
+                        }
+                    });
                 } catch (Exception e) {
-                    logger.log(Level.SEVERE, "Failed to save data for " + uuid + " during bulk save", e);
+                    logger.log(Level.SEVERE, "Failed to collect data for " + uuid + " during bulk save", e);
+                } finally {
+                    future.complete(null);
                 }
-            }));
+            }, null);
+            futures.add(future);
         }
 
-        // Wait for all async saves to complete before returning. This is critical
-        // for shutdown: the caller (onDisable) must not proceed to tear down the
-        // thread pool / database until every save has finished.
+        // Wait for all collection + save tasks to complete.
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         logger.info("Saved data for all online players.");
     }
@@ -1354,6 +1406,15 @@ public class SyncManager {
                     long actualVersion = databaseManager.getCurrentVersion(uuid);
                     conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
                     if (saveLatency != null) saveLatency.recordError();
+                    // Release DB lock on conflict so other servers can proceed.
+                    try {
+                        databaseManager.releaseLock(uuid, config.getServerName());
+                    } catch (SQLException lockEx) {
+                        logger.log(Level.WARNING, "Failed to release lock after periodic conflict for " + uuid, lockEx);
+                    }
+                } else {
+                    // Advance local version for next periodic save (v -> v+1)
+                    advanceVersion(uuid, expectedVersion);
                 }
 
                 if (config.isDebug()) {
@@ -1436,6 +1497,18 @@ public class SyncManager {
     }
 
     // ==================== Helpers ====================
+
+    /**
+     * Advance the local version tracking after a successful save.
+     * Uses compute() with Math.max to handle the race between periodic save
+     * advancing to v+1 and quit save having already set a higher version.
+     */
+    private void advanceVersion(UUID uuid, long savedVersion) {
+        playerVersions.compute(uuid, (k, current) -> {
+            if (current == null) return null; // player already cleaned up (quit)
+            return Math.max(current, savedVersion + 1);
+        });
+    }
 
     // ==================== Snapshot Trigger Helper ====================
 
@@ -1527,20 +1600,22 @@ public class SyncManager {
     /**
      * Wait for all pending async saves to complete (for graceful shutdown).
      *
-     * <p>Replaces the previous busy-loop ({@code Thread.sleep(100)} polling
-     * {@code pendingSaveCount}) with a graceful executor shutdown +
-     * {@code awaitTermination}. This avoids CPU spin and provides cleaner
-     * semantics. Safe to call only from the shutdown path — after this returns,
-     * the async executor is no longer usable.
+     * <p>Uses a bounded busy-wait on {@code pendingSaveCount} — the async
+     * executor is NOT shut down here (that happens in {@link #shutdown()}).
+     * This separation prevents the race where saveAllOnlinePlayers() submits
+     * tasks that haven't been picked up yet when waitForPendingSaves runs.
      */
     public void waitForPendingSaves(long timeoutMillis) {
-        if (asyncExecutor == null) return;
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (pendingSaveCount.get() > 0 && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
         int remaining = pendingSaveCount.get();
-        if (remaining == 0) return;
-        // Gracefully stop accepting new tasks and wait for in-flight saves to drain.
-        asyncExecutor.shutdown((int) Math.max(1, timeoutMillis / 1000));
-        asyncExecutor = null;
-        remaining = pendingSaveCount.get();
         if (remaining > 0) {
             logger.warning(remaining + " pending save(s) did not complete within " + timeoutMillis + "ms timeout.");
         }

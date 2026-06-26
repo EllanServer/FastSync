@@ -473,7 +473,7 @@ public class DatabaseManager {
                 .set(LOCKED_BY_FIELD, (String) null)
                 .set(LOCKED_AT_FIELD, (Long) null)
                 .where(UUID_FIELD.eq(uuid.toString())
-                    .and(LOCKED_BY_FIELD.eq(serverName).or(LOCKED_BY_FIELD.isNull())))
+                    .and(LOCKED_BY_FIELD.eq(serverName)))
                 .execute();
         }
     }
