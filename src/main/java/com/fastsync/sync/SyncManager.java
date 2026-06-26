@@ -694,13 +694,11 @@ public class SyncManager {
         // Persistent Data Container (via strategy)
         if (pdcStrategy != null && !"off".equals(pdcStrategy.strategyName())
                 && data.getPersistentDataContainer() != null
-                && !data.getPersistentDataContainer().isEmpty()) {
+                && data.getPersistentDataContainer().containsKey("__pdc_bytes__")) {
             byte[] pdcBytes = data.getPersistentDataContainer().get("__pdc_bytes__");
             // Call restore even if pdcBytes is empty (length==0) — this is the
             // signal to clear the target PDC and remove ghost keys.
-            if (pdcBytes != null) {
-                pdcStrategy.restore(player, pdcBytes);
-            }
+            pdcStrategy.restore(player, pdcBytes);
         }
 
         // Location (optional, with validation via LocationSyncStrategy)
@@ -925,36 +923,9 @@ public class SyncManager {
         if (quarantinedPlayers.remove(uuid)) {
             logger.warning("[Quit] Player " + uuid + " was quarantined (lock lost during session)."
                 + " Skipping final save — data may be stale. Player should have been kicked.");
-            final Long ft = playerFencingTokens.get(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
             playerVersions.remove(uuid);
-            playerFencingTokens.remove(uuid);
-            pendingSaveCount.incrementAndGet();
-            // Release lock asynchronously — do NOT do JDBC on the entity/region thread.
-            try {
-                asyncExecutor.execute(() -> {
-                    try {
-                        if (ft != null && ft > 0) {
-                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
-                        }
-                        notifyLockReleased(uuid);
-                    } catch (SQLException e) {
-                        logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
-                    } finally {
-                        pendingSaveCount.decrementAndGet();
-                    }
-                });
-            } catch (java.util.concurrent.RejectedExecutionException e) {
-                // Executor shut down — synchronous fallback (acceptable during shutdown)
-                pendingSaveCount.decrementAndGet();
-                try {
-                    if (ft != null && ft > 0) {
-                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
-                    }
-                    notifyLockReleased(uuid);
-                } catch (SQLException ex) {
-                    logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, ex);
-                }
-            }
+            releaseLockAsyncBestEffort(uuid, ft, "quarantined player quit");
             return;
         }
 
@@ -1076,35 +1047,9 @@ public class SyncManager {
         // Check quarantine — skip save if lock was lost
         if (quarantinedPlayers.remove(uuid)) {
             logger.warning("[Quit-Sync] Player " + uuid + " was quarantined. Skipping save.");
-            final Long ft = playerFencingTokens.get(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
             playerVersions.remove(uuid);
-            playerFencingTokens.remove(uuid);
-            // Release lock asynchronously — do NOT do JDBC on the entity/region thread.
-            pendingSaveCount.incrementAndGet();
-            try {
-                asyncExecutor.execute(() -> {
-                    try {
-                        if (ft != null && ft > 0) {
-                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
-                        }
-                        notifyLockReleased(uuid);
-                    } catch (SQLException e) {
-                        logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
-                    } finally {
-                        pendingSaveCount.decrementAndGet();
-                    }
-                });
-            } catch (java.util.concurrent.RejectedExecutionException e) {
-                pendingSaveCount.decrementAndGet();
-                try {
-                    if (ft != null && ft > 0) {
-                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
-                    }
-                    notifyLockReleased(uuid);
-                } catch (SQLException ex) {
-                    logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, ex);
-                }
-            }
+            releaseLockAsyncBestEffort(uuid, ft, "quarantined player quit (sync)");
             return;
         }
 
@@ -1131,6 +1076,51 @@ public class SyncManager {
     private void notifyLockReleased(UUID uuid) {
         if (redissonManager != null && redissonManager.isHealthy()) {
             redissonManager.notifyLockReleased(uuid);
+        }
+    }
+
+    /**
+     * Release a player's DB lock asynchronously on the async executor.
+     * Used by quarantine and failed-join paths where we must NOT do JDBC on
+     * the entity/region thread. Falls back to synchronous execution only when
+     * the executor is shut down (acceptable during server shutdown).
+     *
+     * @param uuid         player UUID
+     * @param fencingToken fencing token from playerFencingTokens (may be null)
+     * @param reason       log label for diagnostics
+     */
+    private void releaseLockAsyncBestEffort(UUID uuid, Long fencingToken, String reason) {
+        pendingSaveCount.incrementAndGet();
+        Runnable task = () -> {
+            try {
+                if (fencingToken != null && fencingToken > 0) {
+                    databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                } else {
+                    logger.warning("[LockRelease] " + reason + " for " + uuid
+                        + " has no fencing token; refusing unsafe tokenless release.");
+                    return;
+                }
+                notifyLockReleased(uuid);
+                if (config.isDebug()) {
+                    logger.info("[LockRelease] Released lock for " + uuid + " (" + reason + ")");
+                }
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "[LockRelease] Failed to release lock for " + uuid
+                    + " (" + reason + ")", e);
+            } finally {
+                pendingSaveCount.decrementAndGet();
+            }
+        };
+        try {
+            if (asyncExecutor != null) {
+                asyncExecutor.execute(task);
+            } else {
+                task.run();
+            }
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            logger.log(Level.WARNING, "[LockRelease] Async executor rejected lock release for " + uuid
+                + " (" + reason + "); running fallback synchronously.", e);
+            task.run();
         }
     }
 
