@@ -274,8 +274,9 @@ public class FastSyncProxy {
             }
         }
 
-        // Don't forward the message to the player
-        event.setResult(PluginMessageEvent.ForwardStatus.discard());
+        // Note: We don't forward the message to the player client.
+        // Velocity's default is to forward, but our messages are internal
+        // protocol messages not meant for the client.
     }
 
     // ==================== Utility ====================
