@@ -351,8 +351,9 @@ public class PlayerDataSerializer {
         }
 
         // Location
-        if (root.getString("world") != null) {
-            playerData.setWorldName(root.getString("world"));
+        String worldName = root.getString("world");
+        if (worldName != null && !worldName.isEmpty()) {
+            playerData.setWorldName(worldName);
             playerData.setX(root.getDouble("x"));
             playerData.setY(root.getDouble("y"));
             playerData.setZ(root.getDouble("z"));
@@ -376,7 +377,8 @@ public class PlayerDataSerializer {
         playerData.setVersion(root.getLong("version"));
         playerData.setFencingToken(root.getLong("fencingToken"));
         playerData.setTimestamp(root.getLong("timestamp"));
-        playerData.setSaveCause(root.getString("saveCause") != null ? root.getString("saveCause") : "disconnect");
+        String saveCause = root.getString("saveCause");
+        playerData.setSaveCause(saveCause != null && !saveCause.isEmpty() ? saveCause : "disconnect");
 
         return playerData;
     }

@@ -364,20 +364,26 @@ NoLateWrite ==
 
 (*
  * NoDupItem: Player's inventory count never increases due to handoff.
- * The DB's inventory count is always <= what any server has loaded.
- * (In a correct system, it should be equal — but the key safety property
- * is that items don't duplicate.)
  *
- * Simplified model: we track a single "inventoryCount" per player.
- * The invariant checks that the DB data's inventory count matches what
- * was last saved (no spontaneous increase).
+ * The key safety property is that the DB's inventory count never EXCEEDS
+ * the server's in-memory count. When no save is pending, they must be
+ * equal. When a save IS pending (in-flight to the DB), the DB may lag
+ * behind (DB inv <= server inv) because the newer count hasn't landed yet.
+ *
+ * The previous formulation used a disjunction that made the invariant
+ * vacuously true whenever any save was pending — too weak to catch
+ * actual duplication bugs.
  *)
 NoDupItem ==
     \A uuid \in Players :
-        dbData[uuid].inv >= 0
-        /\ dbData[uuid].inv = inventoryCount[uuid]
-            (* When no save is pending, DB matches server state *)
-            \/ \E s \in Servers : (s, uuid) \in pendingSave
+        /\ dbData[uuid].inv >= 0
+        /\ inventoryCount[uuid] >= 0
+        (* When no save is pending, DB must match server state exactly *)
+        /\ ((~\E s \in Servers : (s, uuid) \in pendingSave) =>
+            dbData[uuid].inv = inventoryCount[uuid])
+        (* When a save IS pending, DB inv must not exceed server inv *)
+        /\ ((\E s \in Servers : (s, uuid) \in pendingSave) =>
+            dbData[uuid].inv <= inventoryCount[uuid])
 
 (*
  * NoLostMoney: The economy ledger is consistent — the sum of all deltas

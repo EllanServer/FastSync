@@ -1085,6 +1085,10 @@ public class SyncManager {
 
     @SuppressWarnings("deprecation")
     private void applyAdvancements(Player player, PlayerData data) {
+        // NOTE: The Bukkit API's awardCriteria() does not accept a timestamp
+        // parameter, so the saved criterion timestamps (Map<String, Long>) are
+        // not restored — they are preserved for audit/diagnostic purposes only.
+        // The current server time is implicitly used by Bukkit when awarding.
         try {
             // Use the cached advancement list (populated by collectAdvancements)
             // instead of calling Bukkit.advancementIterator() again on every join.
@@ -1492,8 +1496,18 @@ public class SyncManager {
 
         // Clean up save locks for players no longer active (quit > 5 min ago).
         // This prevents unbounded growth of the playerSaveLocks map.
-        playerSaveLocks.keySet().removeIf(uuid -> !activePlayers.containsKey(uuid)
-            && !pendingData.containsKey(uuid) && !pendingEmptyData.contains(uuid));
+        // Conservative: only remove locks that are neither held nor have waiting
+        // threads, to avoid removing a lock that a concurrent save just obtained.
+        playerSaveLocks.entrySet().removeIf(e -> {
+            UUID uuid = e.getKey();
+            if (activePlayers.containsKey(uuid)
+                || pendingData.containsKey(uuid)
+                || pendingEmptyData.contains(uuid)) {
+                return false;
+            }
+            java.util.concurrent.locks.ReentrantLock lock = e.getValue();
+            return !lock.isLocked() && !lock.hasQueuedThreads();
+        });
     }
 
     // ==================== Shutdown ====================

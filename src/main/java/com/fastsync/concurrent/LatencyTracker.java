@@ -3,6 +3,7 @@ package com.fastsync.concurrent;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -16,18 +17,21 @@ import java.util.logging.Logger;
  * Uses a sliding window of the last N samples to keep memory bounded.
  *
  * <p><b>Performance note:</b> Samples are stored in a preallocated ring
- * buffer backed by a plain {@code long[]} array with an {@link AtomicInteger}
+ * buffer backed by an {@link AtomicLongArray} with an {@link AtomicInteger}
  * head pointer. This avoids boxing every {@code long} into a {@code Long}
  * (allocation pressure) and keeps {@code record()} amortized O(1) regardless
- * of window size. Percentile computation snapshots the buffer into a fresh
- * {@code long[]} and sorts it once.
+ * of window size. {@link AtomicLongArray} provides atomic reads/writes, so
+ * {@code snapshot()} can safely read while {@code record()} is writing on
+ * another thread — no torn 64-bit reads on 32-bit JVMs, no data races.
+ * Percentile computation snapshots the buffer into a fresh {@code long[]}
+ * and sorts it once.
  */
 public class LatencyTracker {
 
     private final String operationName;
     private final Logger logger;
     private final int windowSize;
-    private final long[] buffer;
+    private final AtomicLongArray buffer;
     private final AtomicInteger head = new AtomicInteger(0);
     private final AtomicInteger count = new AtomicInteger(0);
     private final AtomicLong totalOperations = new AtomicLong(0);
@@ -37,13 +41,13 @@ public class LatencyTracker {
         this.operationName = operationName;
         this.logger = logger;
         this.windowSize = windowSize;
-        this.buffer = new long[windowSize];
+        this.buffer = new AtomicLongArray(windowSize);
     }
 
     /**
      * Record a latency sample in milliseconds.
      *
-     * <p>Amortized O(1): writes straight into a preallocated {@code long[]}
+     * <p>Amortized O(1): writes straight into a preallocated {@link AtomicLongArray}
      * ring buffer at the index returned by the head pointer, avoiding both
      * boxing and eviction bookkeeping. {@code count} is atomically capped at
      * {@code windowSize}; once the buffer is full the head pointer simply
@@ -51,7 +55,7 @@ public class LatencyTracker {
      */
     public void record(long latencyMs) {
         int idx = head.getAndIncrement();
-        buffer[idx % windowSize] = latencyMs;
+        buffer.set(idx % windowSize, latencyMs);
         // Track how many slots hold valid data, capped at windowSize.
         count.getAndUpdate(c -> Math.min(c + 1, windowSize));
         totalOperations.incrementAndGet();
@@ -85,7 +89,7 @@ public class LatencyTracker {
         int n = Math.min(count.get(), windowSize);
         long[] arr = new long[n];
         for (int i = 0; i < n; i++) {
-            arr[i] = buffer[i];
+            arr[i] = buffer.get(i);
         }
         return arr;
     }

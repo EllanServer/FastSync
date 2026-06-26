@@ -280,8 +280,8 @@ public class DatabaseManager {
         long now = System.currentTimeMillis();
         long expiredTime = now - (config.getLockTimeout() * 1000L);
 
-        // Merge ensurePlayerExists (INSERT IGNORE) + conditional UPDATE into one
-        // INSERT ... ON DUPLICATE KEY UPDATE. The INSERT arm seeds a new player
+        // INSERT ... ON DUPLICATE KEY UPDATE merges row creation and conditional
+        // lock acquisition into one statement. The INSERT arm seeds a new player
         // row (fencing_token = 1, locked_by = us); the UPDATE arm bumps the token
         // and takes the lock only when it is free, expired, or already ours.
         String sql = String.format("""
@@ -329,30 +329,6 @@ public class DatabaseManager {
             }
             Long token = record.get(FENCING_TOKEN_FIELD);
             return token != null ? LockResult.success(token) : LockResult.FAILED;
-        }
-    }
-
-    /**
-     * Ensure a player row exists in the database.
-     *
-     * <p>Rendered as {@code INSERT IGNORE INTO ...} via jOOQ's
-     * {@code onDuplicateKeyIgnore()}, which on the MySQL dialect emits
-     * {@code INSERT IGNORE}. This is a no-op if the row already exists.
-     */
-    private void ensurePlayerExists(UUID uuid) throws SQLException {
-        try (Connection conn = dataSource.getConnection()) {
-            dsl(conn).insertInto(playerData)
-                .set(UUID_FIELD, uuid.toString())
-                .set(DATA_FIELD, new byte[0])
-                .set(VERSION_FIELD, 0L)
-                .set(CHECKSUM_FIELD, 0L)
-                .set(FENCING_TOKEN_FIELD, 0L)
-                .set(LOCKED_BY_FIELD, (String) null)
-                .set(LOCKED_AT_FIELD, (Long) null)
-                .set(LAST_SERVER_FIELD, (String) null)
-                .set(LAST_UPDATED_FIELD, 0L)
-                .onDuplicateKeyIgnore()
-                .execute();
         }
     }
 

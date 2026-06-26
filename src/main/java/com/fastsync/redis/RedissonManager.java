@@ -412,14 +412,13 @@ public class RedissonManager {
                     messageDispatcher.submit(() -> {
                         try {
                             handleStreamMessage(msgId, body);
+                            // Only ack on success — if handleStreamMessage throws,
+                            // the message stays in the PEL and will be reprocessed
+                            // by autoClaim on the next restart.
+                            stream.ack(consumerGroupName, msgId);
                         } catch (Exception e) {
-                            LOGGER.log(Level.WARNING, "[Redisson] Error dispatching stream message " + msgId, e);
-                        } finally {
-                            try {
-                                stream.ack(consumerGroupName, msgId);
-                            } catch (Exception ackEx) {
-                                LOGGER.log(Level.WARNING, "[Redisson] Failed to ack stream message " + msgId, ackEx);
-                            }
+                            LOGGER.log(Level.WARNING, "[Redisson] Error dispatching stream message " + msgId
+                                + " — message will remain in PEL for reprocessing", e);
                         }
                     });
                 }
@@ -497,8 +496,14 @@ public class RedissonManager {
             LOGGER.info("[Redisson] Recovered " + messages.size()
                 + " pending entries from previous crash.");
             for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
-                handleStreamMessage(entry.getKey(), entry.getValue());
-                stream.ack(consumerGroupName, entry.getKey());
+                try {
+                    handleStreamMessage(entry.getKey(), entry.getValue());
+                    // Only ack on success — failed entries stay in PEL for next cycle
+                    stream.ack(consumerGroupName, entry.getKey());
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entry " + entry.getKey()
+                        + " — will retry on next autoClaim cycle", e);
+                }
             }
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entries", e);

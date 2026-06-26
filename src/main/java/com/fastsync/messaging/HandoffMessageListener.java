@@ -99,6 +99,9 @@ public class HandoffMessageListener implements PluginMessageListener {
         // In practice, the player who triggered this message is the one switching
         if (proxyPlayer.isOnline()) {
             proxyPlayer.sendPluginMessage(plugin, CHANNEL, response);
+        } else {
+            logger.warning("[Handoff] Cannot send LOCK_STATUS response for " + uuid
+                + " — player is no longer online. Proxy will need to retry or fall back to DB polling.");
         }
 
         if (config.isDebug()) {
@@ -142,6 +145,8 @@ public class HandoffMessageListener implements PluginMessageListener {
 
         if (proxyPlayer.isOnline()) {
             proxyPlayer.sendPluginMessage(plugin, CHANNEL, response);
+        } else {
+            logger.warning("[Handoff] Cannot send STATUS_RESPONSE — player is no longer online.");
         }
 
         if (config.isDebug()) {

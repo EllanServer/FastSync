@@ -36,9 +36,10 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
         Method ser = null;
         Method readNew = null;
         Method readOld = null;
+        // Tracks whether methods were resolved via getDeclaredMethod (fallback path).
+        // Only those need setAccessible(true); methods from getMethod() are public.
+        boolean usedDeclaredFallback = false;
         try {
-            PersistentDataContainer sampleContainer = null;
-            // We can't get a container without a player, so resolve methods from the interface
             // Try PersistentDataContainerView first (public API in 1.21.11+)
             Class<?> viewClass = null;
             try {
@@ -55,20 +56,15 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
             }
 
             // Fallback: look for package-private methods on the implementation class.
-            // We can't resolve these without an instance, so try the well-known CraftBukkit class.
             if (ser == null) {
                 Class<?> craftPdcClass = null;
                 try {
                     craftPdcClass = Class.forName("org.bukkit.craftbukkit.persistence.CraftPersistentDataContainer");
                 } catch (ClassNotFoundException ignored) {
-                    // Relocated mappings? Try without version prefix (Paper Mojang mappings)
-                    try {
-                        craftPdcClass = Class.forName("org.bukkit.craftbukkit.persistence.CraftPersistentDataContainer");
-                    } catch (ClassNotFoundException ignored2) {
-                        // Could not locate implementation class
-                    }
+                    // Could not locate implementation class
                 }
                 if (craftPdcClass != null) {
+                    usedDeclaredFallback = true;
                     ser = findDeclaredMethod(craftPdcClass, "serializeToBytes");
                     readOld = findDeclaredMethod(craftPdcClass, "deserializeBytes", byte[].class);
                     if (readOld == null) {
@@ -88,14 +84,19 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
         this.readFromBytesMethod = readNew;
         this.deserializeBytesMethod = readOld;
 
-        if (ser != null) {
-            ser.setAccessible(true);
-        }
-        if (readNew != null) {
-            readNew.setAccessible(true);
-        }
-        if (readOld != null) {
-            readOld.setAccessible(true);
+        // Only call setAccessible on methods resolved via getDeclaredMethod (the
+        // fallback path). Methods from getMethod() are already public, so
+        // setAccessible is unnecessary and triggers unnecessary security checks.
+        if (usedDeclaredFallback) {
+            if (ser != null) {
+                ser.setAccessible(true);
+            }
+            if (readNew != null) {
+                readNew.setAccessible(true);
+            }
+            if (readOld != null) {
+                readOld.setAccessible(true);
+            }
         }
 
         if (debug) {
