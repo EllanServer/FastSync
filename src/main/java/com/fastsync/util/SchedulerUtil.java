@@ -90,6 +90,24 @@ public final class SchedulerUtil {
     }
 
     /**
+     * Run a task on the global region after a delay (ticks).
+     *
+     * <p>Use this instead of {@link #runAsyncDelayed} when the task needs to
+     * touch Bukkit {@link org.bukkit.entity.Player} objects (e.g. calling
+     * {@code player.getUniqueId()} or dispatching via {@link #runAtEntity}).
+     * On Folia, async threads must not call methods on Player entities — even
+     * read-only getters — because the entity's state is owned by its region
+     * thread. The global region is the correct context for these reads.
+     */
+    public static void runGlobalDelayed(Plugin plugin, Runnable task, long delayTicks) {
+        if (FOLIA) {
+            Bukkit.getGlobalRegionScheduler().runDelayed(plugin, t -> task.run(), delayTicks);
+        } else {
+            Bukkit.getScheduler().runTaskLater(plugin, task, delayTicks);
+        }
+    }
+
+    /**
      * Run a repeating task on the global region.
      * Delay and period are in TICKS on both Paper and Folia.
      */

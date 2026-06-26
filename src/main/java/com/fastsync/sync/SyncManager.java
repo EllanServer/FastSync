@@ -113,6 +113,34 @@ public class SyncManager {
     // saved via the normal QUIT path — they never had a valid lock.
     private final java.util.Set<UUID> failedJoinPlayers = ConcurrentHashMap.newKeySet();
 
+    // Players who currently have a non-empty full-Blob baseline in player_data.
+    //
+    // <p><b>Why this exists:</b> {@code persistComponentsOnly()} writes only
+    // dirty component rows + bumps {@code player_data.version/component_bitmap}
+    // WITHOUT touching the {@code player_data.data} Blob. If a brand-new player
+    // (whose Blob is still empty because no full save has run yet) hits a
+    // component-only save path, the component rows will be persisted but the
+    // Blob baseline remains empty — and on the NEXT login, {@code loadData()}
+    // sees {@code data == null} and treats the player as brand new again,
+    // completely skipping the component overlay. The player's components are
+    // silently orphaned in the DB until the next full Blob save.
+    //
+    // <p>This set is the safety gate:
+    // <ul>
+    //   <li>{@code true} — a full Blob baseline exists in {@code player_data.data};
+    //       component-only save is allowed.</li>
+    //   <li>{@code false} (or absent) — no baseline yet; {@code persistComponentsOnly}
+    //       returns {@code null} so the caller falls back to a full Blob save first.</li>
+    // </ul>
+    //
+    // <p>Lifecycle:
+    // <ul>
+    //   <li>Set on load when {@code loaded.hasData() == true}</li>
+    //   <li>Set on any successful full Blob save (releaseLock or keepLock)</li>
+    //   <li>Removed on quit / failed-join cleanup / stale cleanup</li>
+    // </ul>
+    private final java.util.Set<UUID> playersWithBaseline = ConcurrentHashMap.newKeySet();
+
     // Anti-reentry guard for heartbeat — prevents overlapping heartbeat cycles
     // when DB latency causes the previous cycle to exceed the interval.
     private final AtomicBoolean heartbeatRunning = new AtomicBoolean(false);
@@ -466,6 +494,12 @@ public class SyncManager {
                 playerFencingTokens.put(uuid, fencingToken);
                 // Explicitly set version=0 for new players (DB default, but don't rely on implicit behavior)
                 playerVersions.put(uuid, loaded.version());
+                // CRITICAL: this player has NO full-Blob baseline in player_data.
+                // persistComponentsOnly() will refuse to run until a full Blob
+                // save establishes the baseline. Otherwise component rows would
+                // be orphaned (next login sees empty Blob → treats as new player
+                // → skips component overlay).
+                playersWithBaseline.remove(uuid);
                 if (config.isDebug()) {
                     logger.info("No saved data for " + uuid + " (new player, v" + loaded.version() + ", ft: " + fencingToken + ")");
                 }
@@ -556,6 +590,9 @@ public class SyncManager {
             data.setVersion(loaded.version());
             // Set the fencing token from lock acquisition (Kleppmann-style)
             data.setFencingToken(fencingToken);
+            // A non-empty full-Blob baseline exists in player_data — component-only
+            // saves are safe for this player from now on.
+            playersWithBaseline.add(uuid);
 
             long deserElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
             if (serializeLatency != null) serializeLatency.record(deserElapsedMs);
@@ -641,6 +678,7 @@ public class SyncManager {
         activePlayers.remove(uuid);
         playerVersions.remove(uuid);
         playerFencingTokens.remove(uuid);
+        playersWithBaseline.remove(uuid);
         if (dirtyMask != null) {
             dirtyMask.remove(uuid);
         }
@@ -896,6 +934,7 @@ public class SyncManager {
                 dirtyMask.remove(uuid);
             }
             playerVersions.remove(uuid);
+            playersWithBaseline.remove(uuid);
             if (ft != null && ft > 0) {
                 pendingSaveCount.incrementAndGet();
                 try {
@@ -946,6 +985,7 @@ public class SyncManager {
                 dirtyMask.remove(uuid);
             }
             playerVersions.remove(uuid);
+            playersWithBaseline.remove(uuid);
             // Release lock without saving — use token version if available
             pendingSaveCount.incrementAndGet();
             try {
@@ -1001,6 +1041,7 @@ public class SyncManager {
                 + " Skipping final save — data may be stale. Player should have been kicked.");
             Long ft = playerFencingTokens.remove(uuid);
             playerVersions.remove(uuid);
+            playersWithBaseline.remove(uuid);
             releaseLockAsyncBestEffort(uuid, ft, "quarantined player quit");
             return;
         }
@@ -1030,6 +1071,7 @@ public class SyncManager {
                     // Locks are cleaned up lazily by cleanupStaleEntries().
                     playerVersions.remove(uuid);
                     playerFencingTokens.remove(uuid);
+                    playersWithBaseline.remove(uuid);
                     pendingSaveCount.decrementAndGet();
                 }
             });
@@ -1047,6 +1089,7 @@ public class SyncManager {
                 saveLock.unlock();
                 playerVersions.remove(uuid);
                 playerFencingTokens.remove(uuid);
+                playersWithBaseline.remove(uuid);
                 pendingSaveCount.decrementAndGet();
             }
         }
@@ -1083,6 +1126,7 @@ public class SyncManager {
             dirtyMask.remove(uuid);
         }
         playerVersions.remove(uuid);
+        playersWithBaseline.remove(uuid);
         try {
             if (ft != null && ft > 0) {
                 databaseManager.releaseLock(uuid, config.getServerName(), ft);
@@ -1131,6 +1175,7 @@ public class SyncManager {
                 dirtyMask.remove(uuid);
             }
             playerVersions.remove(uuid);
+            playersWithBaseline.remove(uuid);
             releaseLockAsyncBestEffort(uuid, ft, "quarantined player quit (sync)");
             return;
         }
@@ -1148,6 +1193,7 @@ public class SyncManager {
             saveLock.unlock();
             playerVersions.remove(uuid);
             playerFencingTokens.remove(uuid);
+            playersWithBaseline.remove(uuid);
         }
     }
 
@@ -1661,19 +1707,50 @@ public class SyncManager {
      * Save a snapshot of players' data. The player list must have been
      * collected on the main thread or global region thread (Folia-safe).
      *
-     * <p>This method is safe to call from an async thread because it does NOT
-     * call Bukkit.getOnlinePlayers() — it uses the pre-collected list and
-     * dispatches per-player data collection via SchedulerUtil.runAtEntity().
+     * <p><b>Threading:</b> This method performs two phases:
+     * <ol>
+     *   <li><b>Dispatch phase</b> — iterates the player list, reads
+     *       {@code player.getUniqueId()}, and calls
+     *       {@link SchedulerUtil#runAtEntity}. These operations touch the
+     *       Player object and MUST run on the global region (or main thread
+     *       on Paper). On Folia, calling them from an async thread is
+     *       forbidden — entity state is owned by the entity's region thread.</li>
+     *   <li><b>Wait phase</b> — blocks on {@code future.get()} for each
+     *       dispatched save. This phase does NOT touch any Player object and
+     *       is safe to run on any thread (async is fine).</li>
+     * </ol>
+     *
+     * <p>For the SHUTDOWN path (called from {@code onDisable}), both phases
+     * run on the calling thread (main/global) — that's correct because
+     * shutdown must block until saves complete.
+     *
+     * <p>For the /saveall command path, callers should use
+     * {@link #dispatchPlayerSaves} on the global region, then
+     * {@link #waitForPlayerSaves} on an async thread, so the global region is
+     * not blocked for the duration of the DB waits. See {@code FastSync.java}
+     * for the canonical usage.
      *
      * @param players pre-collected player list (from main/global thread)
      * @param kind    BULK for /saveall (keep lock), SHUTDOWN for onDisable (release lock)
      * @return result with total/success/failed counts
      */
     public SaveAllResult savePlayersSnapshot(List<Player> players, SaveKind kind) {
-        int total = 0;
-        int success = 0;
-        int failed = 0;
-        Map<UUID, String> failures = new HashMap<>();
+        // Phase 1: dispatch (touches Player — must be on global/main thread)
+        List<Map.Entry<UUID, CompletableFuture<SaveResult>>> futures = dispatchPlayerSaves(players, kind);
+        // Phase 2: wait (no Player access — safe on any thread, including the calling thread)
+        return waitForPlayerSaves(futures, kind);
+    }
+
+    /**
+     * Phase 1 of {@link #savePlayersSnapshot}: dispatch per-player saves via
+     * the entity scheduler. Returns the list of (uuid, future) pairs to wait on.
+     *
+     * <p><b>Must be called on the global region (or main thread on Paper).</b>
+     * This method reads {@code player.getUniqueId()} and dispatches via
+     * {@link SchedulerUtil#runAtEntity} — both touch the Player object.
+     */
+    public List<Map.Entry<UUID, CompletableFuture<SaveResult>>> dispatchPlayerSaves(
+            List<Player> players, SaveKind kind) {
         List<Map.Entry<UUID, CompletableFuture<SaveResult>>> futures = new ArrayList<>();
         Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
 
@@ -1681,7 +1758,6 @@ public class SyncManager {
             if (!activePlayers.containsKey(player.getUniqueId())) {
                 continue;
             }
-            total++;
             UUID uuid = player.getUniqueId();
 
             CompletableFuture<SaveResult> future = new CompletableFuture<>();
@@ -1747,13 +1823,28 @@ public class SyncManager {
             });
             futures.add(Map.entry(uuid, future));
         }
+        return futures;
+    }
+
+    /**
+     * Phase 2 of {@link #savePlayersSnapshot}: wait for all dispatched saves to
+     * complete (with a deadline) and aggregate results.
+     *
+     * <p><b>Safe to call from any thread.</b> This method does NOT touch any
+     * Player object — it only waits on {@link CompletableFuture}s.
+     */
+    public SaveAllResult waitForPlayerSaves(
+            List<Map.Entry<UUID, CompletableFuture<SaveResult>>> futures, SaveKind kind) {
+        int total = futures.size();
+        int success = 0;
+        int failed = 0;
+        Map<UUID, String> failures = new HashMap<>();
 
         // Wait for all DB saves with a dynamic deadline.
         // SHUTDOWN: max(30s, online * 500ms) — scales for large servers.
         // BULK: fixed 30s — operator command, can retry.
-        int onlineCount = futures.size();
         long deadlineMs = (kind == SaveKind.SHUTDOWN)
-            ? Math.max(30_000L, onlineCount * 500L)
+            ? Math.max(30_000L, total * 500L)
             : 30_000L;
         long deadlineStart = System.currentTimeMillis();
         for (Map.Entry<UUID, CompletableFuture<SaveResult>> entry : futures) {
@@ -2079,23 +2170,50 @@ public class SyncManager {
     }
 
     /**
-     * Kick a player whose lock was lost during heartbeat. Runs on the main
-     * thread (or region thread for Folia) to safely interact with the player
-     * entity.
+     * Kick a player whose lock was lost during heartbeat.
+     *
+     * <p><b>Folia-safety:</b> Two-phase dispatch:
+     * <ol>
+     *   <li>Global region — look up the Player by UUID. {@code Bukkit.getPlayer(uuid)}
+     *       is safe on the global region; it does not require the entity's region
+     *       thread. This phase verifies the player is still online before
+     *       attempting the kick.</li>
+     *   <li>Entity scheduler — call {@code player.kick(...)}. On Folia, kicking
+     *       a player modifies entity state, which must happen on the entity's
+     *       own region thread. The global region is NOT the same as the player's
+     *       region (a player can be in any region of any world), so we must
+     *       dispatch from global → entity scheduler.</li>
+     * </ol>
+     *
+     * <p>The retired callback handles the case where the entity is no longer
+     * valid by the time the scheduler tries to run the task (player already
+     * logged out between the two phases).
      */
     private void kickPlayerForLockLoss(UUID uuid) {
         Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
         SchedulerUtil.runGlobal(plugin, () -> {
             Player player = org.bukkit.Bukkit.getPlayer(uuid);
-            if (player != null && player.isOnline()) {
-                player.kick(net.kyori.adventure.text.Component.text(
-                    "[FastSync] Your data lock was lost. Please reconnect to re-sync your data.",
-                    net.kyori.adventure.text.format.NamedTextColor.RED));
-            } else {
+            if (player == null || !player.isOnline()) {
                 if (config.isDebug()) {
                     logger.fine("[Heartbeat] Player " + uuid + " already offline; no kick needed.");
                 }
+                return;
             }
+            // Dispatch the kick to the player's own region thread. On Paper,
+            // runAtEntity falls back to the main thread, which is fine.
+            SchedulerUtil.runAtEntity(plugin, player, () -> {
+                if (player.isOnline()) {
+                    player.kick(net.kyori.adventure.text.Component.text(
+                        "[FastSync] Your data lock was lost. Please reconnect to re-sync your data.",
+                        net.kyori.adventure.text.format.NamedTextColor.RED));
+                }
+            }, () -> {
+                // Entity retired between lookup and dispatch — player is gone, nothing to kick.
+                if (config.isDebug()) {
+                    logger.fine("[Heartbeat] Player " + uuid
+                        + " entity retired before kick; no kick needed.");
+                }
+            });
         });
     }
 
@@ -2113,6 +2231,7 @@ public class SyncManager {
             Long ft = playerFencingTokens.remove(uuid);
             failedJoinPlayers.remove(uuid);
             quarantinedPlayers.remove(uuid);
+            playersWithBaseline.remove(uuid);
             asyncExecutor.execute(() -> {
                 try {
                     if (ft != null && ft > 0) {
@@ -2323,11 +2442,38 @@ public class SyncManager {
      */
     private SaveResult persistComponentsOnly(UUID uuid, PlayerData data, SaveKind kind) {
         try {
-            java.util.Set<com.fastsync.sync.dirty.ComponentDirtyMask.Component> dirty =
-                dirtyMask.getDirty(uuid);
-            if (dirty.isEmpty()) {
+            // CRITICAL safety gate: refuse to do a component-only save unless the
+            // player already has a non-empty full-Blob baseline in player_data.
+            //
+            // Without this gate, a brand-new player (whose player_data.data is
+            // still empty because no full save has run yet) would have component
+            // rows written successfully, but on next login loadData() sees
+            // data == null and treats the player as brand new — the component
+            // overlay is skipped, and the player's state is silently lost.
+            //
+            // Returning null here forces the caller (persistCollectedData) to
+            // fall back to a full Blob save, which establishes the baseline.
+            // Subsequent periodic saves can then safely take the component-only
+            // fast path because playersWithBaseline now contains this UUID.
+            if (!playersWithBaseline.contains(uuid)) {
+                if (config.isDebug()) {
+                    logger.fine("[Component] No baseline Blob for " + uuid
+                        + " — falling back to full Blob save first.");
+                }
+                return null;
+            }
+
+            // Snapshot dirty set WITH epochs. The epoch is what protects us
+            // from the lost-update race where a markDirty() arrives while the
+            // DB write is in flight — clearDirty(snapshot) will only clear
+            // components whose epoch still matches, preserving the new signal.
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot dirtySnapshot =
+                dirtyMask.snapshotDirty(uuid);
+            if (dirtySnapshot.isEmpty()) {
                 return null;  // nothing dirty, fall back (shouldn't happen — caller checks)
             }
+            java.util.Set<com.fastsync.sync.dirty.ComponentDirtyMask.Component> dirty =
+                dirtySnapshot.components();
 
             // Cap the batch size to avoid huge transactions
             if (dirty.size() > config.getComponentBatchSize()) {
@@ -2361,9 +2507,23 @@ public class SyncManager {
             }
 
             if (componentBlobs.isEmpty()) {
-                // All dirty components produced no data (e.g. all empty)
-                dirtyMask.clearDirty(uuid, dirty);
-                return SaveResult.success(data.getVersion(), 0);
+                // All dirty components produced no payload (e.g. all empty AND
+                // the serializer returned null for them — currently INVENTORY's
+                // offhand, ENDER_CHEST, POTION_EFFECTS, ADVANCEMENTS, STATS,
+                // ATTRIBUTES, PDC all return null when empty).
+                //
+                // Do NOT clear dirty flags here and pretend success — that would
+                // discard the dirty signal without bumping player_data.version
+                // or writing anything to the DB, leaving the local
+                // playerVersions map out of sync with reality and silently
+                // masking future changes. Instead, fall back to a full Blob
+                // save so the baseline gets rewritten with the current state
+                // and version is properly advanced.
+                if (config.isDebug()) {
+                    logger.fine("[Component] All dirty components for " + uuid
+                        + " produced empty payloads — falling back to full save.");
+                }
+                return null;
             }
 
             long serElapsed = (System.nanoTime() - startSer) / 1_000_000;
@@ -2401,8 +2561,12 @@ public class SyncManager {
             playerVersions.put(uuid, batchResult.newVersion());
             data.setVersion(batchResult.newVersion());
 
-            // Clear dirty flags for the components we just saved
-            dirtyMask.clearDirty(uuid, dirty);
+            // Clear dirty flags using the epoch-protected clear. Only components
+            // whose epoch still matches the snapshot will be cleared — if a
+            // concurrent markDirty bumped an epoch during the DB write, that
+            // component stays dirty and the next periodic save will re-serialize
+            // and re-write it with the latest state.
+            dirtyMask.clearDirty(uuid, dirtySnapshot);
 
             if (config.isDebug()) {
                 logger.info("Component save " + kind + " for " + uuid + ": "
@@ -2521,25 +2685,32 @@ public class SyncManager {
             long fencingToken = data.getFencingToken();
             long saveStart = System.nanoTime();
 
+            // Full Blob save ALWAYS uses the ClearComponents variant, regardless
+            // of whether component-storage is currently enabled. Rationale:
+            // if the server EVER ran with component-storage enabled in the past,
+            // there may be leftover component rows + non-zero component_bitmap in
+            // player_data for this UUID. If we now save the full Blob WITHOUT
+            // bumping component_generation + zeroing component_bitmap, those
+            // stale rows remain visible to future loads and will silently
+            // overlay the freshly written Blob — rolling back parts of the
+            // player's state to whenever the component was last written.
+            //
+            // The ClearComponents variant only writes two extra columns
+            // (component_bitmap=0, component_generation=generation+1) on a row
+            // we are already CAS-updating. The cost is negligible, and it is
+            // safe even when component-storage has never been enabled:
+            //   - component_bitmap defaults to 0, so setting it to 0 is a no-op
+            //   - component_generation defaults to 0, incrementing to 1 is harmless
+            //   - no component rows exist, so the generation bump invalidates nothing
             boolean saved;
             if (kind.releaseLock) {
-                // Final save (quit): release lock after successful write.
-                // If component-storage is enabled, use the ClearComponents variant
-                // to atomically delete stale component rows + reset bitmap,
-                // preventing stale override on next login.
-                if (config.isComponentStorageEnabled()) {
-                    saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
-                } else {
-                    saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
-                }
+                // Final save (quit): release lock after successful write, and
+                // atomically invalidate stale component rows via generation bump.
+                saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
             } else {
-                // Online save (periodic/bulk/world_save/death): keep lock, refresh locked_at.
-                // Same ClearComponents logic applies — full Blob is the new baseline.
-                if (config.isComponentStorageEnabled()) {
-                    saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
-                } else {
-                    saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
-                }
+                // Online save (periodic/bulk/world_save/death): keep lock, refresh
+                // locked_at, and atomically invalidate stale component rows.
+                saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
             }
 
             long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
@@ -2575,19 +2746,14 @@ public class SyncManager {
                     compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
                     checksum = DatabaseManager.computeChecksum(serialized);
 
-                    // Retry the save with the actual version
+                    // Retry the save with the actual version. Same rationale
+                    // as the first attempt: always use the ClearComponents
+                    // variant so a previous component-storage session cannot
+                    // resurrect stale component rows after the Blob is rewritten.
                     if (kind.releaseLock) {
-                        if (config.isComponentStorageEnabled()) {
-                            saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
-                        } else {
-                            saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
-                        }
+                        saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
                     } else {
-                        if (config.isComponentStorageEnabled()) {
-                            saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
-                        } else {
-                            saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
-                        }
+                        saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
                     }
 
                     if (saved) {
@@ -2643,6 +2809,11 @@ public class SyncManager {
 
             // 5b. Success: advance version + log + snapshot + publish
             advanceVersion(uuid, expectedVersion);
+
+            // A successful full Blob save establishes (or refreshes) the baseline.
+            // From this point on, component-only saves are safe for this player
+            // for the remainder of the session.
+            playersWithBaseline.add(uuid);
 
             // Full Blob save contains the latest state of all enabled components,
             // so all dirty flags can be cleared. Without this, a player who was

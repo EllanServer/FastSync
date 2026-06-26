@@ -21,6 +21,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.logging.Level;
 
@@ -153,13 +154,24 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 // Snapshot online players on the global region thread, then save them
                 // in small batches spread across successive ticks to avoid a lag spike
                 // when many players are online (process at most 10 players per tick).
+                //
+                // CRITICAL (Folia-safety): the batched dispatch MUST run on the
+                // global region (runGlobalDelayed), NOT on an async thread
+                // (runAsyncDelayed). savePlayerAsync(player) reads
+                // player.getUniqueId() and calls SchedulerUtil.runAtEntity(plugin,
+                // player, ...) — both touch the Player object. On Folia, async
+                // threads must not touch Player entities; the global region is
+                // the safe context for these reads. The actual DB write still
+                // happens on the async executor (dispatched from inside
+                // runAtEntity), so the global region is only used for the
+                // brief per-player dispatch, not for the DB wait.
                 List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
                 final int batchSize = configManager.getPeriodicSaveBatchSize();
                 for (int i = 0; i < players.size(); i += batchSize) {
                     final int start = i;
                     final int end = Math.min(i + batchSize, players.size());
                     long delayTicks = i / batchSize;
-                    SchedulerUtil.runAsyncDelayed(this, () -> {
+                    SchedulerUtil.runGlobalDelayed(this, () -> {
                         for (int j = start; j < end; j++) {
                             syncManager.savePlayerAsync(players.get(j));
                         }
@@ -256,14 +268,27 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             }
             case "saveall" -> {
                 sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saving all online players...");
-                // CRITICAL: Bukkit.getOnlinePlayers() must be called on the main
-                // thread (or global region for Folia). Collect the player list
-                // on a safe thread first, then dispatch the async save.
+                // CRITICAL (Folia-safety): the save flow is split into two phases:
+                //
+                //   Phase 1 (dispatch) — runs on the global region. Captures the
+                //   player list via Bukkit.getOnlinePlayers(), then for each
+                //   player reads player.getUniqueId() and dispatches via
+                //   SchedulerUtil.runAtEntity. Both operations touch the Player
+                //   object, which is forbidden from async threads on Folia.
+                //
+                //   Phase 2 (wait) — runs on the async executor. Iterates the
+                //   futures returned by phase 1 and blocks on future.get() with
+                //   a deadline. This phase does NOT touch any Player object, so
+                //   it is safe to run on async. Moving it off the global region
+                //   prevents /saveall from blocking global ticks while DB writes
+                //   complete (up to 30s on large servers).
                 SchedulerUtil.runGlobal(this, () -> {
                     List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
+                    List<Map.Entry<UUID, java.util.concurrent.CompletableFuture<SyncManager.SaveResult>>> futures =
+                        syncManager.dispatchPlayerSaves(players, SyncManager.SaveKind.BULK);
                     SchedulerUtil.runAsync(this, () -> {
                         try {
-                            SyncManager.SaveAllResult result = syncManager.savePlayersSnapshot(players, SyncManager.SaveKind.BULK);
+                            SyncManager.SaveAllResult result = syncManager.waitForPlayerSaves(futures, SyncManager.SaveKind.BULK);
                             SchedulerUtil.runGlobal(this, () -> {
                                 if (result.allSucceeded()) {
                                     sender.sendMessage(ChatColor.GREEN + "[FastSync] All " + result.total() + " players saved!");
