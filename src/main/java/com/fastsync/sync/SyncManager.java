@@ -145,7 +145,7 @@ public class SyncManager {
 
         // Initialize snapshot system if enabled
         if (config.isSnapshotEnabled()) {
-            snapshotManager = new SnapshotManager(logger, config);
+            snapshotManager = new SnapshotManager(logger, config, asyncExecutor.getExecutor());
             snapshotManager.initialize(databaseManager);
             logger.info("Snapshot/backup system enabled (max " + config.getMaxSnapshots() + " per player).");
         }
@@ -703,7 +703,7 @@ public class SyncManager {
                 long startTime = System.nanoTime();
 
                 byte[] serialized = PlayerDataSerializer.serialize(data);
-                byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
+                byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
                 long checksum = DatabaseManager.computeChecksum(serialized);
 
                 long serElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
@@ -1321,7 +1321,7 @@ public class SyncManager {
                     asyncExecutor.execute(() -> {
                         try {
                             byte[] serialized = PlayerDataSerializer.serialize(data);
-                            byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
+                            byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
                             long checksum = DatabaseManager.computeChecksum(serialized);
                             long expectedVersion = data.getVersion();
                             long fencingToken = data.getFencingToken();
@@ -1397,7 +1397,7 @@ public class SyncManager {
                 }
                 try {
                     byte[] serialized = PlayerDataSerializer.serialize(data);
-                    byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
+                    byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
                     long checksum = DatabaseManager.computeChecksum(serialized);
                 long expectedVersion = data.getVersion();
                 long fencingToken = data.getFencingToken();

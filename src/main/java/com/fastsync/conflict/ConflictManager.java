@@ -91,7 +91,7 @@ public class ConflictManager {
 
         try {
             byte[] serialized = PlayerDataSerializer.serialize(staleData);
-            byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
+            byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
             String cause = String.format("CONFLICT_expected_v%d_actual_v%d", expectedVersion, actualVersion);
 
             snapshotManager.createSnapshot(uuid, compressed, cause)

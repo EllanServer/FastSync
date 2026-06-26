@@ -7,6 +7,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -29,13 +30,20 @@ public class SnapshotManager {
 
     private final Logger logger;
     private final ConfigManager config;
+    private final Executor executor;
 
     private DatabaseManager databaseManager;
     private String snapshotTable;
 
-    public SnapshotManager(Logger logger, ConfigManager config) {
+    /**
+     * @param executor the dedicated executor for async DB operations.
+     *                 Must NOT be ForkJoinPool.commonPool() — use the plugin's
+     *                 AsyncExecutor to ensure bounded threads and backpressure.
+     */
+    public SnapshotManager(Logger logger, ConfigManager config, Executor executor) {
         this.logger = logger;
         this.config = config;
+        this.executor = executor;
     }
 
     /**
@@ -133,7 +141,7 @@ public class SnapshotManager {
                 logger.log(Level.SEVERE, "Failed to create snapshot for " + uuid, e);
                 throw new RuntimeException(e);
             }
-        });
+        }, executor);
     }
 
     /**
@@ -176,7 +184,7 @@ public class SnapshotManager {
                 throw new RuntimeException(e);
             }
             return snapshots;
-        });
+        }, executor);
     }
 
     /**
@@ -204,7 +212,7 @@ public class SnapshotManager {
                 throw new RuntimeException(e);
             }
             return null;
-        });
+        }, executor);
     }
 
     /**
@@ -231,7 +239,7 @@ public class SnapshotManager {
                 throw new RuntimeException(e);
             }
             return null;
-        });
+        }, executor);
     }
 
     /**
@@ -261,7 +269,7 @@ public class SnapshotManager {
                 throw new RuntimeException(e);
             }
             return null;
-        });
+        }, executor);
     }
 
     /**
@@ -318,7 +326,7 @@ public class SnapshotManager {
                     " (maxSnapshots=" + maxSnapshots + ")");
             }
             return null;
-        });
+        }, executor);
     }
 
     /**

@@ -40,6 +40,20 @@ public class CompressionUtil {
      * @return wrapped data with header (and optionally compressed)
      */
     public static byte[] wrap(byte[] data, int minSize) {
+        return wrap(data, minSize, true);
+    }
+
+    /**
+     * Wraps raw data with header and optionally compresses with LZ4.
+     *
+     * @param data              raw serialized data
+     * @param minSize           minimum data size to trigger compression (bytes)
+     * @param compressionEnabled if false, data is stored uncompressed (header only)
+     * @return wrapped data with header (and optionally compressed)
+     */
+    public static byte[] wrap(byte[] data, int minSize, boolean compressionEnabled) {
+        int effectiveMinSize = compressionEnabled ? minSize : Integer.MAX_VALUE;
+
         if (data == null || data.length == 0) {
             byte[] result = new byte[2];
             result[0] = FORMAT_VERSION;
@@ -47,7 +61,7 @@ public class CompressionUtil {
             return result;
         }
 
-        boolean shouldCompress = data.length >= minSize;
+        boolean shouldCompress = data.length >= effectiveMinSize;
 
         if (shouldCompress) {
             int maxCompressedLen = compressor.maxCompressedLength(data.length);

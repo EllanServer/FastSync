@@ -4,6 +4,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.inventory.ItemStack;
 
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -26,6 +27,13 @@ import java.util.logging.Logger;
 public class ItemStackCompat {
 
     private static final Logger logger = Logger.getLogger("FastSync");
+
+    // Format header bytes — prepended to every serialized ItemStack payload.
+    // This eliminates exception-based format detection on deserialization.
+    // Legacy data (without header) is handled by checking if the first byte
+    // matches a known format marker; if not, both paths are tried.
+    public static final byte FORMAT_PAPER_NATIVE = 1;
+    public static final byte FORMAT_BUKKIT_OBJECT = 2;
 
     // Reflection cache for Paper API methods
     private static Boolean paperNativeAvailable = null;
@@ -63,8 +71,12 @@ public class ItemStackCompat {
      * Uses Paper's native NBT serialization when available.
      * Falls back to Bukkit object serialization (still byte[], NOT string).
      *
+     * Format: [1 byte: format marker][payload bytes]
+     *   FORMAT_PAPER_NATIVE (1)  → Paper serializeAsBytes() output
+     *   FORMAT_BUKKIT_OBJECT (2) → BukkitObjectOutputStream output
+     *
      * @param item the ItemStack to serialize (null returns empty array)
-     * @return serialized byte[]
+     * @return serialized byte[] with format header
      */
     public static byte[] serialize(ItemStack item) {
         if (item == null || item.getType().isAir()) {
@@ -73,18 +85,26 @@ public class ItemStackCompat {
 
         if (isPaperNativeAvailable()) {
             try {
-                return (byte[]) serializeAsBytesMethod.invoke(item);
+                byte[] raw = (byte[]) serializeAsBytesMethod.invoke(item);
+                return prependHeader(FORMAT_PAPER_NATIVE, raw);
             } catch (Exception e) {
                 logger.log(Level.WARNING, "[ItemStackCompat] Native serialize failed, falling back", e);
             }
         }
 
         // Fallback: Bukkit object serialization (byte[], not string)
-        return serializeBukkit(item);
+        byte[] raw = serializeBukkit(item);
+        return prependHeader(FORMAT_BUKKIT_OBJECT, raw);
     }
 
     /**
      * Deserialize an ItemStack from byte[].
+     *
+     * Reads the format header byte to determine the serialization format,
+     * then dispatches to the correct deserializer — no exception-based guessing.
+     *
+     * For legacy data without a format header (first byte is not 1 or 2),
+     * falls back to trying both paths.
      *
      * @param bytes the serialized data (empty array returns null)
      * @return deserialized ItemStack, or null on failure
@@ -94,16 +114,50 @@ public class ItemStackCompat {
             return null;
         }
 
+        byte firstByte = bytes[0];
+
+        if (firstByte == FORMAT_PAPER_NATIVE) {
+            // Paper native format — strip header and deserialize
+            byte[] raw = Arrays.copyOfRange(bytes, 1, bytes.length);
+            return deserializePaperNative(raw);
+        } else if (firstByte == FORMAT_BUKKIT_OBJECT) {
+            // Bukkit object format — strip header and deserialize
+            byte[] raw = Arrays.copyOfRange(bytes, 1, bytes.length);
+            return deserializeBukkit(raw);
+        } else {
+            // Legacy data without format header — try both paths.
+            // Paper's NBT binary starts with 0x0A (compound tag);
+            // Bukkit's ObjectOutputStream starts with 0xAC (-84).
+            // Neither starts with 1 or 2, so false positives are impossible.
+            if (isPaperNativeAvailable()) {
+                try {
+                    return (ItemStack) deserializeBytesMethod.invoke(null, (Object) bytes);
+                } catch (Exception e) {
+                    logger.log(Level.FINE, "[ItemStackCompat] Legacy native deserialize failed, trying Bukkit", e);
+                }
+            }
+            return deserializeBukkit(bytes);
+        }
+    }
+
+    /** Prepend a 1-byte format header to the payload. */
+    private static byte[] prependHeader(byte format, byte[] payload) {
+        byte[] result = new byte[1 + payload.length];
+        result[0] = format;
+        System.arraycopy(payload, 0, result, 1, payload.length);
+        return result;
+    }
+
+    /** Deserialize using Paper's native API (no fallback). */
+    private static ItemStack deserializePaperNative(byte[] raw) {
         if (isPaperNativeAvailable()) {
             try {
-                return (ItemStack) deserializeBytesMethod.invoke(null, (Object) bytes);
+                return (ItemStack) deserializeBytesMethod.invoke(null, (Object) raw);
             } catch (Exception e) {
-                logger.log(Level.WARNING, "[ItemStackCompat] Native deserialize failed, falling back", e);
+                logger.log(Level.WARNING, "[ItemStackCompat] Paper native deserialize failed", e);
             }
         }
-
-        // Fallback: Bukkit object deserialization
-        return deserializeBukkit(bytes);
+        return null;
     }
 
     /**
