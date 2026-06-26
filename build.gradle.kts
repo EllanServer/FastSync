@@ -47,7 +47,7 @@ dependencies {
 
     // Maven Central runtime deps: compileOnly because Paper will download them
     // via plugin.yml `libraries:` at startup.
-    compileOnly("com.zaxxer:HikariCP:5.1.0")
+    compileOnly("com.zaxxer:HikariCP:7.1.0")
     compileOnly("org.lz4:lz4-java:1.8.1")
     compileOnly("com.mysql:mysql-connector-j:9.0.0")
     compileOnly("io.lettuce:lettuce-core:7.6.0.RELEASE")
@@ -79,7 +79,7 @@ dependencies {
     testImplementation("org.openjdk.jmh:jmh-generator-annprocess:1.37")
     // Paper API + Maven Central runtime deps needed at test runtime.
     testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
-    testImplementation("com.zaxxer:HikariCP:5.1.0")
+    testImplementation("com.zaxxer:HikariCP:7.1.0")
     testImplementation("org.lz4:lz4-java:1.8.1")
     testImplementation("com.mysql:mysql-connector-j:9.0.0")
     testImplementation("io.lettuce:lettuce-core:7.6.0.RELEASE")
