@@ -121,6 +121,11 @@ sync:
   sync-flight: true
   sync-pdc: true
   sync-location: false
+  # When sync-location is true, validate world before teleporting:
+  location:
+    require-same-world-name: true   # World name must match (avoid cross-world teleport)
+    require-same-world-uuid: true   # World UUID must match (prevent same-name different-world)
+    fallback-to-spawn: true         # If validation fails, teleport to spawn instead
   sync-locked-maps: true
 
   # Save on death
@@ -131,6 +136,54 @@ sync:
 
   # Cancel commands while player data is loading
   cancel-commands-while-locked: false
+
+# ------------------------------------------------------------
+# PDC (PersistentDataContainer) Sync Strategy
+# ------------------------------------------------------------
+# Controls how custom PersistentDataContainer data is synchronized.
+#   off              - No PDC sync
+#   safe-all-paper   - (default) Use Paper's public serializeToBytes() API.
+#                      Safe, no reflection. Requires Paper 1.21.11+.
+#   registered-only  - Only sync keys explicitly listed in registered-keys below.
+#                      Production recommended: avoids syncing plugin-internal data.
+#   unsafe-reflection - Use reflection to access package-private methods.
+#                      Fallback for older Paper versions. Requires explicit
+#                      confirmation (unsafe-reflection.enabled: true).
+pdc:
+  mode: "safe-all-paper"
+  # When mode=registered-only, list keys to sync as "namespace:key=TYPE"
+  # e.g. "myplugin:progress=INTEGER", "myplugin:rank=STRING"
+  registered-keys: []
+  # Double-confirmation for unsafe-reflection mode
+  unsafe-reflection:
+    enabled: false
+
+# ------------------------------------------------------------
+# Statistics Sync Strategy
+# ------------------------------------------------------------
+# Basic statistics (UNTYPED: jump, walk, play_time...) are always synced
+# when sync-statistics is true — they are cheap and server-agnostic.
+# 
+# Typed statistics (ITEM/BLOCK/ENTITY: mine-block, kill-entity, use-item...)
+# are expensive to collect (~1300 Materials × N stats) and often
+# server-specific. They are disabled by default.
+statistics:
+  typed:
+    # Whether to sync typed statistics (ITEM/BLOCK/ENTITY)
+    enabled: false
+    # Mode for typed statistics:
+    #   whitelist - Only sync entries listed below (recommended)
+    #   full      - Sync all typed statistics (expensive!)
+    mode: "whitelist"
+    # When mode=whitelist, list entries as "STATISTIC_NAME=MATERIAL_NAME"
+    # e.g. "MINE_BLOCK=DIAMOND_ORE", "KILL_ENTITY=ENDER_DRAGON"
+    whitelist:
+      - "MINE_BLOCK=DIAMOND_ORE"
+      - "MINE_BLOCK=ANCIENT_DEBRIS"
+      - "MINE_BLOCK=EMERALD_ORE"
+      - "KILL_ENTITY=ENDER_DRAGON"
+      - "KILL_ENTITY=WITHER"
+      - "USE_ITEM=TOTEM_OF_UNDYING"
 
 # ------------------------------------------------------------
 # Cluster Settings

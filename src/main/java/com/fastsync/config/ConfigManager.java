@@ -8,6 +8,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import java.io.File;
 import java.io.IOException;
 import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Manages FastSync configuration loading and access.
@@ -23,6 +24,7 @@ public class ConfigManager {
     private final JavaPlugin plugin;
     private final SparrowYaml yaml;
     private YamlDocument doc;
+    private final Logger logger;
 
     // Server
     private String serverName;
@@ -84,6 +86,21 @@ public class ConfigManager {
     private boolean syncLocation;
     private boolean syncLockedMaps;
 
+    // PDC strategy config
+    private String pdcMode;                    // off | safe-all-paper | registered-only | unsafe-reflection
+    private boolean unsafePdcConfirmed;        // explicit confirmation for unsafe-reflection
+    private java.util.List<String> registeredPdcKeys;  // list of "namespace:key=TYPE" strings
+
+    // Typed statistics config
+    private boolean typedStatsEnabled;         // default false
+    private String typedStatsMode;             // whitelist | full
+    private java.util.List<String> typedStatsWhitelist;  // list of "STATISTIC_NAME=MATERIAL_NAME" strings
+
+    // Location validation config
+    private boolean locationRequireSameWorldName;  // default true
+    private boolean locationRequireSameWorldUuid;  // default true
+    private boolean locationFallbackToSpawn;       // default true
+
     // Snapshot
     private boolean snapshotEnabled;
     private int maxSnapshots;
@@ -128,6 +145,7 @@ public class ConfigManager {
     public ConfigManager(JavaPlugin plugin) {
         this.plugin = plugin;
         this.yaml = SparrowYaml.builder().build();
+        this.logger = plugin.getLogger();
     }
 
     /**
@@ -142,6 +160,7 @@ public class ConfigManager {
         }
         this.plugin = null;
         this.yaml = null;
+        this.logger = Logger.getLogger("FastSync");
     }
 
     public void load() {
@@ -243,6 +262,36 @@ public class ConfigManager {
         syncLocation = source.getBoolean("sync.sync-location", false);
         syncLockedMaps = source.getBoolean("sync.sync-locked-maps", true);
 
+        // PDC strategy
+        pdcMode = source.getString("pdc.mode",
+            syncPDC ? "safe-all-paper" : "off");
+        unsafePdcConfirmed = source.getBoolean("pdc.unsafe-reflection.enabled", false);
+        registeredPdcKeys = source.getStringList("pdc.registered-keys");
+
+        // Typed statistics
+        typedStatsEnabled = source.getBoolean("statistics.typed.enabled", false);
+        typedStatsMode = source.getString("statistics.typed.mode", "whitelist");
+        typedStatsWhitelist = source.getStringList("statistics.typed.whitelist");
+
+        // Location validation
+        locationRequireSameWorldName = source.getBoolean("sync.location.require-same-world-name", true);
+        locationRequireSameWorldUuid = source.getBoolean("sync.location.require-same-world-uuid", true);
+        locationFallbackToSpawn = source.getBoolean("sync.location.fallback-to-spawn", true);
+
+        // Migration: old sync-pdc boolean -> new pdc.mode
+        if (source.contains("sync.sync-pdc") && !source.contains("pdc.mode")) {
+            boolean oldPdc = source.getBoolean("sync.sync-pdc", true);
+            pdcMode = oldPdc ? "safe-all-paper" : "off";
+            logger.warning("[Config] Migrated old 'sync.sync-pdc' to 'pdc.mode=" + pdcMode + "'. Please update your config.");
+        }
+        // Migration: old sync-statistics boolean -> new statistics.typed.enabled
+        if (source.contains("sync.sync-statistics") && !source.contains("statistics.typed.enabled")) {
+            // Old behavior: if sync-statistics was true, typed stats were on (full mode)
+            typedStatsEnabled = syncStatistics;
+            if (syncStatistics) typedStatsMode = "full";
+            logger.warning("[Config] Migrated old 'sync.sync-statistics' to 'statistics.typed.enabled=" + typedStatsEnabled + "'. Please update your config.");
+        }
+
         // Snapshot
         snapshotEnabled = source.getBoolean("snapshot.enabled", true);
         maxSnapshots = source.getInt("snapshot.max-snapshots", 16);
@@ -340,6 +389,18 @@ public class ConfigManager {
     public boolean isSyncLocation() { return syncLocation; }
     public boolean isSyncLockedMaps() { return syncLockedMaps; }
 
+    public String getPdcMode() { return pdcMode; }
+    public boolean isUnsafePdcConfirmed() { return unsafePdcConfirmed; }
+    public java.util.List<String> getRegisteredPdcKeys() { return registeredPdcKeys; }
+
+    public boolean isTypedStatsEnabled() { return typedStatsEnabled; }
+    public String getTypedStatsMode() { return typedStatsMode; }
+    public java.util.List<String> getTypedStatsWhitelist() { return typedStatsWhitelist; }
+
+    public boolean isLocationRequireSameWorldName() { return locationRequireSameWorldName; }
+    public boolean isLocationRequireSameWorldUuid() { return locationRequireSameWorldUuid; }
+    public boolean isLocationFallbackToSpawn() { return locationFallbackToSpawn; }
+
     public boolean isSnapshotEnabled() { return snapshotEnabled; }
     public int getMaxSnapshots() { return maxSnapshots; }
     public long getSnapshotBackupFrequencyMs() { return snapshotBackupFrequencyMs; }
@@ -382,6 +443,13 @@ public class ConfigManager {
         int getInt(String key, int def);
         long getLong(String key, long def);
         boolean getBoolean(String key, boolean def);
+        java.util.List<String> getStringList(String key);
+        /**
+         * Returns {@code true} only if a value is explicitly present at the
+         * given path in the user's config (i.e. not merely a default). This is
+         * the semantics required by old-config migration detection.
+         */
+        boolean contains(String key);
     }
 
     /**
@@ -419,6 +487,28 @@ public class ConfigManager {
         public boolean getBoolean(String key, boolean def) {
             return document.getOrDefault(Boolean.class, def, route(key));
         }
+
+        @Override
+        public java.util.List<String> getStringList(String key) {
+            try {
+                java.util.List<String> list = document.getOrDefault(
+                    new net.momirealms.sparrow.yaml.serializer.TypeRef<java.util.List<String>>() {},
+                    java.util.Collections.<String>emptyList(),
+                    route(key));
+                return list == null ? java.util.Collections.emptyList() : list;
+            } catch (Exception e) {
+                // Non-list value at path (or parse failure) -> treat as empty list,
+                // mirroring Bukkit's getStringList() behavior.
+                return java.util.Collections.emptyList();
+            }
+        }
+
+        @Override
+        public boolean contains(String key) {
+            // sparrow-yaml does not merge config defaults, so a non-null node
+            // means the key is explicitly present in the user's file.
+            return document.getNodeOrNull(route(key)) != null;
+        }
     }
 
     /**
@@ -450,6 +540,19 @@ public class ConfigManager {
         @Override
         public boolean getBoolean(String key, boolean def) {
             return config.getBoolean(key, def);
+        }
+
+        @Override
+        public java.util.List<String> getStringList(String key) {
+            return config.getStringList(key);
+        }
+
+        @Override
+        public boolean contains(String key) {
+            // isSet() returns true only when the key is explicitly present in
+            // the user's file (not from the bundled default config), which is
+            // what migration detection needs.
+            return config.isSet(key);
         }
     }
 }

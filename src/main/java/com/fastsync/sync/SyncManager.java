@@ -112,6 +112,11 @@ public class SyncManager {
     // Parsed snapshot trigger set (computed once at init/reload, O(1) lookup per save).
     private volatile java.util.Set<String> snapshotTriggerSet;
 
+    // Sync strategies (initialized in initialize())
+    private com.fastsync.sync.strategy.PdcSyncStrategy pdcStrategy;
+    private com.fastsync.sync.strategy.TypedStatisticStrategy typedStatsStrategy;
+    private com.fastsync.sync.strategy.LocationSyncStrategy locationStrategy;
+
     public SyncManager(FastSync plugin, ConfigManager config, DatabaseManager databaseManager) {
         this.plugin = plugin;
         this.config = config;
@@ -180,6 +185,24 @@ public class SyncManager {
 
         // Parse snapshot trigger set for O(1) lookup during saves
         parseSnapshotTriggerSet();
+
+        // Initialize sync strategies
+        pdcStrategy = com.fastsync.sync.strategy.PdcStrategyFactory.create(config, logger);
+        logger.info("PDC sync strategy: " + pdcStrategy.strategyName()
+            + (pdcStrategy.isSafe() ? "" : " (UNSAFE)"));
+
+        if (config.isTypedStatsEnabled()) {
+            typedStatsStrategy = createTypedStatsStrategy();
+        } else {
+            typedStatsStrategy = null;
+        }
+        if (typedStatsStrategy != null) {
+            logger.info("Typed statistics strategy: " + typedStatsStrategy.strategyName());
+        } else {
+            logger.info("Typed statistics: disabled (basic stats still synced if sync-statistics is on)");
+        }
+
+        locationStrategy = new com.fastsync.sync.strategy.LocationSyncStrategy(config, logger);
     }
 
     /**
@@ -188,6 +211,77 @@ public class SyncManager {
      */
     public void refreshConfigCache() {
         parseSnapshotTriggerSet();
+        // Re-create strategies that depend on config
+        pdcStrategy = com.fastsync.sync.strategy.PdcStrategyFactory.create(config, logger);
+        if (config.isTypedStatsEnabled()) {
+            typedStatsStrategy = createTypedStatsStrategy();
+        } else {
+            typedStatsStrategy = null;
+        }
+        locationStrategy = new com.fastsync.sync.strategy.LocationSyncStrategy(config, logger);
+    }
+
+    /**
+     * Create the typed statistics strategy based on config.
+     * Uses the cached registry lists (untypedStats/itemStats/blockStats/entityStats/
+     * itemMaterials/blockMaterials/aliveEntities) populated by ensureRegistryCache().
+     */
+    private com.fastsync.sync.strategy.TypedStatisticStrategy createTypedStatsStrategy() {
+        ensureRegistryCache();
+        String mode = config.getTypedStatsMode();
+        if ("full".equalsIgnoreCase(mode)) {
+            return new com.fastsync.sync.strategy.FullTypedStatsStrategy(
+                itemStats, blockStats, entityStats,
+                itemMaterials, blockMaterials, aliveEntities);
+        }
+        // Default: whitelist
+        return parseWhitelistStrategy();
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private com.fastsync.sync.strategy.TypedStatisticStrategy parseWhitelistStrategy() {
+        java.util.List<String> rawList = config.getTypedStatsWhitelist();
+        if (rawList == null || rawList.isEmpty()) {
+            logger.warning("[Stats] Whitelist mode but no entries configured. Typed stats will be empty.");
+            return new com.fastsync.sync.strategy.WhitelistTypedStatsStrategy(null, null, null);
+        }
+
+        java.util.List<com.fastsync.sync.strategy.WhitelistTypedStatsStrategy.StatBinding<org.bukkit.Material>> itemBindings = new ArrayList<>();
+        java.util.List<com.fastsync.sync.strategy.WhitelistTypedStatsStrategy.StatBinding<org.bukkit.Material>> blockBindings = new ArrayList<>();
+        java.util.List<com.fastsync.sync.strategy.WhitelistTypedStatsStrategy.StatBinding<org.bukkit.entity.EntityType>> entityBindings = new ArrayList<>();
+
+        for (String entry : rawList) {
+            // Format: "STATISTIC_NAME=MATERIAL_NAME"
+            String[] parts = entry.split("=", 2);
+            if (parts.length != 2) continue;
+            String statName = parts[0].trim().toUpperCase();
+            String targetName = parts[1].trim().toUpperCase();
+
+            try {
+                org.bukkit.Statistic stat = org.bukkit.Statistic.valueOf(statName);
+                if (stat.getType() == org.bukkit.Statistic.Type.ITEM) {
+                    org.bukkit.Material mat = org.bukkit.Material.matchMaterial(targetName);
+                    if (mat != null && mat.isItem()) {
+                        itemBindings.add(new com.fastsync.sync.strategy.WhitelistTypedStatsStrategy.StatBinding<>(stat, mat));
+                    }
+                } else if (stat.getType() == org.bukkit.Statistic.Type.BLOCK) {
+                    org.bukkit.Material mat = org.bukkit.Material.matchMaterial(targetName);
+                    if (mat != null && mat.isBlock()) {
+                        blockBindings.add(new com.fastsync.sync.strategy.WhitelistTypedStatsStrategy.StatBinding<>(stat, mat));
+                    }
+                } else if (stat.getType() == org.bukkit.Statistic.Type.ENTITY) {
+                    org.bukkit.entity.EntityType ent = org.bukkit.entity.EntityType.valueOf(targetName);
+                    entityBindings.add(new com.fastsync.sync.strategy.WhitelistTypedStatsStrategy.StatBinding<>(stat, ent));
+                }
+            } catch (IllegalArgumentException ignored) {
+                logger.warning("[Stats] Invalid whitelist entry: " + entry);
+            }
+        }
+
+        logger.info("[Stats] Whitelist: " + itemBindings.size() + " item, "
+            + blockBindings.size() + " block, " + entityBindings.size() + " entity bindings.");
+        return new com.fastsync.sync.strategy.WhitelistTypedStatsStrategy(
+            itemBindings, blockBindings, entityBindings);
     }
 
     // ==================== Load (Pre-Login) ====================
@@ -495,21 +589,19 @@ public class SyncManager {
             applyAttributes(player, data);
         }
 
-        // Persistent Data Container
-        if (config.isSyncPDC()) {
-            applyPDC(player, data);
+        // Persistent Data Container (via strategy)
+        if (pdcStrategy != null && !"off".equals(pdcStrategy.strategyName())
+                && data.getPersistentDataContainer() != null
+                && !data.getPersistentDataContainer().isEmpty()) {
+            byte[] pdcBytes = data.getPersistentDataContainer().get("__pdc_bytes__");
+            if (pdcBytes != null) {
+                pdcStrategy.restore(player, pdcBytes);
+            }
         }
 
-        // Location (optional)
+        // Location (optional, with validation via LocationSyncStrategy)
         if (config.isSyncLocation() && data.getWorldName() != null) {
-            try {
-                var world = Bukkit.getWorld(data.getWorldName());
-                if (world != null) {
-                    player.teleport(new Location(world, data.getX(), data.getY(), data.getZ(), data.getYaw(), data.getPitch()));
-                }
-            } catch (Exception e) {
-                if (config.isDebug()) logger.warning("Failed to apply location: " + e.getMessage());
-            }
+            locationStrategy.apply(player, data);
         }
 
         activePlayers.put(uuid, true);
@@ -732,7 +824,7 @@ public class SyncManager {
             collectAdvancements(player, data);
         }
 
-        // Statistics
+        // Statistics (basic UNTYPED stats always synced; typed stats via strategy)
         if (config.isSyncStatistics()) {
             collectStatistics(player, data);
         }
@@ -742,9 +834,16 @@ public class SyncManager {
             collectAttributes(player, data);
         }
 
-        // Persistent Data Container
-        if (config.isSyncPDC()) {
-            collectPDC(player, data);
+        // Persistent Data Container (via strategy)
+        if (pdcStrategy != null && !"off".equals(pdcStrategy.strategyName())) {
+            byte[] pdcBytes = pdcStrategy.dump(player);
+            if (pdcBytes != null && pdcBytes.length > 0) {
+                Map<String, byte[]> pdcMap = new HashMap<>();
+                pdcMap.put("__pdc_bytes__", pdcBytes);
+                data.setPersistentDataContainer(pdcMap);
+            } else {
+                data.setPersistentDataContainer(new HashMap<>());
+            }
         }
 
         // Location (optional)
@@ -846,7 +945,7 @@ public class SyncManager {
         try {
             Map<String, Map<String, Integer>> statistics = new HashMap<>();
 
-            // UNTYPED statistics
+            // UNTYPED statistics (always synced — cheap, server-agnostic)
             for (Statistic stat : untypedStats) {
                 try {
                     int value = player.getStatistic(stat);
@@ -854,36 +953,11 @@ public class SyncManager {
                 } catch (Exception ignored) {}
             }
 
-            // ITEM statistics
-            for (Statistic stat : itemStats) {
-                Map<String, Integer> itemStatMap = statistics.computeIfAbsent("ITEM_" + stat.name(), k -> new HashMap<>());
-                for (org.bukkit.Material mat : itemMaterials) {
-                    try {
-                        int v = player.getStatistic(stat, mat);
-                        if (v != 0) itemStatMap.put(mat.name(), v);
-                    } catch (Exception ignored) {}
-                }
-            }
-
-            // BLOCK statistics
-            for (Statistic stat : blockStats) {
-                Map<String, Integer> blockStatMap = statistics.computeIfAbsent("BLOCK_" + stat.name(), k -> new HashMap<>());
-                for (org.bukkit.Material mat : blockMaterials) {
-                    try {
-                        int v = player.getStatistic(stat, mat);
-                        if (v != 0) blockStatMap.put(mat.name(), v);
-                    } catch (Exception ignored) {}
-                }
-            }
-
-            // ENTITY statistics
-            for (Statistic stat : entityStats) {
-                Map<String, Integer> entityStatMap = statistics.computeIfAbsent("ENTITY_" + stat.name(), k -> new HashMap<>());
-                for (org.bukkit.entity.EntityType ent : aliveEntities) {
-                    try {
-                        int v = player.getStatistic(stat, ent);
-                        if (v != 0) entityStatMap.put(ent.name(), v);
-                    } catch (Exception ignored) {}
+            // Typed statistics (ITEM/BLOCK/ENTITY) — via strategy if enabled
+            if (typedStatsStrategy != null) {
+                Map<String, Map<String, Integer>> typed = typedStatsStrategy.dump(player);
+                if (typed != null && !typed.isEmpty()) {
+                    statistics.putAll(typed);
                 }
             }
 
@@ -1025,50 +1099,69 @@ public class SyncManager {
 
     private void applyStatistics(Player player, PlayerData data) {
         try {
+            // Separate typed (ITEM_/BLOCK_/ENTITY_) from untyped stats
+            Map<String, Map<String, Integer>> untypedStats = new HashMap<>();
+            Map<String, Map<String, Integer>> typedStatsData = new HashMap<>();
+
             for (Map.Entry<String, Map<String, Integer>> cat : data.getStatistics().entrySet()) {
                 String category = cat.getKey();
-                try {
-                    if (category.startsWith("ITEM_")) {
-                        Statistic statistic = Statistic.valueOf(category.substring("ITEM_".length()));
-                        for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
-                            try {
-                                org.bukkit.Material mat = org.bukkit.Material.matchMaterial(stat.getKey());
-                                if (mat != null) player.setStatistic(statistic, mat, stat.getValue());
-                            } catch (Exception ignored) {}
+                if (category.startsWith("ITEM_") || category.startsWith("BLOCK_") || category.startsWith("ENTITY_")) {
+                    typedStatsData.put(category, cat.getValue());
+                } else {
+                    untypedStats.put(category, cat.getValue());
+                }
+            }
+
+            // Apply typed stats via strategy (if enabled) or inline
+            if (!typedStatsData.isEmpty()) {
+                if (typedStatsStrategy != null) {
+                    typedStatsStrategy.restore(player, typedStatsData);
+                } else {
+                    // Typed stats present but strategy not enabled — apply inline (backward compat)
+                    applyTypedStatsInline(player, typedStatsData);
+                }
+            }
+
+            // Apply untyped stats
+            for (Map.Entry<String, Map<String, Integer>> cat : untypedStats.entrySet()) {
+                for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
+                    try {
+                        Statistic statistic = Statistic.valueOf(stat.getKey());
+                        if (statistic.getType() == Statistic.Type.UNTYPED) {
+                            player.setStatistic(statistic, stat.getValue());
                         }
-                    } else if (category.startsWith("BLOCK_")) {
-                        Statistic statistic = Statistic.valueOf(category.substring("BLOCK_".length()));
-                        for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
-                            try {
-                                org.bukkit.Material mat = org.bukkit.Material.matchMaterial(stat.getKey());
-                                if (mat != null) player.setStatistic(statistic, mat, stat.getValue());
-                            } catch (Exception ignored) {}
-                        }
-                    } else if (category.startsWith("ENTITY_")) {
-                        Statistic statistic = Statistic.valueOf(category.substring("ENTITY_".length()));
-                        for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
-                            try {
-                                org.bukkit.entity.EntityType ent = org.bukkit.entity.EntityType.valueOf(stat.getKey());
-                                player.setStatistic(statistic, ent, stat.getValue());
-                            } catch (Exception ignored) {}
-                        }
-                    } else {
-                        // Untyped statistics (category == stat.getType().name(), e.g. UNTYPED)
-                        for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
-                            try {
-                                Statistic statistic = Statistic.valueOf(stat.getKey());
-                                if (statistic.getType() == Statistic.Type.UNTYPED) {
-                                    player.setStatistic(statistic, stat.getValue());
-                                }
-                            } catch (Exception ignored) {}
-                        }
-                    }
-                } catch (Exception ignored) {
-                    // Unknown statistic name on this version
+                    } catch (Exception ignored) {}
                 }
             }
         } catch (Exception e) {
             if (config.isDebug()) logger.warning("Failed to apply statistics: " + e.getMessage());
+        }
+    }
+
+    /** Inline typed stats restore for backward compat (when no strategy is active). */
+    private void applyTypedStatsInline(Player player, Map<String, Map<String, Integer>> typedStatsData) {
+        for (Map.Entry<String, Map<String, Integer>> cat : typedStatsData.entrySet()) {
+            String category = cat.getKey();
+            try {
+                if (category.startsWith("ITEM_") || category.startsWith("BLOCK_")) {
+                    String prefix = category.startsWith("ITEM_") ? "ITEM_" : "BLOCK_";
+                    Statistic statistic = Statistic.valueOf(category.substring(prefix.length()));
+                    for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
+                        try {
+                            org.bukkit.Material mat = org.bukkit.Material.matchMaterial(stat.getKey());
+                            if (mat != null) player.setStatistic(statistic, mat, stat.getValue());
+                        } catch (Exception ignored) {}
+                    }
+                } else if (category.startsWith("ENTITY_")) {
+                    Statistic statistic = Statistic.valueOf(category.substring("ENTITY_".length()));
+                    for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
+                        try {
+                            org.bukkit.entity.EntityType ent = org.bukkit.entity.EntityType.valueOf(stat.getKey());
+                            player.setStatistic(statistic, ent, stat.getValue());
+                        } catch (Exception ignored) {}
+                    }
+                }
+            } catch (Exception ignored) {}
         }
     }
 
