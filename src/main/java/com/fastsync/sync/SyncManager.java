@@ -1140,7 +1140,7 @@ public class SyncManager {
             OperationLog log = OperationLog.create(uuid, type, config.getServerName(),
                 fencingToken, version, dataSize, detail);
             operationLogManager.append(log)
-                .thenCompose(v -> operationLogManager.prune(uuid, config.getOperationLogRetention()))
+                .thenRun(() -> operationLogManager.prune(uuid, config.getOperationLogRetention()))
                 .exceptionally(e -> {
                     logger.log(Level.WARNING, "[OpLog] Failed to log " + type + " for " + uuid, e);
                     return null;

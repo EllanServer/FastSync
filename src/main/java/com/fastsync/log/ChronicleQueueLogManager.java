@@ -2,7 +2,6 @@ package com.fastsync.log;
 
 import net.openhft.chronicle.queue.ExcerptAppender;
 import net.openhft.chronicle.queue.ExcerptTailer;
-import net.openhft.chronicle.queue.RollCycles;
 import net.openhft.chronicle.queue.impl.single.SingleChronicleQueue;
 import net.openhft.chronicle.queue.impl.single.SingleChronicleQueueBuilder;
 import net.openhft.chronicle.wire.WireIn;
@@ -149,7 +148,6 @@ public class ChronicleQueueLogManager {
                 logger.log(Level.WARNING, "[OpLog] Failed to create queue dir for " + id, e);
             }
             return SingleChronicleQueueBuilder.binary(dir)
-                .rollCycle(RollCycles.DAILY)
                 .build();
         });
     }
