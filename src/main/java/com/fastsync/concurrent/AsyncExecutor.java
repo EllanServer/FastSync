@@ -1,8 +1,9 @@
 package com.fastsync.concurrent;
 
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -17,17 +18,24 @@ import java.util.logging.Logger;
  * Thread management is critical for sync plugins - HuskSync's poor thread
  * management was specifically criticized. This executor provides:
  *   - Named threads for easy debugging
- *   - Bounded pool size to prevent resource exhaustion
+ *   - Bounded pool size AND bounded queue to prevent OOM under load
+ *   - CallerRunsPolicy backpressure (caller thread runs the task when queue
+ *     is full, naturally throttling submission rate)
  *   - Graceful shutdown with timeout
  *   - Proper exception logging
  */
 public class AsyncExecutor {
 
-    private final ExecutorService executor;
+    private final ThreadPoolExecutor executor;
     private final Logger logger;
     private final String poolName;
 
-    public AsyncExecutor(Logger logger, String poolName, int poolSize) {
+    /**
+     * @param poolSize      number of threads
+     * @param queueCapacity max tasks pending in queue (0 = unbounded not allowed;
+     *                      use a positive value to prevent OOM under login storms)
+     */
+    public AsyncExecutor(Logger logger, String poolName, int poolSize, int queueCapacity) {
         this.logger = logger;
         this.poolName = poolName;
 
@@ -43,17 +51,36 @@ public class AsyncExecutor {
             }
         };
 
-        this.executor = Executors.newFixedThreadPool(
-            Math.max(2, poolSize),
-            threadFactory
+        int actualPoolSize = Math.max(2, poolSize);
+        int actualQueueCapacity = Math.max(64, queueCapacity);
+
+        this.executor = new ThreadPoolExecutor(
+            actualPoolSize,
+            actualPoolSize,
+            0L,
+            TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(actualQueueCapacity),
+            threadFactory,
+            new ThreadPoolExecutor.CallerRunsPolicy()
         );
 
-        logger.info("Async executor '" + poolName + "' initialized with " + poolSize + " threads.");
+        logger.info("Async executor '" + poolName + "' initialized: "
+            + actualPoolSize + " threads, queue capacity " + actualQueueCapacity
+            + ", backpressure=CallerRunsPolicy.");
+    }
+
+    /**
+     * Legacy constructor — uses a default queue capacity of 256.
+     */
+    public AsyncExecutor(Logger logger, String poolName, int poolSize) {
+        this(logger, poolName, poolSize, 256);
     }
 
     /**
      * Submit a task for async execution.
      * Exceptions are logged automatically.
+     * If the queue is full, CallerRunsPolicy runs the task on the calling
+     * thread, providing natural backpressure.
      */
     public void execute(Runnable task) {
         executor.execute(() -> {
@@ -104,22 +131,16 @@ public class AsyncExecutor {
     }
 
     /**
-     * Get the number of active tasks.
+     * Get the number of active threads.
      */
     public int getActiveCount() {
-        if (executor instanceof java.util.concurrent.ThreadPoolExecutor tpe) {
-            return tpe.getActiveCount();
-        }
-        return -1;
+        return executor.getActiveCount();
     }
 
     /**
      * Get the queue size (pending tasks).
      */
     public int getQueueSize() {
-        if (executor instanceof java.util.concurrent.ThreadPoolExecutor tpe) {
-            return tpe.getQueue().size();
-        }
-        return -1;
+        return executor.getQueue().size();
     }
 }

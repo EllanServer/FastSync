@@ -38,6 +38,7 @@ public class ConfigManager {
     private String dbPassword;
     private String tablePrefix;
     private int poolSize;
+    private int queueCapacity;
     private long connectionTimeout;
     private long idleTimeout;
     private long maxLifetime;
@@ -211,6 +212,7 @@ public class ConfigManager {
         dbPassword = source.getString("database.password", "password");
         tablePrefix = source.getString("database.table-prefix", "fastsync_");
         poolSize = source.getInt("database.pool-size", 10);
+        queueCapacity = source.getInt("database.queue-capacity", 256);
         connectionTimeout = source.getLong("database.connection-timeout", 10000);
         idleTimeout = source.getLong("database.idle-timeout", 300000);
         maxLifetime = source.getLong("database.max-lifetime", 1800000);
@@ -344,6 +346,7 @@ public class ConfigManager {
     public String getDbPassword() { return dbPassword; }
     public String getTablePrefix() { return tablePrefix; }
     public int getPoolSize() { return poolSize; }
+    public int getQueueCapacity() { return queueCapacity; }
     public long getConnectionTimeout() { return connectionTimeout; }
     public long getIdleTimeout() { return idleTimeout; }
     public long getMaxLifetime() { return maxLifetime; }

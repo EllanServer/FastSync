@@ -24,6 +24,9 @@ database:
 
   # Connection pool (HikariCP) settings
   pool-size: 10
+  # Max tasks pending in the async executor queue (prevents OOM under login storms).
+  # When full, CallerRunsPolicy runs the task on the calling thread (backpressure).
+  queue-capacity: 256
   connection-timeout: 10000
   idle-timeout: 300000
   max-lifetime: 1800000

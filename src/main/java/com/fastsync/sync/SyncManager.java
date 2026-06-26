@@ -141,7 +141,7 @@ public class SyncManager {
     public void initialize() {
         // Create dedicated thread pool (NOT ForkJoinPool.commonPool)
         int poolSize = Math.max(2, config.getPoolSize() / 2);
-        asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize);
+        asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize, config.getQueueCapacity());
 
         // Initialize snapshot system if enabled
         if (config.isSnapshotEnabled()) {
@@ -156,7 +156,7 @@ public class SyncManager {
                 redissonManager = new RedissonManager(
                     config.getRedisHost(), config.getRedisPort(),
                     config.getRedisPassword(), config.getRedisDatabase(),
-                    config.getServerName());
+                    config.getServerName(), config.getClusterId(), config.getRedisChannelPrefix());
                 redissonManager.initialize();
                 // Register listener for incoming stream events from other servers
                 redissonManager.addListener(this::handleStreamEvent);
@@ -1434,7 +1434,12 @@ public class SyncManager {
                 pendingSaveCount.decrementAndGet();
             }
         });
-        }, null); // retired callback: do nothing if entity is no longer valid
+        }, () -> {
+            // retired callback: entity no longer valid (player logged out during periodic save tick)
+            if (config.isDebug()) {
+                logger.fine("Periodic save skipped for " + uuid + " — entity retired (player offline?)");
+            }
+        });
     }
 
     // ==================== Cleanup ====================

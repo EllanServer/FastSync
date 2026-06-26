@@ -72,11 +72,11 @@ public class RedissonManager {
 
     // ==================== Pub/Sub (RTopic) ====================
     /** Topic used for cross-server lock coordination. Messages are {@link LockMessage} strings. */
-    private static final String LOCK_TOPIC = "fastsync:lock";
+    private final String lockTopicName;
 
     // ==================== Streams (RStream) ====================
-    private static final String STREAM_KEY = "fastsync:stream:events";
-    private static final String CONSUMER_GROUP = "fastsync-group";
+    private final String streamKeyName;
+    private final String consumerGroupName;
     /** readGroup block timeout (XREADGROUP BLOCK). */
     private static final long BLOCK_MS = 2000L;
     /** Reclaim pending entries idle for longer than this (XAUTOCLAIM min-idle-time). */
@@ -110,19 +110,44 @@ public class RedissonManager {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     /**
-     * @param host       Redis host
-     * @param port       Redis port
-     * @param password   Redis password (null/empty &rarr; no auth)
-     * @param database   Redis logical database index
-     * @param serverName this server's name; used as the stream consumer name and
-     *                   to skip self-published events
+     * @param host          Redis host
+     * @param port          Redis port
+     * @param password      Redis password (null/empty &rarr; no auth)
+     * @param database      Redis logical database index
+     * @param serverName    this server's name; used as the stream consumer name and
+     *                      to skip self-published events
+     * @param clusterId     cluster identifier for namespace isolation (empty = default)
+     * @param channelPrefix Redis channel prefix (default "fastsync:lock:")
      */
-    public RedissonManager(String host, int port, String password, int database, String serverName) {
+    public RedissonManager(String host, int port, String password, int database,
+                           String serverName, String clusterId, String channelPrefix) {
         this.host = host;
         this.port = port;
         this.password = password;
         this.database = database;
         this.serverName = serverName;
+
+        // Build namespace-aware names to prevent cross-cluster message mixing
+        // when multiple FastSync deployments share the same Redis.
+        // Pattern: fastsync:{clusterId}:lock, fastsync:{clusterId}:stream, fastsync:{clusterId}:group
+        String ns = (clusterId == null || clusterId.isBlank()) ? "default" : clusterId;
+        String prefix = (channelPrefix == null || channelPrefix.isBlank()) ? "fastsync:" : channelPrefix;
+        // channelPrefix typically ends with ":" (e.g. "fastsync:lock:") — strip trailing ":"
+        // to use as a base prefix, then append our own namespace segments.
+        if (prefix.endsWith(":")) prefix = prefix.substring(0, prefix.length() - 1);
+        // If prefix is "fastsync:lock", use "fastsync" as the base
+        if (prefix.endsWith(":lock")) prefix = prefix.substring(0, prefix.indexOf(":lock"));
+
+        this.lockTopicName = prefix + ":" + ns + ":lock";
+        this.streamKeyName = prefix + ":" + ns + ":stream:events";
+        this.consumerGroupName = prefix + ":" + ns + ":group";
+    }
+
+    /**
+     * Legacy constructor without namespace isolation (uses "default" cluster).
+     */
+    public RedissonManager(String host, int port, String password, int database, String serverName) {
+        this(host, port, password, database, serverName, "", "");
     }
 
     /**
@@ -158,11 +183,11 @@ public class RedissonManager {
         }
 
         // ---- Pub/Sub: plain-string topic messages ("REQUEST:<uuid>" / "RELEASED:<uuid>") ----
-        lockTopic = client.getTopic(LOCK_TOPIC, StringCodec.INSTANCE);
+        lockTopic = client.getTopic(lockTopicName, StringCodec.INSTANCE);
         lockTopic.addListener(String.class, (channel, msg) -> onLockMessage(msg));
 
         // ---- Streams: String,String entries so StreamEvent.toMap()/fromMap() round-trip cleanly ----
-        stream = client.getStream(STREAM_KEY, StringCodec.INSTANCE);
+        stream = client.getStream(streamKeyName, StringCodec.INSTANCE);
 
         createConsumerGroup();
         recoverPendingEntries();
@@ -190,7 +215,7 @@ public class RedissonManager {
             "", 0, 0, "Server started"));
 
         LOGGER.info("[Redisson] Redis connected: " + host + ":" + port + " (db=" + database
-            + ", topic=" + LOCK_TOPIC + ", stream=" + STREAM_KEY + ").");
+            + ", topic=" + lockTopicName + ", stream=" + streamKeyName + ").");
     }
 
     // ==================== Pub/Sub API (replaces RedisManager) ====================
@@ -341,16 +366,16 @@ public class RedissonManager {
      */
     private void createConsumerGroup() {
         try {
-            stream.createGroup(StreamCreateGroupArgs.name(CONSUMER_GROUP)
+            stream.createGroup(StreamCreateGroupArgs.name(consumerGroupName)
                 .id(StreamMessageId.ALL)
                 .makeStream());
-            LOGGER.info("[Redisson] Consumer group created: " + CONSUMER_GROUP);
+            LOGGER.info("[Redisson] Consumer group created: " + consumerGroupName);
         } catch (Exception e) {
             String msg = e.getMessage();
             if (msg != null && msg.contains("BUSYGROUP")) {
-                LOGGER.info("[Redisson] Consumer group already exists: " + CONSUMER_GROUP);
+                LOGGER.info("[Redisson] Consumer group already exists: " + consumerGroupName);
             } else {
-                throw new RuntimeException("Failed to create consumer group " + CONSUMER_GROUP, e);
+                throw new RuntimeException("Failed to create consumer group " + consumerGroupName, e);
             }
         }
     }
@@ -363,7 +388,7 @@ public class RedissonManager {
         while (running.get()) {
             try {
                 Map<StreamMessageId, Map<String, String>> messages = stream.readGroup(
-                    CONSUMER_GROUP, serverName,
+                    consumerGroupName, serverName,
                     StreamReadGroupArgs.neverDelivered()
                         .count(READ_BATCH_SIZE)
                         .timeout(Duration.ofMillis(BLOCK_MS)));
@@ -382,7 +407,7 @@ public class RedissonManager {
                             LOGGER.log(Level.WARNING, "[Redisson] Error dispatching stream message " + msgId, e);
                         } finally {
                             try {
-                                stream.ack(CONSUMER_GROUP, msgId);
+                                stream.ack(consumerGroupName, msgId);
                             } catch (Exception ackEx) {
                                 LOGGER.log(Level.WARNING, "[Redisson] Failed to ack stream message " + msgId, ackEx);
                             }
@@ -451,7 +476,7 @@ public class RedissonManager {
     private void recoverPendingEntries() {
         try {
             AutoClaimResult<String, String> claimed = stream.autoClaim(
-                CONSUMER_GROUP, serverName,
+                consumerGroupName, serverName,
                 AUTOCLAIM_IDLE_MS, TimeUnit.MILLISECONDS,
                 StreamMessageId.ALL, MAX_RECLAIM_PER_CYCLE);
 
@@ -464,7 +489,7 @@ public class RedissonManager {
                 + " pending entries from previous crash.");
             for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
                 handleStreamMessage(entry.getKey(), entry.getValue());
-                stream.ack(CONSUMER_GROUP, entry.getKey());
+                stream.ack(consumerGroupName, entry.getKey());
             }
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entries", e);
@@ -536,7 +561,7 @@ public class RedissonManager {
     // ==================== Pub/Sub message type ====================
 
     /**
-     * Lock coordination message exchanged over the {@link #LOCK_TOPIC}.
+     * Lock coordination message exchanged over the {@link #lockTopicName}.
      *
      * <p>Serialized as a plain {@code "<TYPE>:<uuid>"} string and transported with
      * Redisson's {@link StringCodec} so no JSON/serialization layer is required.
