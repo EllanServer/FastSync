@@ -41,7 +41,7 @@ updates:
           - "org.mockito:*"
     ignore:
       # Velocity 4.0.0-SNAPSHOT doesn't exist on Sonatype Snapshots yet.
-      # Stay on 3.4.0-SNAPSHOT until Velocity 4 is released.
+      # Stay on 3.x until Velocity 4 is released.
       - dependency-name: "com.velocitypowered:velocity-api"
         update-types: ["version-update:semver-major"]
 

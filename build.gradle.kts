@@ -93,6 +93,14 @@ java {
     }
 }
 
+// Fix Gradle 9.x module name conflict: org.lz4:lz4-java and at.yawk.lz4:lz4-java
+// have the same module name. Substitute the fork with the original.
+configurations.all {
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("at.yawk.lz4:lz4-java")).using(module("org.lz4:lz4-java:1.8.1"))
+    }
+}
+
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
     options.release.set(21)
