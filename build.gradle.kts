@@ -49,7 +49,7 @@ dependencies {
     // via plugin.yml `libraries:` at startup.
     compileOnly("com.zaxxer:HikariCP:7.1.0")
     compileOnly("org.lz4:lz4-java:1.8.1")
-    compileOnly("com.mysql:mysql-connector-j:9.0.0")
+    compileOnly("com.mysql:mysql-connector-j:9.7.0")
     compileOnly("io.lettuce:lettuce-core:7.6.0.RELEASE")
     compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.3")
     compileOnly("org.reactivestreams:reactive-streams:1.0.4")
@@ -81,7 +81,7 @@ dependencies {
     testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
     testImplementation("com.zaxxer:HikariCP:7.1.0")
     testImplementation("org.lz4:lz4-java:1.8.1")
-    testImplementation("com.mysql:mysql-connector-j:9.0.0")
+    testImplementation("com.mysql:mysql-connector-j:9.7.0")
     testImplementation("io.lettuce:lettuce-core:7.6.0.RELEASE")
     testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
     testImplementation("org.reactivestreams:reactive-streams:1.0.4")
