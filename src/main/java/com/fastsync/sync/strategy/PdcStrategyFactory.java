@@ -90,9 +90,7 @@ public class PdcStrategyFactory {
             case "BYTE" -> PersistentDataType.BYTE;
             case "BOOLEAN" -> PersistentDataType.BOOLEAN;
             case "BYTE_ARRAY" -> PersistentDataType.BYTE_ARRAY;
-            case "STRING_LIST" -> PersistentDataType.STRING_LIST;
-            case "INTEGER_LIST" -> PersistentDataType.INTEGER_LIST;
-            case "LONG_LIST" -> PersistentDataType.LONG_LIST;
+            // List types are Paper 1.20.6+ only — use reflection if needed
             default -> null;
         };
     }
