@@ -7,11 +7,8 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
 import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Manages FastSync configuration loading and access.
@@ -27,6 +24,7 @@ public class ConfigManager {
     private final JavaPlugin plugin;
     private final SparrowYaml yaml;
     private YamlDocument doc;
+    private final Logger logger;
 
     // Server
     private String serverName;
@@ -40,6 +38,7 @@ public class ConfigManager {
     private String dbPassword;
     private String tablePrefix;
     private int poolSize;
+    private int queueCapacity;
     private long connectionTimeout;
     private long idleTimeout;
     private long maxLifetime;
@@ -77,6 +76,18 @@ public class ConfigManager {
     private String lockTimeoutKickMessage;
     private boolean periodicSave;
     private int periodicSaveIntervalSeconds;
+    private int periodicSaveBatchSize;
+    private int heartbeatIntervalSeconds;
+    private int maxConcurrentLoads;
+    private String busyKickMessage;
+
+    // Dirty tracking — skip serialization for unchanged components
+    private boolean dirtyTrackingEnabled;
+    private int dirtyValidationInterval;
+
+    // Phase 2: per-component storage
+    private boolean componentStorageEnabled;
+    private int componentBatchSize;  // max components per upsertComponentsBatch transaction
 
     // Sync - new features
     private boolean syncAdvancements;
@@ -87,10 +98,27 @@ public class ConfigManager {
     private boolean syncLocation;
     private boolean syncLockedMaps;
 
+    // PDC strategy config
+    private String pdcMode;                    // off | safe-all-paper | registered-only | unsafe-reflection
+    private boolean pdcClearBeforeRestore;     // safe-all-paper: clear PDC before restore (full sync vs merge)
+    private boolean unsafePdcConfirmed;        // explicit confirmation for unsafe-reflection
+    private java.util.List<String> registeredPdcKeys;  // list of "namespace:key=TYPE" strings
+
+    // Typed statistics config
+    private boolean typedStatsEnabled;         // default false
+    private String typedStatsMode;             // whitelist | full
+    private java.util.List<String> typedStatsWhitelist;  // list of "STATISTIC_NAME=MATERIAL_NAME" strings
+
+    // Location validation config
+    private boolean locationRequireSameWorldName;  // default true
+    private boolean locationRequireSameWorldUuid;  // default true
+    private boolean locationFallbackToSpawn;       // default true
+
     // Snapshot
     private boolean snapshotEnabled;
     private int maxSnapshots;
     private long snapshotBackupFrequencyMs;
+    private String snapshotSaveTrigger;
 
     // Death save
     private boolean saveOnDeath;
@@ -126,16 +154,13 @@ public class ConfigManager {
 
     // Redis Streams (critical event delivery)
     private boolean streamsEnabled;
-
-    // Periodic save batch size (players per tick)
-    private int periodicSaveBatchSize;
-
-    // Snapshot triggers (which save causes create a snapshot)
-    private Set<String> snapshotTriggers;
+    private int redisStreamMaxLen;
+    private boolean redisStreamTrimApprox;
 
     public ConfigManager(JavaPlugin plugin) {
         this.plugin = plugin;
         this.yaml = SparrowYaml.builder().build();
+        this.logger = plugin.getLogger();
     }
 
     /**
@@ -150,6 +175,7 @@ public class ConfigManager {
         }
         this.plugin = null;
         this.yaml = null;
+        this.logger = Logger.getLogger("FastSync");
     }
 
     public void load() {
@@ -199,13 +225,19 @@ public class ConfigManager {
         dbUsername = source.getString("database.username", "root");
         dbPassword = source.getString("database.password", "password");
         tablePrefix = source.getString("database.table-prefix", "fastsync_");
+        if (tablePrefix != null && !tablePrefix.matches("[A-Za-z0-9_]*")) {
+            logger.warning("[Config] Invalid database.table-prefix '" + tablePrefix
+                + "'. Only letters, numbers and underscore are allowed. Falling back to 'fastsync_'.");
+            tablePrefix = "fastsync_";
+        }
         poolSize = source.getInt("database.pool-size", 10);
+        queueCapacity = source.getInt("database.queue-capacity", 256);
         connectionTimeout = source.getLong("database.connection-timeout", 10000);
         idleTimeout = source.getLong("database.idle-timeout", 300000);
         maxLifetime = source.getLong("database.max-lifetime", 1800000);
         leakDetectionThreshold = source.getLong("database.leak-detection-threshold", 60000);
         dbParameters = source.getString("database.parameters",
-            "useSSL=false&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true");
+            "useSSL=false&useUnicode=true&characterEncoding=UTF-8");
 
         // Redis
         redisEnabled = source.getBoolean("redis.enabled", false);
@@ -229,7 +261,7 @@ public class ConfigManager {
         syncFireTicks = source.getBoolean("sync.sync-fire-ticks", true);
         syncAir = source.getBoolean("sync.sync-air", true);
         syncExtraData = source.getBoolean("sync.sync-extra-data", true);
-        lockTimeout = source.getInt("sync.lock-timeout", 30);
+        lockTimeout = source.getInt("sync.lock-timeout", 60);
         lockRetryIntervalMs = source.getLong("sync.lock-retry-interval-ms", 1000);
         lockMaxRetries = source.getInt("sync.lock-max-retries", 30);
         saveDelay = source.getInt("sync.save-delay", 0);
@@ -240,6 +272,54 @@ public class ConfigManager {
             "&c[FastSync] Your data is still being saved by another server.");
         periodicSave = source.getBoolean("sync.periodic-save", false);
         periodicSaveIntervalSeconds = source.getInt("sync.periodic-save-interval-seconds", 300);
+        periodicSaveBatchSize = source.getInt("sync.periodic-save-batch-size", 10);
+        heartbeatIntervalSeconds = source.getInt("sync.heartbeat-interval-seconds", 10);
+
+        // Login backpressure: limit concurrent pre-login data loads to prevent
+        // login storms from exhausting the DB connection pool. Default leaves
+        // 2 connections for heartbeat/quit saves.
+        maxConcurrentLoads = source.getInt("sync.max-concurrent-loads",
+            Math.max(2, poolSize - 2));
+        if (maxConcurrentLoads < 1) {
+            logger.warning("[Config] sync.max-concurrent-loads must be >= 1. Using 1.");
+            maxConcurrentLoads = 1;
+        }
+        busyKickMessage = source.getString("sync.busy-kick-message",
+            "&c[FastSync] Data service is busy. Please reconnect in a few seconds.");
+
+        // Dirty tracking — skip serialization + DB writes for unchanged
+        // components. Event listeners mark components dirty; periodic saves
+        // only serialize + write the dirty ones. Every Nth save forces a
+        // full-collect + checksum comparison as a safety net.
+        dirtyTrackingEnabled = source.getBoolean("sync.dirty-tracking.enabled", true);
+        dirtyValidationInterval = source.getInt("sync.dirty-tracking.validation-interval", 5);
+        if (dirtyValidationInterval < 1) {
+            logger.warning("[Config] sync.dirty-tracking.validation-interval must be >= 1. Using 1.");
+            dirtyValidationInterval = 1;
+        }
+
+        // Phase 2: per-component storage. When enabled, dirty components are
+        // written to the player_component table instead of rewriting the full
+        // player_data Blob. Reads check component_bitmap to decide which path.
+        // Disabled by default — needs explicit opt-in until battle-tested.
+        componentStorageEnabled = source.getBoolean("sync.component-storage.enabled", false);
+        componentBatchSize = source.getInt("sync.component-storage.batch-size", 15);
+        if (componentBatchSize < 1) componentBatchSize = 15;
+
+        // Validate: heartbeat must be <= lockTimeout / 3 to guarantee the lock
+        // is refreshed well before it expires. If misconfigured, auto-correct
+        // and warn so the server still starts safely.
+        int maxHeartbeat = lockTimeout / 3;
+        if (maxHeartbeat < 1) maxHeartbeat = 1;
+        if (heartbeatIntervalSeconds > maxHeartbeat) {
+            logger.warning("[Config] heartbeat-interval-seconds (" + heartbeatIntervalSeconds
+                + ") is too large for lock-timeout (" + lockTimeout
+                + "). Auto-correcting to " + maxHeartbeat + "s (lock-timeout/3).");
+            heartbeatIntervalSeconds = maxHeartbeat;
+        }
+        if (heartbeatIntervalSeconds < 1) {
+            heartbeatIntervalSeconds = 1;
+        }
 
         // Sync - new features
         syncAdvancements = source.getBoolean("sync.sync-advancements", true);
@@ -250,14 +330,46 @@ public class ConfigManager {
         syncLocation = source.getBoolean("sync.sync-location", false);
         syncLockedMaps = source.getBoolean("sync.sync-locked-maps", true);
 
+        // PDC strategy
+        pdcMode = source.getString("pdc.mode",
+            syncPDC ? "safe-all-paper" : "off");
+        pdcClearBeforeRestore = source.getBoolean("pdc.clear-before-restore", true);
+        unsafePdcConfirmed = source.getBoolean("pdc.unsafe-reflection.enabled", false);
+        registeredPdcKeys = source.getStringList("pdc.registered-keys");
+
+        // Typed statistics
+        typedStatsEnabled = source.getBoolean("statistics.typed.enabled", false);
+        typedStatsMode = source.getString("statistics.typed.mode", "whitelist");
+        typedStatsWhitelist = source.getStringList("statistics.typed.whitelist");
+
+        // Location validation
+        locationRequireSameWorldName = source.getBoolean("sync.location.require-same-world-name", true);
+        locationRequireSameWorldUuid = source.getBoolean("sync.location.require-same-world-uuid", true);
+        locationFallbackToSpawn = source.getBoolean("sync.location.fallback-to-spawn", true);
+
+        // Migration: old sync-pdc boolean -> new pdc.mode
+        if (source.contains("sync.sync-pdc") && !source.contains("pdc.mode")) {
+            boolean oldPdc = source.getBoolean("sync.sync-pdc", true);
+            pdcMode = oldPdc ? "safe-all-paper" : "off";
+            logger.warning("[Config] Migrated old 'sync.sync-pdc' to 'pdc.mode=" + pdcMode + "'. Please update your config.");
+        }
+        // Migration: old sync-statistics boolean -> new statistics.typed.enabled
+        if (source.contains("sync.sync-statistics") && !source.contains("statistics.typed.enabled")) {
+            // Old behavior: if sync-statistics was true, typed stats were on (full mode)
+            typedStatsEnabled = syncStatistics;
+            if (syncStatistics) typedStatsMode = "full";
+            logger.warning("[Config] Migrated old 'sync.sync-statistics' to 'statistics.typed.enabled=" + typedStatsEnabled + "'. Please update your config.");
+        }
+
         // Snapshot
         snapshotEnabled = source.getBoolean("snapshot.enabled", true);
         maxSnapshots = source.getInt("snapshot.max-snapshots", 16);
         snapshotBackupFrequencyMs = source.getLong("snapshot.backup-frequency-ms", 14400000);
+        snapshotSaveTrigger = source.getString("snapshot.save-trigger", "never");
 
         // Death save
         saveOnDeath = source.getBoolean("sync.save-on-death", false);
-        saveOnWorldSave = source.getBoolean("sync.save-on-world-save", true);
+        saveOnWorldSave = source.getBoolean("sync.save-on-world-save", false);
 
         // Cluster
         clusterId = source.getString("cluster-id", "");
@@ -287,21 +399,8 @@ public class ConfigManager {
         operationLogEnabled = source.getBoolean("operation-log.enabled", true);
         operationLogRetention = source.getInt("operation-log.retention", 100);
         streamsEnabled = source.getBoolean("redis.streams-enabled", true);
-
-        // Periodic save batch size — number of players saved per tick during
-        // periodic save. Spreads the load over multiple ticks instead of
-        // flooding the executor queue.
-        periodicSaveBatchSize = source.getInt("sync.periodic-save-batch-size", 10);
-
-        // Snapshot triggers — comma-separated list of save causes that should
-        // create a snapshot. Default: death, disconnect, shutdown, world_save.
-        // Conflict saves always create a snapshot regardless of this setting.
-        // Periodic saves do NOT create snapshots by default (was the source of
-        // massive DB write amplification).
-        String triggersStr = source.getString("snapshot.triggers",
-            "death,disconnect,shutdown,world_save");
-        snapshotTriggers = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
-            triggersStr.split("\\s*,\\s*"))));
+        redisStreamMaxLen = source.getInt("redis.stream-maxlen", 100000);
+        redisStreamTrimApprox = source.getBoolean("redis.stream-trim-approx", true);
     }
 
     // ==================== Getters ====================
@@ -316,6 +415,7 @@ public class ConfigManager {
     public String getDbPassword() { return dbPassword; }
     public String getTablePrefix() { return tablePrefix; }
     public int getPoolSize() { return poolSize; }
+    public int getQueueCapacity() { return queueCapacity; }
     public long getConnectionTimeout() { return connectionTimeout; }
     public long getIdleTimeout() { return idleTimeout; }
     public long getMaxLifetime() { return maxLifetime; }
@@ -351,6 +451,20 @@ public class ConfigManager {
     public String getLockTimeoutKickMessage() { return lockTimeoutKickMessage; }
     public boolean isPeriodicSave() { return periodicSave; }
     public int getPeriodicSaveIntervalSeconds() { return periodicSaveIntervalSeconds; }
+    public int getPeriodicSaveBatchSize() { return periodicSaveBatchSize; }
+    public int getHeartbeatIntervalSeconds() { return heartbeatIntervalSeconds; }
+    public int getMaxConcurrentLoads() { return maxConcurrentLoads; }
+    public String getBusyKickMessage() { return busyKickMessage; }
+
+    /** Whether dirty-tracking-based skip is enabled for periodic saves. */
+    public boolean isDirtyTrackingEnabled() { return dirtyTrackingEnabled; }
+    /** How many saves between forced full-collect validations. */
+    public int getDirtyValidationInterval() { return dirtyValidationInterval; }
+
+    /** Phase 2: per-component storage (writes dirty components to player_component table). */
+    public boolean isComponentStorageEnabled() { return componentStorageEnabled; }
+    /** Max components per batch upsert transaction. */
+    public int getComponentBatchSize() { return componentBatchSize; }
 
     public boolean isSyncAdvancements() { return syncAdvancements; }
     public boolean isSyncStatistics() { return syncStatistics; }
@@ -360,18 +474,23 @@ public class ConfigManager {
     public boolean isSyncLocation() { return syncLocation; }
     public boolean isSyncLockedMaps() { return syncLockedMaps; }
 
-    // Strategy config methods (used by LocationSyncStrategy and PdcStrategyFactory)
-    public boolean isLocationFallbackToSpawn() { return false; }
-    public boolean isLocationRequireSameWorldName() { return true; }
-    public boolean isLocationRequireSameWorldUuid() { return false; }
-    public boolean isPdcClearBeforeRestore() { return true; }
-    public String getPdcMode() { return "off"; }
-    public boolean isUnsafePdcConfirmed() { return false; }
-    public java.util.List<String> getRegisteredPdcKeys() { return java.util.Collections.emptyList(); }
+    public String getPdcMode() { return pdcMode; }
+    public boolean isPdcClearBeforeRestore() { return pdcClearBeforeRestore; }
+    public boolean isUnsafePdcConfirmed() { return unsafePdcConfirmed; }
+    public java.util.List<String> getRegisteredPdcKeys() { return registeredPdcKeys; }
+
+    public boolean isTypedStatsEnabled() { return typedStatsEnabled; }
+    public String getTypedStatsMode() { return typedStatsMode; }
+    public java.util.List<String> getTypedStatsWhitelist() { return typedStatsWhitelist; }
+
+    public boolean isLocationRequireSameWorldName() { return locationRequireSameWorldName; }
+    public boolean isLocationRequireSameWorldUuid() { return locationRequireSameWorldUuid; }
+    public boolean isLocationFallbackToSpawn() { return locationFallbackToSpawn; }
 
     public boolean isSnapshotEnabled() { return snapshotEnabled; }
     public int getMaxSnapshots() { return maxSnapshots; }
     public long getSnapshotBackupFrequencyMs() { return snapshotBackupFrequencyMs; }
+    public String getSnapshotSaveTrigger() { return snapshotSaveTrigger; }
 
     public boolean isSaveOnDeath() { return saveOnDeath; }
     public boolean isSaveOnWorldSave() { return saveOnWorldSave; }
@@ -397,12 +516,8 @@ public class ConfigManager {
     public boolean isOperationLogEnabled() { return operationLogEnabled; }
     public int getOperationLogRetention() { return operationLogRetention; }
     public boolean isStreamsEnabled() { return streamsEnabled; }
-
-    /** Batch size for periodic saves (players per tick). */
-    public int getPeriodicSaveBatchSize() { return periodicSaveBatchSize; }
-
-    /** Save causes that should trigger a snapshot creation. */
-    public Set<String> getSnapshotTriggers() { return snapshotTriggers; }
+    public int getRedisStreamMaxLen() { return redisStreamMaxLen; }
+    public boolean isRedisStreamTrimApprox() { return redisStreamTrimApprox; }
 
     // ==================== Internal config access abstraction ====================
 
@@ -416,6 +531,13 @@ public class ConfigManager {
         int getInt(String key, int def);
         long getLong(String key, long def);
         boolean getBoolean(String key, boolean def);
+        java.util.List<String> getStringList(String key);
+        /**
+         * Returns {@code true} only if a value is explicitly present at the
+         * given path in the user's config (i.e. not merely a default). This is
+         * the semantics required by old-config migration detection.
+         */
+        boolean contains(String key);
     }
 
     /**
@@ -453,6 +575,28 @@ public class ConfigManager {
         public boolean getBoolean(String key, boolean def) {
             return document.getOrDefault(Boolean.class, def, route(key));
         }
+
+        @Override
+        public java.util.List<String> getStringList(String key) {
+            try {
+                java.util.List<String> list = document.getOrDefault(
+                    new net.momirealms.sparrow.yaml.serializer.TypeRef<java.util.List<String>>() {},
+                    java.util.Collections.<String>emptyList(),
+                    route(key));
+                return list == null ? java.util.Collections.emptyList() : list;
+            } catch (Exception e) {
+                // Non-list value at path (or parse failure) -> treat as empty list,
+                // mirroring Bukkit's getStringList() behavior.
+                return java.util.Collections.emptyList();
+            }
+        }
+
+        @Override
+        public boolean contains(String key) {
+            // sparrow-yaml does not merge config defaults, so a non-null node
+            // means the key is explicitly present in the user's file.
+            return document.getNodeOrNull(route(key)) != null;
+        }
     }
 
     /**
@@ -484,6 +628,19 @@ public class ConfigManager {
         @Override
         public boolean getBoolean(String key, boolean def) {
             return config.getBoolean(key, def);
+        }
+
+        @Override
+        public java.util.List<String> getStringList(String key) {
+            return config.getStringList(key);
+        }
+
+        @Override
+        public boolean contains(String key) {
+            // isSet() returns true only when the key is explicitly present in
+            // the user's file (not from the bundled default config), which is
+            // what migration detection needs.
+            return config.isSet(key);
         }
     }
 }

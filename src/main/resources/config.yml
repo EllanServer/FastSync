@@ -24,6 +24,10 @@ database:
 
   # Connection pool (HikariCP) settings
   pool-size: 10
+  # Max tasks pending in the async executor queue (prevents OOM under login storms).
+  # When full, AbortPolicy throws RejectedExecutionException.
+  # Quit saves fall back to synchronous execution; periodic saves are skipped (coalesced).
+  queue-capacity: 256
   connection-timeout: 10000
   idle-timeout: 300000
   max-lifetime: 1800000
@@ -35,24 +39,49 @@ database:
 # ------------------------------------------------------------
 # Redis Settings (for cross-server lock coordination via pub/sub)
 # ------------------------------------------------------------
+# Redis enables real-time lock release notifications between servers.
+# When server A needs a lock held by server B, it sends a REQUEST via pub/sub.
+# Server B responds with a RELEASED notification as soon as it finishes saving.
+# This replaces the "poll and force" approach used by HuskSync.
 redis:
+  # Whether to enable Redis for lock coordination
+  # If disabled, falls back to database polling for lock acquisition
   enabled: false
+
   host: "localhost"
   port: 6379
   password: ""
   database: 0
+
+  # SSL/TLS
   ssl: false
+
+  # Connection timeout in milliseconds
   timeout: 5000
+
+  # Channel prefix for pub/sub messages
   channel-prefix: "fastsync:lock:"
+
+  # Whether to use Redis for data caching (reduces DB load for frequent reads)
   cache-enabled: false
 
   # Redis Streams for critical, recoverable event delivery.
+  # Unlike Pub/Sub (fire-and-forget), Streams persist events so they survive
+  # consumer crashes and can be recovered via XAUTOCLAIM.
+  # Used for: player checkout/checkin handoff, server lifecycle events.
   streams-enabled: true
+  # Maximum number of entries to keep in the Redis stream. Older entries are
+  # trimmed automatically by XADD MAXLEN. Set to 0 to disable trimming (not recommended).
+  stream-maxlen: 100000
+  # Use approximate trimming (~ MAXLEN) for better performance. Slightly less precise
+  # but significantly faster — recommended for production.
+  stream-trim-approx: true
 
 # ------------------------------------------------------------
 # Synchronization Settings
 # ------------------------------------------------------------
 sync:
+  # What data to synchronize
   sync-inventory: true
   sync-ender-chest: true
   sync-health: true
@@ -64,26 +93,87 @@ sync:
   sync-air: true
   sync-extra-data: true
 
-  lock-timeout: 30
+  # Lock timeout in seconds (how long before a lock from another server is considered stale)
+  lock-timeout: 60
+
+  # Heartbeat interval for online lock refresh (seconds).
+  # The heartbeat task refreshes locked_at for all online players, preventing
+  # the lock from expiring while the player is still connected.
+  # Rule: heartbeat-interval <= lock-timeout / 3 (auto-corrected if violated).
+  heartbeat-interval-seconds: 10
+
+  # Lock retry settings (when data is locked by another server)
   lock-retry-interval-ms: 1000
   lock-max-retries: 30
 
+  # Save delay on quit in ticks (0 = immediate, 20 = 1 second delay)
   save-delay: 0
+
+  # Whether to clear inventory before applying synced data (prevents item duplication)
   clear-before-apply: true
 
+  # Kick message when data fails to load
   load-fail-kick-message: "&c[FastSync] Failed to load your player data. Please try reconnecting in a few seconds."
+
+  # Kick message when data is locked by another server for too long
   lock-timeout-kick-message: "&c[FastSync] Your data is still being saved by another server. Please try reconnecting in a few seconds."
 
   # Whether to save player data periodically (in addition to on quit)
   periodic-save: false
   periodic-save-interval-seconds: 300
-  # NEW: Number of players saved per tick during periodic save. Spreads the
-  # load over multiple ticks instead of submitting every online player to the
-  # executor in one tick (which previously caused queue flooding and pool
-  # saturation on busy servers). Set to a higher value for smaller servers,
-  # lower for larger ones.
-  periodic-save-batch-size: 10
 
+  # Batch size for periodic saves (number of players saved per tick).
+  # Lower this if the async executor pool is small; the async executor pool
+  # size should be >= this value to avoid queue flooding with many players.
+  periodic-save-batch-size: 10
+  # Maximum concurrent pre-login data loads. Prevents login storms from
+  # exhausting the DB connection pool. Default: pool-size - 2 (leaves 2
+  # connections for heartbeat/quit saves). When exceeded, players are
+  # kicked with busy-kick-message and can retry immediately.
+  max-concurrent-loads: 8
+  busy-kick-message: "&c[FastSync] Data service is busy. Please reconnect in a few seconds."
+
+  # ------------------------------------------------------------
+  # Dirty Tracking (component-level change detection)
+  # ------------------------------------------------------------
+  # When enabled, event listeners mark which player data components
+  # (inventory, vitals, food, exp, etc.) have changed since the last save.
+  # Periodic saves skip serialization + DB writes for unchanged components,
+  # reducing save cost by 80-95% on idle players.
+  #
+  # Safety: every Nth save (validation-interval) forces a full collect +
+  # checksum comparison to catch changes that slipped through events.
+  # Set validation-interval to 1 to always do full saves (disables the
+  # fast path but keeps the dirty tracking infrastructure).
+  dirty-tracking:
+    enabled: true
+    validation-interval: 5  # every 5th save = full checksum validation
+
+  # ------------------------------------------------------------
+  # Component Storage (Phase 2)
+  # ------------------------------------------------------------
+  # When enabled, dirty components are written to the player_component
+  # table instead of rewriting the full player_data Blob on every save.
+  # This means a save that touches 1 of 15 components writes 1 small row
+  # instead of 1 full Blob (~5-20KB).
+  #
+  # Reads automatically merge: full Blob as base, component rows as overrides.
+  # The component_bitmap column on player_data tracks which components are
+  # migrated — readers check the bitmap to decide the read path.
+  #
+  # QUIT saves always write the full Blob (atomic lock release + version CAS).
+  # Periodic/death/world_save saves use component storage when beneficial.
+  #
+  # Disabled by default — opt-in until battle-tested in production.
+  # When disabled, behavior is identical to phase 1 (dirty tracking skips
+  # saves but writes full Blob when it does save).
+  component-storage:
+    enabled: false
+    batch-size: 15  # max components per transaction; full save if exceeded
+
+  # ------------------------------------------------------------
+  # Additional Sync Settings
+  # ------------------------------------------------------------
   # Sync additional data types (HuskSync feature parity)
   sync-advancements: true
   sync-statistics: true
@@ -91,75 +181,172 @@ sync:
   sync-flight: true
   sync-pdc: true
   sync-location: false
-  sync-locked-maps: true
+  # When sync-location is true, validate world before teleporting:
+  location:
+    require-same-world-name: true   # World name must match (avoid cross-world teleport)
+    require-same-world-uuid: true   # World UUID must match (prevent same-name different-world)
+    fallback-to-spawn: true         # If validation fails, teleport to spawn instead
+  sync-locked-maps: false          # Reserved / not implemented. Map item and map view data sync is not yet wired into collectPlayerData/applyPlayerData.
 
+  # Save on death
   save-on-death: false
-  save-on-world-save: true
+
+  # Save on world save
+  # Disabled by default — world saves fire frequently (every 5 min) and cause
+  # unnecessary DB write load. Enable only if you need extra crash durability.
+  save-on-world-save: false
+
+  # Cancel commands while player data is loading
   cancel-commands-while-locked: false
+
+# ------------------------------------------------------------
+# PDC (PersistentDataContainer) Sync Strategy
+# ------------------------------------------------------------
+# Controls how custom PersistentDataContainer data is synchronized.
+#   off              - No PDC sync
+#   safe-all-paper   - Use Paper's serializeToBytes() API via reflection.
+#                      Safe, no reflection of internal classes. Works on
+#                      Paper 1.21.11+ (public API) and older versions (package-
+#                      private methods via reflection, still safe).
+#   registered-only  - (default) Only sync keys explicitly listed in registered-keys below.
+#                      Production recommended: avoids syncing plugin-internal data.
+#                      Uses stable Bukkit API, compatible with all Paper versions.
+#   unsafe-reflection - Use reflection to access NMS internals.
+#                      Fallback for older Paper versions. Requires explicit
+#                      confirmation (unsafe-reflection.enabled: true).
+pdc:
+  mode: "registered-only"
+  # When mode=safe-all-paper, clear the target PDC before restoring (true = full sync, false = merge/append).
+  # registered-only always clears registered keys before restore regardless of this setting.
+  clear-before-restore: true
+  # When mode=registered-only, list keys to sync as "namespace:key=TYPE"
+  # e.g. "myplugin:progress=INTEGER", "myplugin:rank=STRING"
+  registered-keys: []
+  # Double-confirmation for unsafe-reflection mode
+  unsafe-reflection:
+    enabled: false
+
+# ------------------------------------------------------------
+# Statistics Sync Strategy
+# ------------------------------------------------------------
+# Basic statistics (UNTYPED: jump, walk, play_time...) are always synced
+# when sync-statistics is true — they are cheap and server-agnostic.
+# 
+# Typed statistics (ITEM/BLOCK/ENTITY: mine-block, kill-entity, use-item...)
+# are expensive to collect (~1300 Materials × N stats) and often
+# server-specific. They are disabled by default.
+statistics:
+  typed:
+    # Whether to sync typed statistics (ITEM/BLOCK/ENTITY)
+    enabled: false
+    # Mode for typed statistics:
+    #   whitelist - Only sync entries listed below (recommended)
+    #   full      - Sync all typed statistics (expensive!)
+    mode: "whitelist"
+    # When mode=whitelist, list entries as "STATISTIC_NAME=MATERIAL_NAME"
+    # e.g. "MINE_BLOCK=DIAMOND_ORE", "KILL_ENTITY=ENDER_DRAGON"
+    whitelist:
+      - "MINE_BLOCK=DIAMOND_ORE"
+      - "MINE_BLOCK=ANCIENT_DEBRIS"
+      - "MINE_BLOCK=EMERALD_ORE"
+      - "KILL_ENTITY=ENDER_DRAGON"
+      - "KILL_ENTITY=WITHER"
+      - "USE_ITEM=TOTEM_OF_UNDYING"
 
 # ------------------------------------------------------------
 # Cluster Settings
 # ------------------------------------------------------------
+# Cluster ID for multi-cluster isolation. Servers with the same cluster ID
+# share player data. Leave empty for single cluster.
 cluster-id: ""
 
 # ------------------------------------------------------------
 # Snapshot / Backup Settings
 # ------------------------------------------------------------
 snapshot:
+  # Whether to enable snapshot/backup system
   enabled: true
+
+  # Maximum number of snapshots to keep per player (oldest non-pinned are deleted)
   max-snapshots: 16
+
+  # Minimum time between snapshot creation in milliseconds (default: 4 hours)
   backup-frequency-ms: 14400000
 
-  # NEW: Comma-separated list of save causes that should trigger a snapshot.
-  # Default: death, disconnect, shutdown, world_save.
-  # - "death"        — player died and a death-save was triggered
-  # - "disconnect"   — player quit normally
-  # - "shutdown"     — server is shutting down
-  # - "world_save"   — world save triggered a player save
-  # - "periodic"     — periodic auto-save (DEFAULT OFF — was the source of
-  #                    ~80% of unnecessary snapshot INSERTs)
-  # - "conflict"     — write conflict (always creates a snapshot regardless
-  #                    of this list, listed here for completeness)
-  # Remove a cause from this list to skip snapshot creation for that path.
-  triggers: "death,disconnect,shutdown,world_save"
+  # When to create a snapshot on a successful save.
+  #   "never"  - (default) no snapshots on save. Conflict-driven snapshots
+  #              created by ConflictManager are STILL created unconditionally,
+  #              so conflict recovery is never lost.
+  #   "always" - create a snapshot on every successful save (high write amplification).
+  #   Comma-separated cause list, e.g. "death,disconnect,shutdown,world_save"
+  #              - only snapshot when the save cause matches one listed.
+  save-trigger: "never"
 
 # ------------------------------------------------------------
 # Compression Settings
 # ------------------------------------------------------------
 compression:
+  # Whether to enable LZ4 compression
   enabled: true
+
+  # Compression type: LZ4 (only LZ4 is supported currently)
   type: "LZ4"
+
+  # Minimum data size in bytes before compression is applied (smaller data won't be compressed)
   min-size: 128
 
 # ------------------------------------------------------------
 # Serialization Settings
 # ------------------------------------------------------------
 serialization:
+  # Format version (stored in the first byte of serialized data)
+  # Used for future migration support
   format-version: 1
 
 # ------------------------------------------------------------
 # Debug Settings
 # ------------------------------------------------------------
 debug: false
+
+# Whether to log detailed timing information for serialization and database operations
 log-timing: false
 
 # ------------------------------------------------------------
 # Conflict Recovery Settings (Dynamo-style Optimistic Concurrency)
 # ------------------------------------------------------------
+# When a server tries to save data with an outdated version number,
+# a conflict is detected. This controls what happens to the stale data.
 conflict:
+  # Recovery strategy when a write conflict is detected:
+  #   "snapshot" - Save the stale data as a conflict snapshot for manual recovery (recommended)
+  #   "discard"  - Discard the stale data (the newer DB version is kept)
+  #   "overwrite" - Force overwrite the newer data (DANGEROUS - can cause data loss)
   recovery-strategy: "snapshot"
+
+  # Whether to verify data checksum on load (detects database corruption)
   verify-checksum: true
 
 # ------------------------------------------------------------
 # Latency Tracking Settings (Dynamo p99.9 SLA)
 # ------------------------------------------------------------
+# Tracks operation latencies and computes p50/p99/p99.9 percentiles.
+# Dynamo's key insight: optimize for the 99.9th percentile, not averages.
 latency:
+  # Whether to enable latency tracking
   enabled: false
+
+  # Number of recent samples to keep for percentile calculation
   window-size: 1000
 
 # ------------------------------------------------------------
 # Operation Log Settings (Raft-inspired per-UUID ordered log)
 # ------------------------------------------------------------
+# Every state-changing operation (load, save, conflict, snapshot, etc.)
+# is recorded in an append-only log with a per-UUID sequence number.
+# This provides a complete audit trail and enables conflict diagnosis.
 operation-log:
+  # Whether to enable the operation log
   enabled: true
+
+  # Maximum number of log entries to keep per player (older entries are pruned)
   retention: 100

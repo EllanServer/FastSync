@@ -1,9 +1,7 @@
 package com.fastsync.serialization;
 
 import com.fastsync.data.PlayerData;
-import net.momirealms.sparrow.nbt.ByteArrayTag;
 import net.momirealms.sparrow.nbt.CompoundTag;
-import net.momirealms.sparrow.nbt.IntTag;
 import net.momirealms.sparrow.nbt.ListTag;
 import net.momirealms.sparrow.nbt.NBT;
 import net.momirealms.sparrow.nbt.Tag;
@@ -22,20 +20,18 @@ import java.util.Map;
 /**
  * Serializes PlayerData to/from raw byte[] using sparrow-nbt's CompoundTag.
  *
- * <h2>Performance (rewritten)</h2>
- * <ul>
- *   <li><b>Sparse inventory storage:</b> previously, every inventory slot
- *       (including empty ones) produced a ByteArrayTag in the ListTag. A typical
- *       41-slot inventory with 30 empty slots wasted ~30 bytes per save (plus
- *       NBT overhead). Now only non-empty slots are stored as
- *       {@code CompoundTag{slot:int, data:byte[]}} entries. On load, missing
- *       slots are filled with {@code null} (air). Net savings: 30-60% smaller
- *       inventory blobs on typical player data.</li>
- *   <li><b>Backward compatibility:</b> the deserializer transparently reads
- *       both the old "list of byte arrays" format and the new "list of
- *       compound tags with slot index" format. New saves always use the new
- *       format.</li>
- * </ul>
+ * Replaces hand-written NbtBinaryReader/Writer with the professional sparrow-nbt library.
+ * sparrow-nbt implements the exact NBT binary format specification:
+ *   - Write: type tag byte → name (length-prefixed UTF-8) → payload per type spec
+ *   - Read: read type byte → dispatch to correct read method → direct binary
+ *
+ * NBT.toBytes(CompoundTag) → binary byte[] (no string/base64/JSON)
+ * NBT.fromBytes(byte[]) → CompoundTag (direct binary deserialization)
+ *
+ * The NBT binary format is fundamentally different from string/JSON:
+ *   - Reader reads the type byte, then knows EXACTLY how many bytes to read next
+ *   - Direct binary copy of primitive values - zero parsing overhead
+ *   - No structural character parsing ([], {}, quotes, delimiters)
  */
 public class PlayerDataSerializer {
 
@@ -47,18 +43,18 @@ public class PlayerDataSerializer {
     public static byte[] serialize(PlayerData data) throws IOException {
         CompoundTag root = NBT.createCompound();
 
-        // Inventory + Armor + Offhand + Ender chest (sparse: only non-empty slots)
+        // Inventory + Armor + Offhand + Ender chest (as byte arrays from ItemStack.serializeAsBytes)
         if (data.getInventory() != null) {
-            root.put("inventory", toSparseItemStackList(data.getInventory()));
+            root.put("inventory", toItemStackList(data.getInventory()));
         }
         if (data.getArmor() != null) {
-            root.put("armor", toSparseItemStackList(data.getArmor()));
+            root.put("armor", toItemStackList(data.getArmor()));
         }
         if (data.getOffhand() != null) {
             root.putByteArray("offhand", ItemStackCompat.serialize(data.getOffhand()));
         }
         if (data.getEnderChest() != null) {
-            root.put("enderChest", toSparseItemStackList(data.getEnderChest()));
+            root.put("enderChest", toItemStackList(data.getEnderChest()));
         }
 
         // Vitals
@@ -74,7 +70,7 @@ public class PlayerDataSerializer {
         root.putInt("totalExperience", data.getTotalExperience());
 
         // Extra
-        root.putByte("gameMode", (byte) (data.getGameMode() != null ? data.getGameMode().ordinal() : 0));
+        root.putString("gameMode", data.getGameMode() != null ? data.getGameMode().name() : "SURVIVAL");
         root.putInt("fireTicks", data.getFireTicks());
         root.putInt("remainingAir", data.getRemainingAir());
         root.putInt("maximumAir", data.getMaximumAir());
@@ -188,11 +184,15 @@ public class PlayerDataSerializer {
         root.putLong("timestamp", data.getTimestamp());
         root.putString("saveCause", data.getSaveCause() != null ? data.getSaveCause() : "disconnect");
 
+        // Serialize CompoundTag to binary byte[] (native NBT binary format)
         return NBT.toBytes(root);
     }
 
     /**
      * Deserialize NBT binary byte[] to PlayerData using sparrow-nbt.
+     *
+     * NBT.fromBytes reads the type byte, then dispatches to the correct
+     * read method - no string/JSON structural character parsing.
      */
     public static PlayerData deserialize(byte[] data) throws IOException {
         CompoundTag root = NBT.fromBytes(data);
@@ -230,9 +230,32 @@ public class PlayerDataSerializer {
         playerData.setTotalExperience(root.getInt("totalExperience"));
 
         // Extra
-        int gmOrdinal = root.getByte("gameMode") & 0xFF;
-        GameMode[] gameModes = GameMode.values();
-        playerData.setGameMode(gmOrdinal < gameModes.length ? gameModes[gmOrdinal] : GameMode.SURVIVAL);
+        // Try name-based deserialization first (current format: gameMode stored as STRING)
+        GameMode gameMode = GameMode.SURVIVAL;
+        try {
+            String gmName = root.getString("gameMode");
+            if (gmName != null && !gmName.isEmpty()) {
+                gameMode = GameMode.valueOf(gmName);
+            }
+        } catch (Exception nameEx) {
+            // Fallback: legacy ordinal-based format (for data saved by older versions).
+            // The old format stored gameMode as a BYTE (ordinal). We need to check
+            // the tag type before reading as byte to avoid exceptions when the tag
+            // is actually a STRING (current format).
+            try {
+                Tag gmTag = root.get("gameMode");
+                if (gmTag instanceof net.momirealms.sparrow.nbt.ByteTag byteTag) {
+                    int gmOrdinal = byteTag.getAsByte() & 0xFF;
+                    GameMode[] gameModes = GameMode.values();
+                    if (gmOrdinal >= 0 && gmOrdinal < gameModes.length) {
+                        gameMode = gameModes[gmOrdinal];
+                    }
+                }
+            } catch (Exception ordEx) {
+                // Keep SURVIVAL default
+            }
+        }
+        playerData.setGameMode(gameMode);
         playerData.setFireTicks(root.getInt("fireTicks"));
         playerData.setRemainingAir(root.getInt("remainingAir"));
         playerData.setMaximumAir(root.getInt("maximumAir"));
@@ -328,8 +351,9 @@ public class PlayerDataSerializer {
         }
 
         // Location
-        if (root.getString("world") != null && !root.getString("world").isEmpty()) {
-            playerData.setWorldName(root.getString("world"));
+        String worldName = root.getString("world");
+        if (worldName != null && !worldName.isEmpty()) {
+            playerData.setWorldName(worldName);
             playerData.setX(root.getDouble("x"));
             playerData.setY(root.getDouble("y"));
             playerData.setZ(root.getDouble("z"));
@@ -342,7 +366,7 @@ public class PlayerDataSerializer {
             List<byte[]> maps = new ArrayList<>();
             for (int i = 0; i < mapList.size(); i++) {
                 Tag mapTag = mapList.get(i);
-                if (mapTag instanceof ByteArrayTag baTag) {
+                if (mapTag instanceof net.momirealms.sparrow.nbt.ByteArrayTag baTag) {
                     maps.add(baTag.getAsByteArray());
                 }
             }
@@ -353,97 +377,41 @@ public class PlayerDataSerializer {
         playerData.setVersion(root.getLong("version"));
         playerData.setFencingToken(root.getLong("fencingToken"));
         playerData.setTimestamp(root.getLong("timestamp"));
-        playerData.setSaveCause(root.getString("saveCause") != null ? root.getString("saveCause") : "disconnect");
+        String saveCause = root.getString("saveCause");
+        playerData.setSaveCause(saveCause != null && !saveCause.isEmpty() ? saveCause : "disconnect");
 
         return playerData;
     }
 
-    // ==================== Sparse Item Stack List Helpers ====================
+    // ==================== Item Stack List Helpers ====================
 
     /**
-     * Convert ItemStack[] to a ListTag of {@code CompoundTag{slot:int, data:byte[]}}
-     * entries — only non-empty slots are included. Empty/air slots are omitted
-     * entirely, which on typical inventories (40-60% empty) saves 30-60% of the
-     * blob size compared to the previous dense format.
+     * Convert ItemStack[] to ListTag of ByteArrayTag (each item's NBT bytes).
      */
-    private static ListTag toSparseItemStackList(ItemStack[] items) {
+    private static ListTag toItemStackList(ItemStack[] items) {
         ListTag list = NBT.createList();
-        for (int i = 0; i < items.length; i++) {
-            ItemStack item = items[i];
-            if (item == null || item.getType().isAir()) {
-                continue;
-            }
-            byte[] bytes = ItemStackCompat.serialize(item);
-            if (bytes.length == 0) {
-                continue;
-            }
-            CompoundTag entry = NBT.createCompound();
-            entry.putInt("slot", i);
-            entry.putByteArray("data", bytes);
-            list.add(entry);
+        for (ItemStack item : items) {
+            list.add(NBT.createByteArray(ItemStackCompat.serialize(item)));
         }
         return list;
     }
 
     /**
-     * Convert a ListTag back to an ItemStack[].
-     *
-     * <p>Supports both formats transparently:
-     * <ul>
-     *   <li><b>New sparse format:</b> ListTag of {@code CompoundTag{slot:int,
-     *       data:byte[]}} — only non-empty slots are present. The array is
-     *       sized to {@code max(slot) + 1}, with missing slots left null.</li>
-     *   <li><b>Legacy dense format:</b> ListTag of ByteArrayTag, one per slot
-     *       (including empty slots as empty arrays). The array is sized to the
-     *       list length. This format was written by older FastSync versions.</li>
-     * </ul>
+     * Convert ListTag of ByteArrayTag back to ItemStack[].
      */
     private static ItemStack[] fromItemStackList(ListTag list) {
-        // Detect format by inspecting the first element.
-        if (list.isEmpty()) {
-            return new ItemStack[0];
-        }
-
-        Tag first = list.get(0);
-        if (first instanceof CompoundTag) {
-            // New sparse format.
-            int maxSlot = -1;
-            for (int i = 0; i < list.size(); i++) {
-                Tag t = list.get(i);
-                if (t instanceof CompoundTag ct && ct.get("slot") instanceof IntTag it) {
-                    if (it.getAsInt() > maxSlot) maxSlot = it.getAsInt();
-                }
-            }
-            ItemStack[] items = new ItemStack[maxSlot + 1];
-            for (int i = 0; i < list.size(); i++) {
-                Tag t = list.get(i);
-                if (!(t instanceof CompoundTag ct)) continue;
-                Tag slotTag = ct.get("slot");
-                if (!(slotTag instanceof IntTag it)) continue;
-                int slot = it.getAsInt();
-                byte[] bytes = ct.getByteArray("data");
+        ItemStack[] items = new ItemStack[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            Tag element = list.get(i);
+            if (element instanceof net.momirealms.sparrow.nbt.ByteArrayTag baTag) {
                 try {
-                    items[slot] = ItemStackCompat.deserialize(bytes);
+                    items[i] = ItemStackCompat.deserialize(baTag.getAsByteArray());
                 } catch (Exception e) {
-                    items[slot] = null;
+                    items[i] = null;
                 }
             }
-            return items;
-        } else {
-            // Legacy dense format: ListTag of ByteArrayTag (one per slot).
-            ItemStack[] items = new ItemStack[list.size()];
-            for (int i = 0; i < list.size(); i++) {
-                Tag element = list.get(i);
-                if (element instanceof ByteArrayTag baTag) {
-                    try {
-                        items[i] = ItemStackCompat.deserialize(baTag.getAsByteArray());
-                    } catch (Exception e) {
-                        items[i] = null;
-                    }
-                }
-            }
-            return items;
         }
+        return items;
     }
 
     // ==================== Helpers ====================
@@ -463,5 +431,309 @@ public class PlayerDataSerializer {
             return new PotionEffect(type, data.getDuration(), data.getAmplifier(),
                 data.isAmbient(), data.isParticles(), data.isIcon());
         } catch (Exception e) { return null; }
+    }
+
+    // ==================== Phase 2: Per-Component Serialization ====================
+
+    /**
+     * Serialize a single component to a standalone NBT byte[].
+     *
+     * <p>Each component is wrapped in a CompoundTag with a single key
+     * (the component name) whose value is the component's NBT subtree.
+     * This keeps the per-component blob self-describing — readers can
+     * identify which component a blob represents without external metadata.
+     *
+     * <p>Components not yet migrated to per-component storage continue to
+     * live in the legacy single-Blob {@link #serialize(PlayerData)} format.
+     * The SyncManager decides which path to use based on the dirty mask
+     * and the player's {@code component_bitmap}.
+     *
+     * @param componentName one of {@link com.fastsync.sync.dirty.ComponentDirtyMask.Component#name()}
+     * @param data          the full PlayerData (only the named component is read)
+     * @return NBT-encoded byte[] for the single component, or null if the
+     *         component is null/empty and should not be stored.
+     */
+    public static byte[] serializeComponent(String componentName, PlayerData data) throws IOException {
+        CompoundTag root = NBT.createCompound();
+        CompoundTag componentRoot = serializeComponentFields(componentName, data);
+        if (componentRoot == null) return null;
+        root.put(componentName, componentRoot);
+        return NBT.toBytes(root);
+    }
+
+    /**
+     * Deserialize a single component's NBT byte[] and merge it into the
+     * provided PlayerData. Other fields in {@code data} are left untouched.
+     */
+    public static void deserializeComponent(String componentName, byte[] bytes, PlayerData data) throws IOException {
+        if (bytes == null || bytes.length == 0) return;
+        CompoundTag root = NBT.fromBytes(bytes);
+        if (root == null) return;
+        Tag tag = root.get(componentName);
+        if (!(tag instanceof CompoundTag componentRoot)) return;
+        deserializeComponentFields(componentName, componentRoot, data);
+    }
+
+    /**
+     * Write a single component's fields into a fresh CompoundTag.
+     * Returns null if the component has no data (e.g. PDC is empty).
+     */
+    private static CompoundTag serializeComponentFields(String name, PlayerData data) throws IOException {
+        CompoundTag c = NBT.createCompound();
+        switch (name) {
+            case "INVENTORY" -> {
+                if (data.getInventory() != null) c.put("inventory", toItemStackList(data.getInventory()));
+                if (data.getArmor() != null) c.put("armor", toItemStackList(data.getArmor()));
+                if (data.getOffhand() != null) c.putByteArray("offhand", ItemStackCompat.serialize(data.getOffhand()));
+            }
+            case "ENDER_CHEST" -> {
+                if (data.getEnderChest() != null) c.put("enderChest", toItemStackList(data.getEnderChest()));
+            }
+            case "VITALS" -> {
+                c.putDouble("health", data.getHealth());
+                c.putDouble("maxHealth", data.getMaxHealth());
+            }
+            case "FOOD" -> {
+                c.putInt("foodLevel", data.getFoodLevel());
+                c.putFloat("saturation", data.getSaturation());
+                c.putFloat("exhaustion", data.getExhaustion());
+            }
+            case "EXPERIENCE" -> {
+                c.putInt("expLevel", data.getExpLevel());
+                c.putFloat("expProgress", data.getExpProgress());
+                c.putInt("totalExperience", data.getTotalExperience());
+            }
+            case "POTION_EFFECTS" -> {
+                if (data.getPotionEffects() != null && !data.getPotionEffects().isEmpty()) {
+                    ListTag effectList = NBT.createList();
+                    for (PlayerData.PotionEffectData effect : data.getPotionEffects()) {
+                        CompoundTag e = NBT.createCompound();
+                        e.putString("type", effect.getTypeKey());
+                        e.putInt("duration", effect.getDuration());
+                        e.putInt("amplifier", effect.getAmplifier());
+                        byte flags = 0;
+                        if (effect.isAmbient()) flags |= 0x01;
+                        if (effect.isParticles()) flags |= 0x02;
+                        if (effect.isIcon()) flags |= 0x04;
+                        e.putByte("flags", flags);
+                        effectList.add(e);
+                    }
+                    c.put("potionEffects", effectList);
+                }
+            }
+            case "GAME_MODE" -> c.putByte("gameMode", (byte)(data.getGameMode() != null ? data.getGameMode().ordinal() : 0));
+            case "FIRE_TICKS" -> c.putInt("fireTicks", data.getFireTicks());
+            case "AIR" -> {
+                c.putInt("remainingAir", data.getRemainingAir());
+                c.putInt("maximumAir", data.getMaximumAir());
+            }
+            case "FLIGHT" -> {
+                c.putBoolean("flying", data.isFlying());
+                c.putBoolean("allowFlight", data.isAllowFlight());
+            }
+            case "ADVANCEMENTS" -> {
+                if (data.getAdvancements() != null && !data.getAdvancements().isEmpty()) {
+                    CompoundTag a = NBT.createCompound();
+                    for (var entry : data.getAdvancements().entrySet()) {
+                        CompoundTag criteria = NBT.createCompound();
+                        for (var crit : entry.getValue().entrySet()) {
+                            criteria.putLong(crit.getKey(), crit.getValue());
+                        }
+                        a.put(entry.getKey(), criteria);
+                    }
+                    c.put("advancements", a);
+                }
+            }
+            case "STATISTICS" -> {
+                if (data.getStatistics() != null && !data.getStatistics().isEmpty()) {
+                    CompoundTag s = NBT.createCompound();
+                    for (var cat : data.getStatistics().entrySet()) {
+                        CompoundTag catTag = NBT.createCompound();
+                        for (var stat : cat.getValue().entrySet()) {
+                            catTag.putInt(stat.getKey(), stat.getValue());
+                        }
+                        s.put(cat.getKey(), catTag);
+                    }
+                    c.put("statistics", s);
+                }
+            }
+            case "ATTRIBUTES" -> {
+                if (data.getAttributes() != null && !data.getAttributes().isEmpty()) {
+                    ListTag attrList = NBT.createList();
+                    for (PlayerData.AttributeData attr : data.getAttributes()) {
+                        CompoundTag a = NBT.createCompound();
+                        a.putString("key", attr.getAttributeKey());
+                        a.putDouble("base", attr.getBaseValue());
+                        if (attr.getModifiers() != null && !attr.getModifiers().isEmpty()) {
+                            ListTag mods = NBT.createList();
+                            for (PlayerData.ModifierData mod : attr.getModifiers()) {
+                                CompoundTag m = NBT.createCompound();
+                                m.putString("uuid", mod.getUuid());
+                                m.putString("name", mod.getName());
+                                m.putDouble("amount", mod.getAmount());
+                                m.putString("operation", mod.getOperation());
+                                if (mod.getSerializedData() != null && mod.getSerializedData().length > 0) {
+                                    m.putByteArray("data", mod.getSerializedData());
+                                }
+                                mods.add(m);
+                            }
+                            a.put("modifiers", mods);
+                        }
+                        attrList.add(a);
+                    }
+                    c.put("attributes", attrList);
+                }
+            }
+            case "PDC" -> {
+                if (data.getPersistentDataContainer() != null && !data.getPersistentDataContainer().isEmpty()) {
+                    CompoundTag pdcTag = NBT.createCompound();
+                    for (var entry : data.getPersistentDataContainer().entrySet()) {
+                        pdcTag.putByteArray(entry.getKey(), entry.getValue());
+                    }
+                    c.put("pdc", pdcTag);
+                }
+            }
+            case "LOCATION" -> {
+                if (data.getWorldName() != null) {
+                    c.putString("world", data.getWorldName());
+                    c.putDouble("x", data.getX());
+                    c.putDouble("y", data.getY());
+                    c.putDouble("z", data.getZ());
+                    c.putFloat("yaw", data.getYaw());
+                    c.putFloat("pitch", data.getPitch());
+                }
+            }
+            default -> {
+                // Unknown component — return null so caller skips it.
+                return null;
+            }
+        }
+        // Return null if the component wrote no fields (e.g. empty PDC).
+        if (c.isEmpty()) return null;
+        return c;
+    }
+
+    /**
+     * Read a single component's fields from its CompoundTag into PlayerData.
+     */
+    private static void deserializeComponentFields(String name, CompoundTag c, PlayerData data) throws IOException {
+        switch (name) {
+            case "INVENTORY" -> {
+                if (c.get("inventory") instanceof ListTag inv) data.setInventory(fromItemStackList(inv));
+                if (c.get("armor") instanceof ListTag arm) data.setArmor(fromItemStackList(arm));
+                if (c.get("offhand") != null) data.setOffhand(ItemStackCompat.deserialize(c.getByteArray("offhand")));
+            }
+            case "ENDER_CHEST" -> {
+                if (c.get("enderChest") instanceof ListTag ec) data.setEnderChest(fromItemStackList(ec));
+            }
+            case "VITALS" -> {
+                data.setHealth(c.getDouble("health"));
+                data.setMaxHealth(c.getDouble("maxHealth"));
+            }
+            case "FOOD" -> {
+                data.setFoodLevel(c.getInt("foodLevel"));
+                data.setSaturation(c.getFloat("saturation"));
+                data.setExhaustion(c.getFloat("exhaustion"));
+            }
+            case "EXPERIENCE" -> {
+                data.setExpLevel(c.getInt("expLevel"));
+                data.setExpProgress(c.getFloat("expProgress"));
+                data.setTotalExperience(c.getInt("totalExperience"));
+            }
+            case "POTION_EFFECTS" -> {
+                if (c.get("potionEffects") instanceof ListTag list) {
+                    java.util.List<PlayerData.PotionEffectData> effects = new java.util.ArrayList<>();
+                    for (int i = 0; i < list.size(); i++) {
+                        if (list.get(i) instanceof CompoundTag e) {
+                            byte flags = e.getByte("flags");
+                            effects.add(new PlayerData.PotionEffectData(
+                                e.getString("type"), e.getInt("duration"), e.getInt("amplifier"),
+                                (flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0));
+                        }
+                    }
+                    data.setPotionEffects(effects);
+                }
+            }
+            case "GAME_MODE" -> {
+                int ord = c.getByte("gameMode") & 0xFF;
+                GameMode[] modes = GameMode.values();
+                data.setGameMode(ord < modes.length ? modes[ord] : GameMode.SURVIVAL);
+            }
+            case "FIRE_TICKS" -> data.setFireTicks(c.getInt("fireTicks"));
+            case "AIR" -> {
+                data.setRemainingAir(c.getInt("remainingAir"));
+                data.setMaximumAir(c.getInt("maximumAir"));
+            }
+            case "FLIGHT" -> {
+                data.setFlying(c.getBoolean("flying"));
+                data.setAllowFlight(c.getBoolean("allowFlight"));
+            }
+            case "ADVANCEMENTS" -> {
+                if (c.get("advancements") instanceof CompoundTag a) {
+                    java.util.Map<String, java.util.Map<String, Long>> advs = new java.util.HashMap<>();
+                    for (String key : a.keySet()) {
+                        if (a.get(key) instanceof CompoundTag crit) {
+                            java.util.Map<String, Long> m = new java.util.HashMap<>();
+                            for (String cn : crit.keySet()) m.put(cn, crit.getLong(cn));
+                            advs.put(key, m);
+                        }
+                    }
+                    data.setAdvancements(advs);
+                }
+            }
+            case "STATISTICS" -> {
+                if (c.get("statistics") instanceof CompoundTag s) {
+                    java.util.Map<String, java.util.Map<String, Integer>> stats = new java.util.HashMap<>();
+                    for (String cat : s.keySet()) {
+                        if (s.get(cat) instanceof CompoundTag catTag) {
+                            java.util.Map<String, Integer> m = new java.util.HashMap<>();
+                            for (String sn : catTag.keySet()) m.put(sn, catTag.getInt(sn));
+                            stats.put(cat, m);
+                        }
+                    }
+                    data.setStatistics(stats);
+                }
+            }
+            case "ATTRIBUTES" -> {
+                if (c.get("attributes") instanceof ListTag list) {
+                    java.util.List<PlayerData.AttributeData> attrs = new java.util.ArrayList<>();
+                    for (int i = 0; i < list.size(); i++) {
+                        if (list.get(i) instanceof CompoundTag a) {
+                            java.util.List<PlayerData.ModifierData> mods = new java.util.ArrayList<>();
+                            if (a.get("modifiers") instanceof ListTag ml) {
+                                for (int j = 0; j < ml.size(); j++) {
+                                    if (ml.get(j) instanceof CompoundTag m) {
+                                        byte[] md = m.get("data") != null ? m.getByteArray("data") : null;
+                                        mods.add(new PlayerData.ModifierData(
+                                            m.getString("uuid"), m.getString("name"),
+                                            m.getDouble("amount"), m.getString("operation"), md));
+                                    }
+                                }
+                            }
+                            attrs.add(new PlayerData.AttributeData(a.getString("key"), a.getDouble("base"), mods));
+                        }
+                    }
+                    data.setAttributes(attrs);
+                }
+            }
+            case "PDC" -> {
+                if (c.get("pdc") instanceof CompoundTag pdcTag) {
+                    java.util.Map<String, byte[]> pdc = new java.util.HashMap<>();
+                    for (String key : pdcTag.keySet()) pdc.put(key, pdcTag.getByteArray(key));
+                    data.setPersistentDataContainer(pdc);
+                }
+            }
+            case "LOCATION" -> {
+                if (c.getString("world") != null && !c.getString("world").isEmpty()) {
+                    data.setWorldName(c.getString("world"));
+                    data.setX(c.getDouble("x"));
+                    data.setY(c.getDouble("y"));
+                    data.setZ(c.getDouble("z"));
+                    data.setYaw(c.getFloat("yaw"));
+                    data.setPitch(c.getFloat("pitch"));
+                }
+            }
+            default -> { /* unknown component: skip */ }
+        }
     }
 }

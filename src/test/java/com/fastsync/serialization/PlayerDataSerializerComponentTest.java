@@ -1,0 +1,252 @@
+package com.fastsync.serialization;
+
+import com.fastsync.data.PlayerData;
+import org.bukkit.GameMode;
+import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Unit tests for the per-component serialize/deserialize API added in
+ * phase 2. Verifies that each component can be serialized to its own
+ * NBT byte[] and round-tripped back into a PlayerData without affecting
+ * other components' fields.
+ *
+ * <p>Note: ItemStack-related components (INVENTORY, ENDER_CHEST) can't
+ * be fully tested here because ItemStackCompat.serialize requires the
+ * Paper runtime. We test the non-ItemStack components which exercise
+ * the core serialization logic.
+ */
+class PlayerDataSerializerComponentTest {
+
+    @Test
+    void testVitalsRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setHealth(15.5);
+        original.setMaxHealth(20.0);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("VITALS", original);
+        assertNotNull(bytes);
+        assertTrue(bytes.length > 0);
+
+        PlayerData target = new PlayerData();
+        target.setHealth(1.0);
+        target.setMaxHealth(1.0);
+
+        PlayerDataSerializer.deserializeComponent("VITALS", bytes, target);
+
+        assertEquals(15.5, target.getHealth(), 0.001);
+        assertEquals(20.0, target.getMaxHealth(), 0.001);
+    }
+
+    @Test
+    void testFoodRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setFoodLevel(18);
+        original.setSaturation(5.0f);
+        original.setExhaustion(0.5f);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("FOOD", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("FOOD", bytes, target);
+
+        assertEquals(18, target.getFoodLevel());
+        assertEquals(5.0f, target.getSaturation(), 0.001f);
+        assertEquals(0.5f, target.getExhaustion(), 0.001f);
+    }
+
+    @Test
+    void testExperienceRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setExpLevel(42);
+        original.setExpProgress(0.75f);
+        original.setTotalExperience(1200);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("EXPERIENCE", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("EXPERIENCE", bytes, target);
+
+        assertEquals(42, target.getExpLevel());
+        assertEquals(0.75f, target.getExpProgress(), 0.001f);
+        assertEquals(1200, target.getTotalExperience());
+    }
+
+    @Test
+    void testGameModeRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setGameMode(GameMode.CREATIVE);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("GAME_MODE", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("GAME_MODE", bytes, target);
+
+        assertEquals(GameMode.CREATIVE, target.getGameMode());
+    }
+
+    @Test
+    void testFireTicksRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setFireTicks(100);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("FIRE_TICKS", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("FIRE_TICKS", bytes, target);
+
+        assertEquals(100, target.getFireTicks());
+    }
+
+    @Test
+    void testAirRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setRemainingAir(150);
+        original.setMaximumAir(300);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("AIR", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("AIR", bytes, target);
+
+        assertEquals(150, target.getRemainingAir());
+        assertEquals(300, target.getMaximumAir());
+    }
+
+    @Test
+    void testFlightRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setFlying(true);
+        original.setAllowFlight(true);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("FLIGHT", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        target.setFlying(false);
+        target.setAllowFlight(false);
+
+        PlayerDataSerializer.deserializeComponent("FLIGHT", bytes, target);
+
+        assertTrue(target.isFlying());
+        assertTrue(target.isAllowFlight());
+    }
+
+    @Test
+    void testLocationRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setWorldName("world");
+        original.setX(123.45);
+        original.setY(64.0);
+        original.setZ(-78.9);
+        original.setYaw(45.5f);
+        original.setPitch(-30.0f);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("LOCATION", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("LOCATION", bytes, target);
+
+        assertEquals("world", target.getWorldName());
+        assertEquals(123.45, target.getX(), 0.001);
+        assertEquals(64.0, target.getY(), 0.001);
+        assertEquals(-78.9, target.getZ(), 0.001);
+        assertEquals(45.5f, target.getYaw(), 0.001f);
+        assertEquals(-30.0f, target.getPitch(), 0.001f);
+    }
+
+    @Test
+    void testEmptyComponentReturnsNull() throws IOException {
+        PlayerData empty = new PlayerData();
+        byte[] bytes = PlayerDataSerializer.serializeComponent("PDC", empty);
+        assertNull(bytes, "Empty PDC should serialize to null");
+    }
+
+    @Test
+    void testUnknownComponentReturnsNull() throws IOException {
+        PlayerData data = new PlayerData();
+        byte[] bytes = PlayerDataSerializer.serializeComponent("NONEXISTENT", data);
+        assertNull(bytes, "Unknown component should serialize to null");
+    }
+
+    @Test
+    void testDeserializeEmptyBytesIsNoOp() throws IOException {
+        PlayerData target = new PlayerData();
+        target.setHealth(10.0);
+
+        PlayerDataSerializer.deserializeComponent("VITALS", new byte[0], target);
+
+        assertEquals(10.0, target.getHealth(), 0.001);
+    }
+
+    @Test
+    void testComponentIsolation() throws IOException {
+        PlayerData original = new PlayerData();
+        original.setHealth(15.0);
+        original.setFoodLevel(20);
+
+        byte[] vitalsBytes = PlayerDataSerializer.serializeComponent("VITALS", original);
+        byte[] foodBytes = PlayerDataSerializer.serializeComponent("FOOD", original);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("VITALS", vitalsBytes, target);
+
+        assertEquals(15.0, target.getHealth(), 0.001);
+        assertEquals(0, target.getFoodLevel(), "Food should not be set by VITALS deserialization");
+
+        PlayerDataSerializer.deserializeComponent("FOOD", foodBytes, target);
+        assertEquals(20, target.getFoodLevel());
+        assertEquals(15.0, target.getHealth(), 0.001);
+    }
+
+    @Test
+    void testStatisticsRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        Map<String, Map<String, Integer>> stats = new HashMap<>();
+        Map<String, Integer> unt = new HashMap<>();
+        unt.put("JUMP", 42);
+        unt.put("WALK_ONE_CM", 12345);
+        stats.put("UNtyped", unt);
+        original.setStatistics(stats);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("STATISTICS", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("STATISTICS", bytes, target);
+
+        assertNotNull(target.getStatistics());
+        assertEquals(42, target.getStatistics().get("UNtyped").get("JUMP"));
+        assertEquals(12345, target.getStatistics().get("UNtyped").get("WALK_ONE_CM"));
+    }
+
+    @Test
+    void testAdvancementsRoundTrip() throws IOException {
+        PlayerData original = new PlayerData();
+        Map<String, Map<String, Long>> advs = new HashMap<>();
+        Map<String, Long> crit = new HashMap<>();
+        crit.put("got_diamond", 1700000000000L);
+        advs.put("minecraft:story/mine_diamond", crit);
+        original.setAdvancements(advs);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("ADVANCEMENTS", original);
+        assertNotNull(bytes);
+
+        PlayerData target = new PlayerData();
+        PlayerDataSerializer.deserializeComponent("ADVANCEMENTS", bytes, target);
+
+        assertNotNull(target.getAdvancements());
+        assertEquals(1700000000000L, target.getAdvancements().get("minecraft:story/mine_diamond").get("got_diamond"));
+    }
+}

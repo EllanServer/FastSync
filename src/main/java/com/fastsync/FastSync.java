@@ -25,25 +25,19 @@ import java.util.UUID;
 import java.util.logging.Level;
 
 /**
- * FastSync — high-performance cross-server player data synchronization.
+ * FastSync - High-performance cross-server player data synchronization.
  *
- * <h2>Optimizations applied in this revision</h2>
- * <ul>
- *   <li><b>Robust {@code /fastsync log} parsing:</b> the previous
- *       {@code Integer.parseInt(args[2])} call would throw
- *       {@code NumberFormatException} and bubble up to the command sender
- *       as an ugly stacktrace when the user typed e.g.
- *       {@code /fastsync log Notch abc}. Now wrapped in try/catch with a
- *       friendly error message.</li>
- *   <li><b>Periodic-save batching:</b> the previous implementation submitted
- *       every online player to the async executor in a single tick, which
- *       on busy servers flooded the executor queue and saturated the
- *       HikariCP pool. The new implementation processes players in batches
- *       of {@code config.getPeriodicSaveBatchSize()} per tick, spacing the
- *       load over multiple ticks. Default batch size is 10 — at 300s
- *       interval with 200 players, that's 20 ticks (1 second) of spread
- *       instead of one giant spike.</li>
- * </ul>
+ * Design principles (based on community discussion):
+ *   1. NBT byte[] serialization - NO base64 string encoding, NO Kryo, NO Gson
+ *      Primary: ItemStack.serializeAsBytes() (Paper 1.20.5+)
+ *      Fallback: Bukkit object serialization (still byte[], NOT string)
+ *   2. LZ4 compression to reduce database storage and network transfer
+ *   3. Data loaded during login phase (AsyncPlayerPreLoginEvent) - not after joining
+ *      Prevents item duplication bugs from "enter server then load" approach
+ *   4. Cross-server lock with proper acknowledgment (Redis pub/sub)
+ *      NOT HuskSync's broken "petition" that forces entry after timeout
+ *   5. Dedicated thread pool for async operations (NOT ForkJoinPool.commonPool)
+ *   6. Version byte prefix for future serialization format migration
  */
 public class FastSync extends JavaPlugin implements CommandExecutor, TabCompleter {
 
@@ -53,9 +47,36 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
     private Object cleanupTask;
     private Object periodicSaveTask;
+    private Object heartbeatTask;
+
+    /**
+     * Start (or restart) the heartbeat task. Called from onEnable and from
+     * the reload command when heartbeat-interval-seconds changes.
+     *
+     * <p>Without this, /fastsync reload would change the config value but
+     * the old timer would keep running at the old interval — a subtle
+     * production trap that could cause lock expiry if the new interval is
+     * shorter than expected.
+     */
+    private void restartHeartbeatTask() {
+        // Cancel old task if running
+        if (heartbeatTask != null) {
+            SchedulerUtil.cancel(heartbeatTask);
+            heartbeatTask = null;
+        }
+        // Start new task with current config
+        long heartbeatTicks = configManager.getHeartbeatIntervalSeconds() * 20L;
+        heartbeatTask = SchedulerUtil.runAsyncTimer(this, () -> {
+            syncManager.heartbeatOnlinePlayers();
+        }, heartbeatTicks, heartbeatTicks);
+        getLogger().info("Lock heartbeat " + (heartbeatTask != null ? "restarted" : "started")
+            + ": every " + configManager.getHeartbeatIntervalSeconds() + " seconds"
+            + " (lock-timeout=" + configManager.getLockTimeout() + "s).");
+    }
 
     @Override
     public void onEnable() {
+        // Check ItemStack serialization compatibility (graceful, not hard fail)
         boolean nativeNbt = ItemStackCompat.isPaperNativeAvailable();
         if (!nativeNbt) {
             getLogger().warning("============================================");
@@ -65,10 +86,12 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             getLogger().warning("============================================");
         }
 
+        // Initialize config
         saveDefaultConfig();
         configManager = new ConfigManager(this);
         configManager.load();
 
+        // Initialize database
         databaseManager = new DatabaseManager(getLogger(), configManager);
         try {
             databaseManager.initialize();
@@ -78,9 +101,13 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             return;
         }
 
+        // Initialize sync manager (creates thread pool + optional Redis)
         syncManager = new SyncManager(this, configManager, databaseManager);
         syncManager.initialize();
 
+        // Register plugin messaging channel for proxy handoff communication
+        // This is optional — if no Velocity proxy with FastSync Proxy is installed,
+        // the channel simply never receives messages. The backend works standalone.
         Bukkit.getMessenger().registerIncomingPluginChannel(
             this, com.fastsync.messaging.HandoffMessageListener.CHANNEL,
             new com.fastsync.messaging.HandoffMessageListener(
@@ -89,29 +116,58 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             this, com.fastsync.messaging.HandoffMessageListener.CHANNEL);
         getLogger().info("Registered fastsync:handoff plugin messaging channel (optional: for Velocity proxy integration)");
 
+        // Register listeners
         getServer().getPluginManager().registerEvents(
             new PlayerListener(this, syncManager), this);
         getServer().getPluginManager().registerEvents(
             new com.fastsync.listeners.DataListener(syncManager, configManager), this);
 
+        // Register dirty-tracking listener (component-level change detection)
+        if (configManager.isDirtyTrackingEnabled() && syncManager.getDirtyMask() != null) {
+            getServer().getPluginManager().registerEvents(
+                new com.fastsync.listeners.dirty.DirtyTrackingListener(syncManager.getDirtyMask()), this);
+            getLogger().info("Dirty tracking enabled: validation every " +
+                configManager.getDirtyValidationInterval() + " saves");
+        }
+
+        // Register command
         if (getCommand("fastsync") != null) {
             getCommand("fastsync").setExecutor(this);
             getCommand("fastsync").setTabCompleter(this);
         }
 
+        // Start cleanup task (every 5 minutes = 6000 ticks)
         cleanupTask = SchedulerUtil.runAsyncTimer(this, () -> {
             syncManager.cleanupStaleEntries();
         }, 6000L, 6000L);
 
+        // Start heartbeat task — refreshes locked_at for all online players.
+        // This is the PRIMARY mechanism for keeping online locks alive.
+        // Runs on async thread (DB I/O only, no Bukkit API calls).
+        restartHeartbeatTask();
+
+        // Start periodic save task (if enabled)
         if (configManager.isPeriodicSave()) {
             long intervalTicks = configManager.getPeriodicSaveIntervalSeconds() * 20L;
-            int batchSize = configManager.getPeriodicSaveBatchSize();
             periodicSaveTask = SchedulerUtil.runGlobalTimer(this, () -> {
-                schedulePeriodicSaveBatch(batchSize);
+                // Snapshot online players on the global region thread, then save them
+                // in small batches spread across successive ticks to avoid a lag spike
+                // when many players are online (process at most 10 players per tick).
+                List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
+                final int batchSize = configManager.getPeriodicSaveBatchSize();
+                for (int i = 0; i < players.size(); i += batchSize) {
+                    final int start = i;
+                    final int end = Math.min(i + batchSize, players.size());
+                    long delayTicks = i / batchSize;
+                    SchedulerUtil.runAsyncDelayed(this, () -> {
+                        for (int j = start; j < end; j++) {
+                            syncManager.savePlayerAsync(players.get(j));
+                        }
+                    }, delayTicks);
+                }
             }, intervalTicks, intervalTicks);
             getLogger().info("Periodic save enabled: every " +
-                configManager.getPeriodicSaveIntervalSeconds() +
-                " seconds (batch size: " + batchSize + " per tick)");
+                configManager.getPeriodicSaveIntervalSeconds() + " seconds");
         }
 
         getLogger().info("FastSync v" + getPluginMeta().getVersion() + " enabled!");
@@ -121,54 +177,27 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         getLogger().info("Redis: " + (configManager.isRedisEnabled() ? "Enabled" : "Disabled (DB polling)"));
     }
 
-    /**
-     * Schedule a batched periodic save.
-     *
-     * <p>Instead of submitting all online players to the executor in one tick
-     * (which previously caused queue flooding and pool saturation), this method
-     * takes a snapshot of online players and schedules the save across multiple
-     * ticks — {@code batchSize} players per tick, 1 tick apart. With 200 online
-     * players and a batch size of 10, the save is spread across 20 ticks
-     * (1 second) instead of all-at-once.
-     */
-    private void schedulePeriodicSaveBatch(int batchSize) {
-        List<Player> snapshot = new ArrayList<>(Bukkit.getOnlinePlayers());
-        if (snapshot.isEmpty()) return;
-
-        int total = snapshot.size();
-        int batches = (total + batchSize - 1) / batchSize;
-
-        for (int b = 0; b < batches; b++) {
-            final int from = b * batchSize;
-            final int to = Math.min(from + batchSize, total);
-            // Schedule each batch on a separate tick (b ticks later).
-            SchedulerUtil.runGlobal(this, () -> {
-                for (int i = from; i < to; i++) {
-                    Player p = snapshot.get(i);
-                    if (p.isOnline()) {
-                        syncManager.savePlayerAsync(p);
-                    }
-                }
-            });
-            // For batches beyond the first, we'd ideally use runGlobalDelayed,
-            // but since the periodic-save interval is minutes, batching within
-            // one tick is acceptable for most servers. If true multi-tick
-            // spreading is needed, callers can implement a state machine here.
-        }
-    }
-
     @Override
     public void onDisable() {
+        // Cancel scheduled tasks (Paper/Folia compatible)
         SchedulerUtil.cancel(cleanupTask);
         SchedulerUtil.cancel(periodicSaveTask);
+        SchedulerUtil.cancel(heartbeatTask);
 
+        // Save all online players synchronously (release locks — server is stopping)
         if (syncManager != null) {
-            getLogger().info("Saving all online players...");
-            syncManager.saveAllOnlinePlayers();
+            getLogger().info("Saving all online players (shutdown)...");
+            SyncManager.SaveAllResult result = syncManager.saveAllOnlinePlayers(SyncManager.SaveKind.SHUTDOWN);
+            getLogger().info("Shutdown save: " + result.success() + "/" + result.total()
+                + " succeeded" + (result.failed() > 0 ? ", " + result.failed() + " failed" : "") + ".");
         }
+
+        // Shut down sync manager (waits for pending saves, closes Redis + thread pool)
         if (syncManager != null) {
             syncManager.shutdown();
         }
+
+        // Close database
         if (databaseManager != null) {
             databaseManager.close();
         }
@@ -194,12 +223,27 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         switch (args[0].toLowerCase()) {
             case "reload" -> {
                 configManager.reload();
+                // Refresh SyncManager caches that depend on config (e.g. snapshot trigger set)
+                if (syncManager != null) {
+                    syncManager.refreshConfigCache();
+                }
+                // Restart heartbeat task — interval may have changed
+                restartHeartbeatTask();
+                // Reset protection mode on reload — only if DB is healthy
+                boolean resetOk = syncManager.resetProtectionMode();
+                if (resetOk) {
+                    sender.sendMessage(ChatColor.GREEN + "[FastSync] Protection mode reset.");
+                } else {
+                    sender.sendMessage(ChatColor.RED + "[FastSync] Protection mode still active: database is unhealthy.");
+                }
                 sender.sendMessage(ChatColor.GREEN + "[FastSync] Configuration reloaded.");
                 sender.sendMessage(ChatColor.GRAY + "Server: " + configManager.getServerName());
                 sender.sendMessage(ChatColor.GRAY + "Compression: " +
                     (configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
                 sender.sendMessage(ChatColor.GRAY + "Redis: " +
                     (configManager.isRedisEnabled() ? "Enabled" : "Disabled"));
+                sender.sendMessage(ChatColor.GRAY + "Heartbeat: every " +
+                    configManager.getHeartbeatIntervalSeconds() + "s (timer restarted)");
             }
             case "status" -> sendStatus(sender);
             case "debug" -> {
@@ -212,9 +256,34 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             }
             case "saveall" -> {
                 sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saving all online players...");
-                SchedulerUtil.runAsync(this, () -> {
-                    syncManager.saveAllOnlinePlayers();
-                    sender.sendMessage(ChatColor.GREEN + "[FastSync] All players saved!");
+                // CRITICAL: Bukkit.getOnlinePlayers() must be called on the main
+                // thread (or global region for Folia). Collect the player list
+                // on a safe thread first, then dispatch the async save.
+                SchedulerUtil.runGlobal(this, () -> {
+                    List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
+                    SchedulerUtil.runAsync(this, () -> {
+                        try {
+                            SyncManager.SaveAllResult result = syncManager.savePlayersSnapshot(players, SyncManager.SaveKind.BULK);
+                            SchedulerUtil.runGlobal(this, () -> {
+                                if (result.allSucceeded()) {
+                                    sender.sendMessage(ChatColor.GREEN + "[FastSync] All " + result.total() + " players saved!");
+                                } else {
+                                    sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saved " + result.success()
+                                        + "/" + result.total() + " players. " + ChatColor.RED + result.failed() + " failed.");
+                                    if (!result.failures().isEmpty()) {
+                                        sender.sendMessage(ChatColor.GRAY + "Failed players:");
+                                        result.failures().forEach((uuid, reason) ->
+                                            sender.sendMessage(ChatColor.GRAY + "  " + uuid + ": " + ChatColor.RED + reason));
+                                    }
+                                }
+                            });
+                        } catch (Exception e) {
+                            getLogger().log(Level.SEVERE, "Saveall failed", e);
+                            SchedulerUtil.runGlobal(this, () ->
+                                sender.sendMessage(ChatColor.RED + "[FastSync] Saveall failed: " + e.getMessage())
+                            );
+                        }
+                    });
                 });
             }
             case "log" -> {
@@ -222,22 +291,17 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     sender.sendMessage(ChatColor.RED + "Usage: /" + label + " log <player|uuid> [limit]");
                     return true;
                 }
-                // Parse limit with explicit exception handling — previously
-                // Integer.parseInt(args[2]) would throw NumberFormatException
-                // for non-numeric input, bubbling up to the command sender as
-                // an ugly stacktrace.
-                int limit = 20;
+                int limit;
                 if (args.length >= 3) {
                     try {
                         limit = Math.min(Integer.parseInt(args[2]), 50);
-                        if (limit < 1) limit = 1;
                     } catch (NumberFormatException e) {
-                        sender.sendMessage(ChatColor.RED + "Invalid limit '" + args[2] +
-                            "'. Must be a number between 1 and 50.");
+                        sender.sendMessage(ChatColor.RED + "Invalid number: " + args[2]);
                         return true;
                     }
+                } else {
+                    limit = 20;
                 }
-
                 UUID targetUuid;
                 Player target = Bukkit.getPlayer(args[1]);
                 if (target != null) {
@@ -251,27 +315,33 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     }
                 }
                 final UUID fuuid = targetUuid;
-                final int flimit = limit;
                 SchedulerUtil.runAsync(this, () -> {
-                    List<OperationLog> logs = syncManager.queryOperationLog(fuuid, flimit);
+                    List<OperationLog> logs = syncManager.queryOperationLog(fuuid, limit);
+                    // Build all messages on async thread, then send on global thread
+                    List<String> messages = new java.util.ArrayList<>();
                     if (logs.isEmpty()) {
-                        sender.sendMessage(ChatColor.YELLOW + "[FastSync] No operation log entries for " + args[1]);
-                        return;
+                        messages.add(ChatColor.YELLOW + "[FastSync] No operation log entries for " + args[1]);
+                    } else {
+                        messages.add(ChatColor.GOLD + "===== Operation Log: " + args[1] + " (" + logs.size() + " entries) =====");
+                        for (OperationLog log : logs) {
+                            ChatColor typeColor = switch (log.type()) {
+                                case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> ChatColor.RED;
+                                case SAVE, SNAPSHOT, RESTORE -> ChatColor.GREEN;
+                                case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> ChatColor.AQUA;
+                            };
+                            messages.add(ChatColor.GRAY + "#" + log.seq() + " " +
+                                typeColor + log.type() + ChatColor.GRAY +
+                                " | server=" + log.serverName() +
+                                " v=" + log.version() + " ft=" + log.fencingToken() +
+                                " sz=" + log.dataSize() + "B" +
+                                (log.detail() != null ? " | " + ChatColor.WHITE + log.detail() : ""));
+                        }
                     }
-                    sender.sendMessage(ChatColor.GOLD + "===== Operation Log: " + args[1] + " (" + logs.size() + " entries) =====");
-                    for (OperationLog log : logs) {
-                        ChatColor typeColor = switch (log.type()) {
-                            case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> ChatColor.RED;
-                            case SAVE, SNAPSHOT, RESTORE -> ChatColor.GREEN;
-                            case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> ChatColor.AQUA;
-                        };
-                        sender.sendMessage(ChatColor.GRAY + "#" + log.seq() + " " +
-                            typeColor + log.type() + ChatColor.GRAY +
-                            " | server=" + log.serverName() +
-                            " v=" + log.version() + " ft=" + log.fencingToken() +
-                            " sz=" + log.dataSize() + "B" +
-                            (log.detail() != null ? " | " + ChatColor.WHITE + log.detail() : ""));
-                    }
+                    SchedulerUtil.runGlobal(this, () -> {
+                        for (String msg : messages) {
+                            sender.sendMessage(msg);
+                        }
+                    });
                 });
             }
             default -> sendHelp(sender, label);
@@ -317,6 +387,12 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sender.sendMessage(ChatColor.YELLOW + "Active players: " + ChatColor.WHITE + syncManager.getActiveCount());
         sender.sendMessage(ChatColor.YELLOW + "Pending loads: " + ChatColor.WHITE + syncManager.getPendingCount());
         sender.sendMessage(ChatColor.YELLOW + "Pending saves: " + ChatColor.WHITE + syncManager.getPendingSaveCount());
+        sender.sendMessage(ChatColor.YELLOW + "Quarantined: " + ChatColor.WHITE + syncManager.getQuarantinedPlayerCount());
+        sender.sendMessage(ChatColor.YELLOW + "Protection mode: " +
+            (syncManager.isProtectionMode() ? ChatColor.RED + "ACTIVE (DB failures detected)" : ChatColor.GREEN + "Off"));
+        sender.sendMessage(ChatColor.YELLOW + "Heartbeat: " + ChatColor.WHITE +
+            "every " + configManager.getHeartbeatIntervalSeconds() + "s" +
+            " (lock-timeout=" + configManager.getLockTimeout() + "s)");
         sender.sendMessage(ChatColor.YELLOW + "Async threads: " + ChatColor.WHITE +
             "active=" + syncManager.getAsyncActiveCount() +
             ", queue=" + syncManager.getAsyncQueueSize());
@@ -325,6 +401,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sender.sendMessage(ChatColor.YELLOW + "Debug: " +
             (configManager.isDebug() ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
 
+        // HikariCP stats
         if (databaseManager.getDataSource() != null) {
             var pool = databaseManager.getDataSource().getHikariPoolMXBean();
             if (pool != null) {
@@ -336,9 +413,11 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             }
         }
 
+        // Latency stats (Dynamo p99.9)
         sender.sendMessage(ChatColor.YELLOW + "Latency: " + ChatColor.GRAY + "(p50/p99/p99.9)");
         syncManager.logLatencyStats();
 
+        // Stream stats
         sender.sendMessage(ChatColor.YELLOW + "Streams: " +
             (configManager.isStreamsEnabled() ? ChatColor.GREEN + "Enabled" : ChatColor.RED + "Disabled"));
     }
