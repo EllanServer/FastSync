@@ -99,6 +99,19 @@ public class SyncManager {
     private volatile org.bukkit.advancement.Advancement[] cachedAdvancements;
     private volatile Attribute[] cachedAttributes;
 
+    // Pre-grouped statistic registries (avoids Statistic.values() + type check on every save).
+    private volatile List<Statistic> untypedStats;
+    private volatile List<Statistic> itemStats;
+    private volatile List<Statistic> blockStats;
+    private volatile List<Statistic> entityStats;
+    // Pre-filtered material/entity registries (avoids Material.values() ~1300 entries on every save).
+    private volatile List<org.bukkit.Material> itemMaterials;   // isItem() == true
+    private volatile List<org.bukkit.Material> blockMaterials;  // isBlock() == true
+    private volatile List<org.bukkit.entity.EntityType> aliveEntities; // isAlive() == true
+
+    // Parsed snapshot trigger set (computed once at init/reload, O(1) lookup per save).
+    private volatile java.util.Set<String> snapshotTriggerSet;
+
     public SyncManager(FastSync plugin, ConfigManager config, DatabaseManager databaseManager) {
         this.plugin = plugin;
         this.config = config;
@@ -164,6 +177,17 @@ public class SyncManager {
             serializeLatency = new LatencyTracker("Serialize", logger, window);
             logger.info("Latency tracking enabled (p50/p99/p99.9, window=" + window + ").");
         }
+
+        // Parse snapshot trigger set for O(1) lookup during saves
+        parseSnapshotTriggerSet();
+    }
+
+    /**
+     * Re-parse config-dependent caches after a config reload.
+     * Called from {@code /fastsync reload}.
+     */
+    public void refreshConfigCache() {
+        parseSnapshotTriggerSet();
     }
 
     // ==================== Load (Pre-Login) ====================
@@ -741,6 +765,47 @@ public class SyncManager {
 
     // ==================== Data Collection Helpers ====================
 
+    /**
+     * Lazily populate the cached Bukkit registry snapshots.
+     *
+     * <p>These registries are immutable for the lifetime of a server process,
+     * so we compute them once and reuse across all subsequent save/load cycles.
+     * This avoids rebuilding ~1300-entry Material arrays and re-checking
+     * isItem()/isBlock() on every player save.
+     */
+    private void ensureRegistryCache() {
+        if (untypedStats != null) return; // already cached
+        List<Statistic> unt = new ArrayList<>(), it = new ArrayList<>(),
+                        blk = new ArrayList<>(), ent = new ArrayList<>();
+        for (Statistic s : Statistic.values()) {
+            switch (s.getType()) {
+                case UNTYPED -> unt.add(s);
+                case ITEM -> it.add(s);
+                case BLOCK -> blk.add(s);
+                case ENTITY -> ent.add(s);
+            }
+        }
+        this.untypedStats = List.copyOf(unt);
+        this.itemStats = List.copyOf(it);
+        this.blockStats = List.copyOf(blk);
+        this.entityStats = List.copyOf(ent);
+
+        List<org.bukkit.Material> items = new ArrayList<>();
+        List<org.bukkit.Material> blocks = new ArrayList<>();
+        for (org.bukkit.Material mat : org.bukkit.Material.values()) {
+            if (mat.isItem()) items.add(mat);
+            if (mat.isBlock()) blocks.add(mat);
+        }
+        this.itemMaterials = List.copyOf(items);
+        this.blockMaterials = List.copyOf(blocks);
+
+        List<org.bukkit.entity.EntityType> alive = new ArrayList<>();
+        for (org.bukkit.entity.EntityType e : org.bukkit.entity.EntityType.values()) {
+            if (e.isAlive()) alive.add(e);
+        }
+        this.aliveEntities = List.copyOf(alive);
+    }
+
     @SuppressWarnings("deprecation")
     private void collectAdvancements(Player player, PlayerData data) {
         try {
@@ -777,49 +842,51 @@ public class SyncManager {
     }
 
     private void collectStatistics(Player player, PlayerData data) {
+        ensureRegistryCache();
         try {
             Map<String, Map<String, Integer>> statistics = new HashMap<>();
-            for (Statistic stat : Statistic.values()) {
-                try {
-                    String categoryName = stat.getType().name();
-                    String statName = stat.name();
 
-                    if (stat.getType() == Statistic.Type.UNTYPED) {
-                        int value = player.getStatistic(stat);
-                        statistics.computeIfAbsent(categoryName, k -> new HashMap<>()).put(statName, value);
-                    } else if (stat.getType() == Statistic.Type.ITEM) {
-                        Map<String, Integer> itemStats = statistics.computeIfAbsent("ITEM_" + statName, k -> new HashMap<>());
-                        for (org.bukkit.Material mat : org.bukkit.Material.values()) {
-                            if (mat.isItem()) {
-                                try {
-                                    int v = player.getStatistic(stat, mat);
-                                    if (v != 0) itemStats.put(mat.name(), v);
-                                } catch (Exception ignored) {}
-                            }
-                        }
-                    } else if (stat.getType() == Statistic.Type.BLOCK) {
-                        Map<String, Integer> blockStats = statistics.computeIfAbsent("BLOCK_" + statName, k -> new HashMap<>());
-                        for (org.bukkit.Material mat : org.bukkit.Material.values()) {
-                            if (mat.isBlock()) {
-                                try {
-                                    int v = player.getStatistic(stat, mat);
-                                    if (v != 0) blockStats.put(mat.name(), v);
-                                } catch (Exception ignored) {}
-                            }
-                        }
-                    } else if (stat.getType() == Statistic.Type.ENTITY) {
-                        Map<String, Integer> entityStats = statistics.computeIfAbsent("ENTITY_" + statName, k -> new HashMap<>());
-                        for (org.bukkit.entity.EntityType ent : org.bukkit.entity.EntityType.values()) {
-                            try {
-                                int v = player.getStatistic(stat, ent);
-                                if (v != 0) entityStats.put(ent.name(), v);
-                            } catch (Exception ignored) {}
-                        }
-                    }
-                } catch (Exception ignored) {
-                    // Some stats throw on certain versions
+            // UNTYPED statistics
+            for (Statistic stat : untypedStats) {
+                try {
+                    int value = player.getStatistic(stat);
+                    statistics.computeIfAbsent("UNTYPED", k -> new HashMap<>()).put(stat.name(), value);
+                } catch (Exception ignored) {}
+            }
+
+            // ITEM statistics
+            for (Statistic stat : itemStats) {
+                Map<String, Integer> itemStatMap = statistics.computeIfAbsent("ITEM_" + stat.name(), k -> new HashMap<>());
+                for (org.bukkit.Material mat : itemMaterials) {
+                    try {
+                        int v = player.getStatistic(stat, mat);
+                        if (v != 0) itemStatMap.put(mat.name(), v);
+                    } catch (Exception ignored) {}
                 }
             }
+
+            // BLOCK statistics
+            for (Statistic stat : blockStats) {
+                Map<String, Integer> blockStatMap = statistics.computeIfAbsent("BLOCK_" + stat.name(), k -> new HashMap<>());
+                for (org.bukkit.Material mat : blockMaterials) {
+                    try {
+                        int v = player.getStatistic(stat, mat);
+                        if (v != 0) blockStatMap.put(mat.name(), v);
+                    } catch (Exception ignored) {}
+                }
+            }
+
+            // ENTITY statistics
+            for (Statistic stat : entityStats) {
+                Map<String, Integer> entityStatMap = statistics.computeIfAbsent("ENTITY_" + stat.name(), k -> new HashMap<>());
+                for (org.bukkit.entity.EntityType ent : aliveEntities) {
+                    try {
+                        int v = player.getStatistic(stat, ent);
+                        if (v != 0) entityStatMap.put(ent.name(), v);
+                    } catch (Exception ignored) {}
+                }
+            }
+
             data.setStatistics(statistics);
         } catch (Exception e) {
             if (config.isDebug()) {
@@ -1250,24 +1317,33 @@ public class SyncManager {
      *   <li>Comma-separated cause list, e.g. {@code "death,disconnect,shutdown,world_save"}
      *       — snapshot only when the save cause matches one of the listed values.</li>
      * </ul>
+     *
+     * <p>The trigger string is parsed into a {@link Set} once at
+     * {@link #initialize()}/{@link #reload()} time, so this method is O(1).
      */
     private boolean shouldCreateSnapshot(String saveCause) {
+        java.util.Set<String> triggers = snapshotTriggerSet;
+        if (triggers.isEmpty()) return false;
+        if (triggers.contains("always")) return true;
+        return saveCause != null && triggers.contains(saveCause.toLowerCase());
+    }
+
+    /**
+     * Parse the {@code snapshot.save-trigger} config value into a pre-computed
+     * Set for O(1) lookup. Called from {@link #initialize()} and {@link #reload()}.
+     */
+    private void parseSnapshotTriggerSet() {
         String trigger = config.getSnapshotSaveTrigger();
         if (trigger == null || trigger.isBlank() || "never".equalsIgnoreCase(trigger)) {
-            return false;
-        }
-        if ("always".equalsIgnoreCase(trigger)) {
-            return true;
-        }
-        // Cause list: "death,disconnect,shutdown"
-        if (saveCause == null) return false;
-        String[] causes = trigger.split(",");
-        for (String c : causes) {
-            if (saveCause.equalsIgnoreCase(c.trim())) {
-                return true;
+            snapshotTriggerSet = java.util.Set.of();
+        } else {
+            java.util.Set<String> set = new java.util.HashSet<>();
+            for (String c : trigger.split(",")) {
+                String trimmed = c.trim().toLowerCase();
+                if (!trimmed.isEmpty()) set.add(trimmed);
             }
+            snapshotTriggerSet = java.util.Collections.unmodifiableSet(set);
         }
-        return false;
     }
 
     /**
@@ -1316,18 +1392,21 @@ public class SyncManager {
 
     /**
      * Wait for all pending async saves to complete (for graceful shutdown).
+     *
+     * <p>Replaces the previous busy-loop ({@code Thread.sleep(100)} polling
+     * {@code pendingSaveCount}) with a graceful executor shutdown +
+     * {@code awaitTermination}. This avoids CPU spin and provides cleaner
+     * semantics. Safe to call only from the shutdown path — after this returns,
+     * the async executor is no longer usable.
      */
     public void waitForPendingSaves(long timeoutMillis) {
-        long deadline = System.currentTimeMillis() + timeoutMillis;
-        while (pendingSaveCount.get() > 0 && System.currentTimeMillis() < deadline) {
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
+        if (asyncExecutor == null) return;
         int remaining = pendingSaveCount.get();
+        if (remaining == 0) return;
+        // Gracefully stop accepting new tasks and wait for in-flight saves to drain.
+        asyncExecutor.shutdown((int) Math.max(1, timeoutMillis / 1000));
+        asyncExecutor = null;
+        remaining = pendingSaveCount.get();
         if (remaining > 0) {
             logger.warning(remaining + " pending save(s) did not complete within " + timeoutMillis + "ms timeout.");
         }

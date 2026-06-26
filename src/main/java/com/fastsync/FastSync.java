@@ -181,6 +181,10 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         switch (args[0].toLowerCase()) {
             case "reload" -> {
                 configManager.reload();
+                // Refresh SyncManager caches that depend on config (e.g. snapshot trigger set)
+                if (syncManager != null) {
+                    syncManager.refreshConfigCache();
+                }
                 sender.sendMessage(ChatColor.GREEN + "[FastSync] Configuration reloaded.");
                 sender.sendMessage(ChatColor.GRAY + "Server: " + configManager.getServerName());
                 sender.sendMessage(ChatColor.GRAY + "Compression: " +
