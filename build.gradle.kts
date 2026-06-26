@@ -40,11 +40,11 @@ dependencies {
     // Velocity proxy API
     compileOnly("com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
     compileOnly("org.slf4j:slf4j-api:2.0.13")
-    compileOnly("io.netty:netty-bom:4.1.115.Final")
-    compileOnly("io.netty:netty-transport:4.1.115.Final")
-    compileOnly("io.netty:netty-buffer:4.1.115.Final")
-    compileOnly("io.netty:netty-codec:4.1.115.Final")
-    compileOnly("io.netty:netty-resolver:4.1.115.Final")
+    compileOnly("io.netty:netty-bom:4.2.15.Final")
+    compileOnly("io.netty:netty-transport:4.2.15.Final")
+    compileOnly("io.netty:netty-buffer:4.2.15.Final")
+    compileOnly("io.netty:netty-codec:4.2.15.Final")
+    compileOnly("io.netty:netty-resolver:4.2.15.Final")
 
     // Maven Central runtime deps: compileOnly because Paper will download them
     // via plugin.yml `libraries:` at startup.
@@ -152,11 +152,11 @@ val velocityOnly by configurations.creating
 dependencies {
     add("velocityOnly", "com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
     add("velocityOnly", "org.slf4j:slf4j-api:2.0.13")
-    add("velocityOnly", "io.netty:netty-bom:4.1.115.Final")
-    add("velocityOnly", "io.netty:netty-transport:4.1.115.Final")
-    add("velocityOnly", "io.netty:netty-buffer:4.1.115.Final")
-    add("velocityOnly", "io.netty:netty-codec:4.1.115.Final")
-    add("velocityOnly", "io.netty:netty-resolver:4.1.115.Final")
+    add("velocityOnly", "io.netty:netty-bom:4.2.15.Final")
+    add("velocityOnly", "io.netty:netty-transport:4.2.15.Final")
+    add("velocityOnly", "io.netty:netty-buffer:4.2.15.Final")
+    add("velocityOnly", "io.netty:netty-codec:4.2.15.Final")
+    add("velocityOnly", "io.netty:netty-resolver:4.2.15.Final")
     // SnakeYAML for proxy-config.yml parsing (Velocity bundles it at runtime)
     add("velocityOnly", "org.yaml:snakeyaml:2.2")
 }
