@@ -37,7 +37,7 @@ dependencies {
     compileOnly("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
 
     // Velocity proxy API
-    compileOnly("com.velocitypowered:velocity-api:4.0.0-SNAPSHOT")
+    compileOnly("com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
     compileOnly("org.slf4j:slf4j-api:2.0.18")
     compileOnly("io.netty:netty-bom:4.2.15.Final")
     compileOnly("io.netty:netty-transport:4.2.15.Final")
@@ -155,7 +155,7 @@ tasks.named<Copy>("processVelocityResources") {
 
 val velocityOnly by configurations.creating
 dependencies {
-    add("velocityOnly", "com.velocitypowered:velocity-api:4.0.0-SNAPSHOT")
+    add("velocityOnly", "com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
     add("velocityOnly", "org.slf4j:slf4j-api:2.0.18")
     add("velocityOnly", "io.netty:netty-bom:4.2.15.Final")
     add("velocityOnly", "io.netty:netty-transport:4.2.15.Final")
