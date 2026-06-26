@@ -157,6 +157,8 @@ dependencies {
     add("velocityOnly", "io.netty:netty-buffer:4.1.115.Final")
     add("velocityOnly", "io.netty:netty-codec:4.1.115.Final")
     add("velocityOnly", "io.netty:netty-resolver:4.1.115.Final")
+    // SnakeYAML for proxy-config.yml parsing (Velocity bundles it at runtime)
+    add("velocityOnly", "org.yaml:snakeyaml:2.2")
 }
 sourceSets["velocity"].compileClasspath += velocityOnly
 

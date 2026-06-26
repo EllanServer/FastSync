@@ -79,6 +79,15 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         syncManager = new SyncManager(this, configManager, databaseManager);
         syncManager.initialize();
 
+        // Register plugin messaging channel for proxy handoff communication
+        Bukkit.getMessenger().registerIncomingPluginChannel(
+            this, com.fastsync.messaging.HandoffMessageListener.CHANNEL,
+            new com.fastsync.messaging.HandoffMessageListener(
+                this, configManager, databaseManager, syncManager));
+        Bukkit.getMessenger().registerOutgoingPluginChannel(
+            this, com.fastsync.messaging.HandoffMessageListener.CHANNEL);
+        getLogger().info("Registered fastsync:handoff plugin messaging channel");
+
         // Register listeners
         getServer().getPluginManager().registerEvents(
             new PlayerListener(this, syncManager), this);

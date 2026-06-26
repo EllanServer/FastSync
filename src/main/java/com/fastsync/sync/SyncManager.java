@@ -96,6 +96,7 @@ public class SyncManager {
 
     // Track pending async saves for graceful shutdown
     private final AtomicInteger pendingSaveCount = new AtomicInteger(0);
+    private final AtomicInteger pendingLoadCount = new AtomicInteger(0);
 
     public SyncManager(FastSync plugin, ConfigManager config, DatabaseManager databaseManager) {
         this.plugin = plugin;
@@ -184,6 +185,15 @@ public class SyncManager {
      * @return LoadResult indicating success, locked, or error
      */
     public LoadResult loadPlayerData(UUID uuid) {
+        pendingLoadCount.incrementAndGet();
+        try {
+            return loadPlayerDataInternal(uuid);
+        } finally {
+            pendingLoadCount.decrementAndGet();
+        }
+    }
+
+    private LoadResult loadPlayerDataInternal(UUID uuid) {
         // Step 1: Try to acquire lock (returns fencing token on success)
         boolean locked = false;
         long fencingToken = 0;
@@ -1104,6 +1114,14 @@ public class SyncManager {
 
     public int getPendingSaveCount() {
         return pendingSaveCount.get();
+    }
+
+    public int getPendingLoadCount() {
+        return pendingLoadCount.get();
+    }
+
+    public boolean isRedisHealthy() {
+        return redisManager != null && redisManager.isHealthy();
     }
 
     public boolean isRedisEnabled() {
