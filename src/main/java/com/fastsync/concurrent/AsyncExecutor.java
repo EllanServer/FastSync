@@ -66,6 +66,15 @@ public class AsyncExecutor {
     }
 
     /**
+     * Returns the underlying ExecutorService for use by components that need
+     * to pass an Executor to CompletableFuture.supplyAsync() etc.
+     * This avoids falling back to ForkJoinPool.commonPool().
+     */
+    public ExecutorService getExecutor() {
+        return executor;
+    }
+
+    /**
      * Submit a task and return a CompletableFuture.
      */
     public java.util.concurrent.CompletableFuture<Void> submit(Runnable task) {

@@ -1313,6 +1313,7 @@ public class SyncManager {
             UUID uuid = player.getUniqueId();
 
             // Collect on the entity's region thread (Folia-safe), then save async.
+            // future completes ONLY after the DB save finishes (or fails).
             CompletableFuture<Void> future = new CompletableFuture<>();
             SchedulerUtil.runAtEntity(plugin, player, () -> {
                 try {
@@ -1338,22 +1339,27 @@ public class SyncManager {
                                 advanceVersion(uuid, expectedVersion);
                             }
                             notifyLockReleased(uuid);
+                            future.complete(null);
                         } catch (Exception e) {
                             logger.log(Level.SEVERE, "Failed to save data for " + uuid + " during bulk save", e);
+                            future.completeExceptionally(e);
                         } finally {
                             pendingSaveCount.decrementAndGet();
                         }
                     });
                 } catch (Exception e) {
                     logger.log(Level.SEVERE, "Failed to collect data for " + uuid + " during bulk save", e);
-                } finally {
-                    future.complete(null);
+                    future.completeExceptionally(e);
                 }
-            }, null);
+            }, () -> {
+                // retired callback: entity no longer valid (player logged out, etc.)
+                // Complete the future so saveAllOnlinePlayers() doesn't hang.
+                future.complete(null);
+            });
             futures.add(future);
         }
 
-        // Wait for all collection + save tasks to complete.
+        // Wait for all DB saves to actually complete (not just collection).
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         logger.info("Saved data for all online players.");
     }
