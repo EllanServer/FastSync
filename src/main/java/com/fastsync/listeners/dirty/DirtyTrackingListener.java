@@ -2,6 +2,7 @@ package com.fastsync.listeners.dirty;
 
 import com.fastsync.sync.dirty.ComponentDirtyMask;
 import com.fastsync.sync.dirty.ComponentDirtyMask.Component;
+import org.bukkit.entity.HumanEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -11,6 +12,7 @@ import org.bukkit.event.entity.EntityPotionEffectEvent;
 import org.bukkit.event.entity.FoodLevelChangeEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerExpChangeEvent;
@@ -20,6 +22,7 @@ import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.event.player.PlayerPickupItemEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.inventory.InventoryHolder;
 
 import java.util.UUID;
 
@@ -62,6 +65,13 @@ public class DirtyTrackingListener implements Listener {
         if (event.isCancelled()) return;
         if (event.getWhoClicked() instanceof Player p) {
             markDirty(p, Component.INVENTORY);
+            // Ender chest detection: if the clicked inventory is an ender chest,
+            // mark ENDER_CHEST dirty separately. The inventory holder check
+            // distinguishes ender chest from regular inventory/crafting.
+            var inv = event.getClickedInventory();
+            if (inv != null && inv.getHolder() instanceof org.bukkit.block.EnderChest) {
+                markDirty(p, Component.ENDER_CHEST);
+            }
         }
     }
 
@@ -70,6 +80,26 @@ public class DirtyTrackingListener implements Listener {
         if (event.isCancelled()) return;
         if (event.getWhoClicked() instanceof Player p) {
             markDirty(p, Component.INVENTORY);
+            // Check if any of the dragged slots are in an ender chest inventory
+            var inv = event.getInventory();
+            if (inv != null && inv.getHolder() instanceof org.bukkit.block.EnderChest) {
+                markDirty(p, Component.ENDER_CHEST);
+            }
+        }
+    }
+
+    /**
+     * When a player closes an inventory, check if it was an ender chest.
+     * This catches ender chest modifications that don't fire click/drag
+     * events (e.g. shift-click moves that complete on close).
+     */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onInventoryClose(InventoryCloseEvent event) {
+        if (event.getPlayer() instanceof Player p) {
+            var inv = event.getInventory();
+            if (inv != null && inv.getHolder() instanceof org.bukkit.block.EnderChest) {
+                markDirty(p, Component.ENDER_CHEST);
+            }
         }
     }
 

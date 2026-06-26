@@ -1831,6 +1831,18 @@ public class SyncManager {
                 // Force full collect + dirty-mark everything to ensure checksum
                 // comparison happens in persistCollectedData.
                 dirtyMask.markAllDirty(uuid);
+            } else if (config.isComponentStorageEnabled()) {
+                // Conservative dirty strategy for components without event coverage.
+                // DirtyTrackingListener does NOT cover: PDC changes (no events),
+                // Statistics changes (no granular events), Attribute changes (rare).
+                // When component-storage is enabled, these components would only
+                // be written during validation saves (every Nth cycle). To avoid
+                // losing changes between validations, conservatively mark them
+                // dirty on every periodic save when component-storage is on.
+                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
+                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
+                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
+                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
             }
         }
 
