@@ -49,6 +49,31 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     private Object periodicSaveTask;
     private Object heartbeatTask;
 
+    /**
+     * Start (or restart) the heartbeat task. Called from onEnable and from
+     * the reload command when heartbeat-interval-seconds changes.
+     *
+     * <p>Without this, /fastsync reload would change the config value but
+     * the old timer would keep running at the old interval — a subtle
+     * production trap that could cause lock expiry if the new interval is
+     * shorter than expected.
+     */
+    private void restartHeartbeatTask() {
+        // Cancel old task if running
+        if (heartbeatTask != null) {
+            SchedulerUtil.cancel(heartbeatTask);
+            heartbeatTask = null;
+        }
+        // Start new task with current config
+        long heartbeatTicks = configManager.getHeartbeatIntervalSeconds() * 20L;
+        heartbeatTask = SchedulerUtil.runAsyncTimer(this, () -> {
+            syncManager.heartbeatOnlinePlayers();
+        }, heartbeatTicks, heartbeatTicks);
+        getLogger().info("Lock heartbeat " + (heartbeatTask != null ? "restarted" : "started")
+            + ": every " + configManager.getHeartbeatIntervalSeconds() + " seconds"
+            + " (lock-timeout=" + configManager.getLockTimeout() + "s).");
+    }
+
     @Override
     public void onEnable() {
         // Check ItemStack serialization compatibility (graceful, not hard fail)
@@ -111,13 +136,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         // Start heartbeat task — refreshes locked_at for all online players.
         // This is the PRIMARY mechanism for keeping online locks alive.
         // Runs on async thread (DB I/O only, no Bukkit API calls).
-        long heartbeatTicks = configManager.getHeartbeatIntervalSeconds() * 20L;
-        heartbeatTask = SchedulerUtil.runAsyncTimer(this, () -> {
-            syncManager.heartbeatOnlinePlayers();
-        }, heartbeatTicks, heartbeatTicks);
-        getLogger().info("Lock heartbeat enabled: every " +
-            configManager.getHeartbeatIntervalSeconds() + " seconds (lock-timeout=" +
-            configManager.getLockTimeout() + "s).");
+        restartHeartbeatTask();
 
         // Start periodic save task (if enabled)
         if (configManager.isPeriodicSave()) {
@@ -200,12 +219,16 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 if (syncManager != null) {
                     syncManager.refreshConfigCache();
                 }
+                // Restart heartbeat task — interval may have changed
+                restartHeartbeatTask();
                 sender.sendMessage(ChatColor.GREEN + "[FastSync] Configuration reloaded.");
                 sender.sendMessage(ChatColor.GRAY + "Server: " + configManager.getServerName());
                 sender.sendMessage(ChatColor.GRAY + "Compression: " +
                     (configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
                 sender.sendMessage(ChatColor.GRAY + "Redis: " +
                     (configManager.isRedisEnabled() ? "Enabled" : "Disabled"));
+                sender.sendMessage(ChatColor.GRAY + "Heartbeat: every " +
+                    configManager.getHeartbeatIntervalSeconds() + "s (timer restarted)");
             }
             case "status" -> sendStatus(sender);
             case "debug" -> {
@@ -343,6 +366,10 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sender.sendMessage(ChatColor.YELLOW + "Active players: " + ChatColor.WHITE + syncManager.getActiveCount());
         sender.sendMessage(ChatColor.YELLOW + "Pending loads: " + ChatColor.WHITE + syncManager.getPendingCount());
         sender.sendMessage(ChatColor.YELLOW + "Pending saves: " + ChatColor.WHITE + syncManager.getPendingSaveCount());
+        sender.sendMessage(ChatColor.YELLOW + "Quarantined: " + ChatColor.WHITE + syncManager.getQuarantinedPlayerCount());
+        sender.sendMessage(ChatColor.YELLOW + "Heartbeat: " + ChatColor.WHITE +
+            "every " + configManager.getHeartbeatIntervalSeconds() + "s" +
+            " (lock-timeout=" + configManager.getLockTimeout() + "s)");
         sender.sendMessage(ChatColor.YELLOW + "Async threads: " + ChatColor.WHITE +
             "active=" + syncManager.getAsyncActiveCount() +
             ", queue=" + syncManager.getAsyncQueueSize());

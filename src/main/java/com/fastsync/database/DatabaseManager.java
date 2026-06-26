@@ -522,6 +522,55 @@ public class DatabaseManager {
     }
 
     /**
+     * Batch refresh of lock timestamps for multiple players (heartbeat).
+     *
+     * <p>Uses a single JDBC connection and a single PreparedStatement with
+     * {@code addBatch()} to refresh all players' {@code locked_at} in one
+     * round-trip. Players whose refresh affects 0 rows (lock no longer ours)
+     * are added to the {@code failedPlayers} set.
+     *
+     * <p>This is significantly more efficient than calling {@link #refreshLock}
+     * per player when there are many online players, as it amortizes connection
+     * acquisition and network round-trips.
+     *
+     * @param playersToRefresh map of UUID -> fencing token for each player
+     * @param serverName       server that holds the locks
+     * @param failedPlayers    output set — UUIDs whose refresh failed (0 rows updated)
+     */
+    public void refreshLockBatch(java.util.Map<UUID, Long> playersToRefresh,
+                                  String serverName,
+                                  java.util.Set<UUID> failedPlayers) throws SQLException {
+        if (playersToRefresh.isEmpty()) return;
+        long now = System.currentTimeMillis();
+
+        // Use raw JDBC for batch — jOOQ's batch API is more verbose for this use case
+        String sql = "UPDATE " + tablePrefix + "player_data"
+            + " SET locked_at = ?"
+            + " WHERE uuid = ? AND locked_by = ? AND fencing_token = ?";
+
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            for (java.util.Map.Entry<UUID, Long> entry : playersToRefresh.entrySet()) {
+                ps.setLong(1, now);
+                ps.setString(2, entry.getKey().toString());
+                ps.setString(3, serverName);
+                ps.setLong(4, entry.getValue());
+                ps.addBatch();
+            }
+
+            int[] results = ps.executeBatch();
+            int i = 0;
+            for (UUID uuid : playersToRefresh.keySet()) {
+                if (i < results.length && results[i] == 0) {
+                    failedPlayers.add(uuid);
+                }
+                i++;
+            }
+        }
+    }
+
+    /**
      * Get the server that currently holds the lock for a player.
      * Returns null if not locked.
      */

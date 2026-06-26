@@ -4,8 +4,10 @@ import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -131,6 +133,33 @@ public final class SchedulerUtil {
         } else {
             Bukkit.getScheduler().runTaskLater(plugin, task, delayTicks);
         }
+    }
+
+    /**
+     * Run a task on the region that owns the player with the given UUID.
+     * If the player is offline, the retired callback is invoked.
+     *
+     * @param plugin  the plugin
+     * @param uuid    the player UUID
+     * @param task    receives the Player if online
+     * @param retired fallback if the player is not online
+     */
+    public static void runForPlayer(Plugin plugin, UUID uuid, Consumer<Player> task, Runnable retired) {
+        Player player = Bukkit.getPlayer(uuid);
+        if (player == null) {
+            if (retired != null) retired.run();
+            return;
+        }
+        runAtEntity(plugin, player, () -> {
+            // Re-check online status inside the task — player may have logged out
+            // between the Bukkit.getPlayer() call and the task execution.
+            Player p = Bukkit.getPlayer(uuid);
+            if (p != null && p.isOnline()) {
+                task.accept(p);
+            } else if (retired != null) {
+                retired.run();
+            }
+        }, retired);
     }
 
     // ==================== Region Tasks (TimeUnit = ticks) ====================

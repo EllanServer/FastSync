@@ -440,4 +440,137 @@ class DatabaseManagerTest {
         assertEquals("server-b", databaseManager.getLockHolder(uuid),
             "Quit save conflict should not release another server's lock");
     }
+
+    // ==================== Final-Save Version Race Tests ====================
+
+    /**
+     * Simulates the final-save version race:
+     * 1. Player has version 0, fencing token 1 (server-a).
+     * 2. Periodic save (keep-lock) advances version to 1.
+     * 3. Quit save (release-lock) tries with the OLD version 0 — must fail (CAS).
+     *
+     * This proves the race condition exists at the DB level and that the
+     * SyncManager's refreshVersionAndFencingToken() fix is necessary.
+     */
+    @Test
+    void testQuitSaveWithStaleVersion_failsAfterKeepLockSaveAdvancesVersion() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        byte[] data1 = new byte[]{1, 2, 3};
+        long checksum1 = DatabaseManager.computeChecksum(data1);
+
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(lock.acquired());
+
+        // Periodic save (keep-lock) — advances version 0 -> 1
+        assertTrue(databaseManager.saveDataKeepLock(uuid, data1, checksum1, 0,
+            lock.fencingToken(), "server-a"));
+        assertEquals(1, databaseManager.loadData(uuid).version(),
+            "Version should be 1 after keep-lock save");
+
+        // Quit save (release-lock) with STALE version 0 — must fail
+        byte[] finalData = new byte[]{4, 5, 6};
+        long finalChecksum = DatabaseManager.computeChecksum(finalData);
+        boolean saved = databaseManager.saveDataAndReleaseLock(uuid, finalData, finalChecksum,
+            0, lock.fencingToken(), "server-a");
+        assertFalse(saved, "Quit save with stale version must fail CAS — this is the race condition");
+
+        // Lock should still be held (release-lock save failed)
+        assertEquals("server-a", databaseManager.getLockHolder(uuid),
+            "Lock should still be held after failed release-lock save");
+    }
+
+    /**
+     * Verifies the fix for the final-save version race:
+     * After a keep-lock save advances the version, a release-lock save
+     * with the UPDATED version succeeds.
+     *
+     * This proves the SyncManager's same-fencing retry would work:
+     * refresh version from playerVersions map, retry with actual version.
+     */
+    @Test
+    void testQuitSaveWithUpdatedVersion_succeedsAfterKeepLockSave() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        byte[] data1 = new byte[]{1, 2, 3};
+        long checksum1 = DatabaseManager.computeChecksum(data1);
+
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(lock.acquired());
+
+        // Periodic save (keep-lock) — advances version 0 -> 1
+        assertTrue(databaseManager.saveDataKeepLock(uuid, data1, checksum1, 0,
+            lock.fencingToken(), "server-a"));
+        long currentVersion = databaseManager.loadData(uuid).version();
+        assertEquals(1, currentVersion, "Version should be 1 after keep-lock save");
+
+        // Quit save (release-lock) with UPDATED version 1 — must succeed
+        byte[] finalData = new byte[]{4, 5, 6};
+        long finalChecksum = DatabaseManager.computeChecksum(finalData);
+        boolean saved = databaseManager.saveDataAndReleaseLock(uuid, finalData, finalChecksum,
+            currentVersion, lock.fencingToken(), "server-a");
+        assertTrue(saved, "Quit save with updated version must succeed — same fencing token, correct version");
+
+        // Lock should be released
+        assertNull(databaseManager.getLockHolder(uuid),
+            "Lock should be released after successful release-lock save");
+
+        // Verify final data was saved
+        assertArrayEquals(finalData, databaseManager.loadData(uuid).data(),
+            "DB should contain the final (quit) save data");
+    }
+
+    // ==================== Batch Heartbeat (refreshLockBatch) Tests ====================
+
+    @Test
+    void testRefreshLockBatch_refreshesMultiplePlayers() throws SQLException {
+        UUID uuidA = UUID.randomUUID();
+        UUID uuidB = UUID.randomUUID();
+        UUID uuidC = UUID.randomUUID();
+
+        LockResult lockA = databaseManager.acquireLock(uuidA, "server-a");
+        LockResult lockB = databaseManager.acquireLock(uuidB, "server-a");
+        LockResult lockC = databaseManager.acquireLock(uuidC, "server-a");
+        assertTrue(lockA.acquired() && lockB.acquired() && lockC.acquired());
+
+        java.util.Map<UUID, Long> players = new java.util.HashMap<>();
+        players.put(uuidA, lockA.fencingToken());
+        players.put(uuidB, lockB.fencingToken());
+        players.put(uuidC, lockC.fencingToken());
+
+        java.util.Set<UUID> failed = new java.util.HashSet<>();
+        databaseManager.refreshLockBatch(players, "server-a", failed);
+
+        assertTrue(failed.isEmpty(), "All refreshes should succeed — no failed players");
+
+        // All locks should still be held by server-a (not taken over)
+        assertEquals("server-a", databaseManager.getLockHolder(uuidA));
+        assertEquals("server-a", databaseManager.getLockHolder(uuidB));
+        assertEquals("server-a", databaseManager.getLockHolder(uuidC));
+    }
+
+    @Test
+    void testRefreshLockBatch_reportsFailedPlayers() throws SQLException {
+        UUID uuidA = UUID.randomUUID();
+        UUID uuidB = UUID.randomUUID();
+
+        LockResult lockA = databaseManager.acquireLock(uuidA, "server-a");
+        LockResult lockB = databaseManager.acquireLock(uuidB, "server-a");
+        assertTrue(lockA.acquired() && lockB.acquired());
+
+        // Server B takes over uuidB's lock
+        databaseManager.releaseLock(uuidB, "server-a");
+        LockResult lockB2 = databaseManager.acquireLock(uuidB, "server-b");
+        assertTrue(lockB2.acquired());
+
+        // Batch refresh: uuidA should succeed, uuidB should fail
+        java.util.Map<UUID, Long> players = new java.util.HashMap<>();
+        players.put(uuidA, lockA.fencingToken());
+        players.put(uuidB, lockB.fencingToken()); // stale token — lock now held by server-b
+
+        java.util.Set<UUID> failed = new java.util.HashSet<>();
+        databaseManager.refreshLockBatch(players, "server-a", failed);
+
+        assertEquals(1, failed.size(), "Exactly one player should fail refresh");
+        assertTrue(failed.contains(uuidB), "uuidB should be in failed set (lock taken by server-b)");
+        assertFalse(failed.contains(uuidA), "uuidA should NOT be in failed set (still ours)");
+    }
 }

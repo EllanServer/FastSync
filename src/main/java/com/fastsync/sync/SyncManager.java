@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -100,6 +101,16 @@ public class SyncManager {
     // This prevents unnecessary version conflicts when periodic + quit saves
     // race for the same player.
     private final ConcurrentHashMap<UUID, java.util.concurrent.locks.ReentrantLock> playerSaveLocks = new ConcurrentHashMap<>();
+
+    // Players whose locks were lost (heartbeat refreshLock=false). These players
+    // are being kicked and must NOT be saved via the normal QUIT path — their
+    // fencing token is no longer valid. The quit handler checks this set and
+    // skips the save, only releasing the lock if it somehow still belongs to us.
+    private final java.util.Set<UUID> quarantinedPlayers = ConcurrentHashMap.newKeySet();
+
+    // Anti-reentry guard for heartbeat — prevents overlapping heartbeat cycles
+    // when DB latency causes the previous cycle to exceed the interval.
+    private final AtomicBoolean heartbeatRunning = new AtomicBoolean(false);
 
     // Track pending async saves for graceful shutdown
     private final AtomicInteger pendingSaveCount = new AtomicInteger(0);
@@ -656,6 +667,43 @@ public class SyncManager {
      * Collection happens on the main thread; serialization and DB save happen async.
      * After save, notifies Redis so waiting servers can acquire the lock immediately.
      */
+    /**
+     * Refresh the version and fencing token in a PlayerData object from the
+     * current in-memory maps. This MUST be called after acquiring the per-UUID
+     * saveLock but before calling {@link #persistCollectedData}, to ensure the
+     * final save uses the latest version (which may have been advanced by an
+     * in-flight periodic/death/world_save save that completed while we waited
+     * for the lock).
+     *
+     * <p>Without this refresh, a QUIT save that was collected with version N
+     * but waited behind a periodic save that advanced the DB to version N+1
+     * would fail the CAS and release the lock without saving — losing the
+     * player's final state.
+     */
+    private void refreshVersionAndFencingToken(UUID uuid, PlayerData data) {
+        Long latestVersion = playerVersions.get(uuid);
+        if (latestVersion != null) {
+            data.setVersion(latestVersion);
+        }
+        Long latestFencing = playerFencingTokens.get(uuid);
+        if (latestFencing != null) {
+            data.setFencingToken(latestFencing);
+        }
+    }
+
+    /**
+     * Collect and save player data on quit (async path).
+     *
+     * <p>Collection happens on the main/region thread (PlayerQuitEvent), then
+     * the save is dispatched to the async executor. The per-UUID saveLock
+     * ensures this save runs AFTER any in-flight periodic/death/world_save save.
+     *
+     * <p><b>Critical:</b> After acquiring the saveLock, {@link #refreshVersionAndFencingToken}
+     * is called to pick up the latest version/fencing token from any save that
+     * completed while we waited for the lock. This prevents the final-save
+     * version race where the QUIT save uses a stale version, fails the CAS,
+     * and releases the lock without saving the player's final state.
+     */
     public void collectAndSavePlayerData(Player player) {
         UUID uuid = player.getUniqueId();
 
@@ -708,6 +756,24 @@ public class SyncManager {
         // because the per-UUID lock check in periodic save still references them.
         activePlayers.remove(uuid);
 
+        // Check quarantine — if heartbeat detected lock loss, skip normal save.
+        if (quarantinedPlayers.remove(uuid)) {
+            logger.warning("[Quit] Player " + uuid + " was quarantined (lock lost during session)."
+                + " Skipping final save — data may be stale. Player should have been kicked.");
+            pendingSaveCount.incrementAndGet();
+            try {
+                databaseManager.releaseLock(uuid, config.getServerName());
+                notifyLockReleased(uuid);
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
+            } finally {
+                playerVersions.remove(uuid);
+                playerFencingTokens.remove(uuid);
+                pendingSaveCount.decrementAndGet();
+            }
+            return;
+        }
+
         // Save asynchronously using dedicated thread pool.
         // Per-UUID lock ensures this save runs AFTER any in-flight periodic save,
         // preventing version conflicts from concurrent saves for the same player.
@@ -718,6 +784,13 @@ public class SyncManager {
             asyncExecutor.execute(() -> {
                 saveLock.lock(); // must wait — quit save must persist final state
                 try {
+                    // CRITICAL: refresh version/fencingToken after acquiring the lock.
+                    // A periodic/death/world_save save may have completed while we
+                    // waited, advancing the DB version. Without this refresh, the
+                    // QUIT save would use the stale version collected before the
+                    // lock was acquired, fail the CAS, and release the lock
+                    // without saving — losing the player's final state.
+                    refreshVersionAndFencingToken(uuid, data);
                     persistCollectedData(uuid, data, SaveKind.QUIT);
                 } finally {
                     saveLock.unlock();
@@ -737,6 +810,7 @@ public class SyncManager {
                 + " — running synchronously as fallback", e);
             saveLock.lock();
             try {
+                refreshVersionAndFencingToken(uuid, data);
                 persistCollectedData(uuid, data, SaveKind.QUIT);
             } finally {
                 saveLock.unlock();
@@ -811,11 +885,28 @@ public class SyncManager {
 
         activePlayers.remove(uuid);
 
+        // Check quarantine — skip save if lock was lost
+        if (quarantinedPlayers.remove(uuid)) {
+            logger.warning("[Quit-Sync] Player " + uuid + " was quarantined. Skipping save.");
+            try {
+                databaseManager.releaseLock(uuid, config.getServerName());
+                notifyLockReleased(uuid);
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
+            }
+            playerVersions.remove(uuid);
+            playerFencingTokens.remove(uuid);
+            return;
+        }
+
         // Save synchronously with per-UUID lock to avoid races with any in-flight save
         java.util.concurrent.locks.ReentrantLock saveLock =
             playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
         saveLock.lock();
         try {
+            // Refresh version/fencingToken after acquiring lock — same rationale
+            // as the async QUIT path: an in-flight save may have advanced the version.
+            refreshVersionAndFencingToken(uuid, data);
             persistCollectedData(uuid, data, SaveKind.QUIT);
         } finally {
             saveLock.unlock();
@@ -1279,6 +1370,10 @@ public class SyncManager {
                             try {
                                 saveLock.lock();
                                 try {
+                                    // Refresh version/fencingToken after acquiring lock —
+                                    // an in-flight save may have advanced the version
+                                    // while we waited for the lock.
+                                    refreshVersionAndFencingToken(uuid, data);
                                     result = persistCollectedData(uuid, data, kind);
                                 } finally {
                                     saveLock.unlock();
@@ -1445,32 +1540,102 @@ public class SyncManager {
      * locked_at as a side effect, but relying solely on saves is unsafe when
      * periodic-save is disabled (default) or the interval exceeds lock-timeout.
      *
+     * <p><b>Anti-reentry:</b> Uses {@link AtomicBoolean} to prevent overlapping
+     * heartbeat cycles. If the previous cycle is still running (DB latency),
+     * the current tick is skipped with a warning.
+     *
+     * <p><b>Batch refresh:</b> Uses a single JDBC batch UPDATE to refresh all
+     * players' locked_at in one connection, reducing DB pressure from O(N)
+     * connections to O(1) per heartbeat cycle. Players whose refresh fails
+     * (lock no longer ours) are quarantined and kicked.
+     *
      * <p>If refreshLock returns false for a player, it means our lock was
      * already taken over by another server (stale expiry or infringement).
-     * This is a SEVERE condition — the player's data may be inconsistent.
-     * We log it at SEVERE and remove the player from active tracking to
-     * prevent further saves that would conflict.
+     * This is a SEVERE condition — the player is quarantined and kicked to
+     * prevent data corruption from continued play with an invalid lock.
      */
     public void heartbeatOnlinePlayers() {
-        String serverName = config.getServerName();
-        for (UUID uuid : activePlayers.keySet()) {
-            Long fencingToken = playerFencingTokens.get(uuid);
-            if (fencingToken == null) continue;
-            try {
-                boolean refreshed = databaseManager.refreshLock(uuid, serverName, fencingToken);
-                if (!refreshed) {
-                    // Lock no longer ours — possible infringement or stale expiry
-                    logger.log(Level.SEVERE, "[Heartbeat] Lock refresh failed for " + uuid
-                        + " (ft=" + fencingToken + ") — lock may have been taken by another server!"
-                        + " Removing player from active tracking to prevent data corruption.");
-                    activePlayers.remove(uuid);
-                    playerVersions.remove(uuid);
-                    playerFencingTokens.remove(uuid);
-                }
-            } catch (SQLException e) {
-                logger.log(Level.WARNING, "[Heartbeat] Failed to refresh lock for " + uuid, e);
-            }
+        if (!heartbeatRunning.compareAndSet(false, true)) {
+            logger.warning("[Heartbeat] Previous heartbeat cycle still running; skipping this tick.");
+            return;
         }
+        try {
+            String serverName = config.getServerName();
+            if (activePlayers.isEmpty()) {
+                return;
+            }
+
+            // Build a snapshot of (uuid -> fencingToken) for batch refresh
+            java.util.Map<UUID, Long> playersToRefresh = new java.util.HashMap<>();
+            for (UUID uuid : activePlayers.keySet()) {
+                Long fencingToken = playerFencingTokens.get(uuid);
+                if (fencingToken != null && !quarantinedPlayers.contains(uuid)) {
+                    playersToRefresh.put(uuid, fencingToken);
+                }
+            }
+
+            if (playersToRefresh.isEmpty()) {
+                return;
+            }
+
+            // Batch refresh: single connection, single PreparedStatement
+            java.util.Set<UUID> failedPlayers = new java.util.HashSet<>();
+            try {
+                databaseManager.refreshLockBatch(playersToRefresh, serverName, failedPlayers);
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "[Heartbeat] Batch refresh failed; falling back to per-player", e);
+                // Fallback: per-player refresh
+                for (java.util.Map.Entry<UUID, Long> entry : playersToRefresh.entrySet()) {
+                    try {
+                        if (!databaseManager.refreshLock(entry.getKey(), serverName, entry.getValue())) {
+                            failedPlayers.add(entry.getKey());
+                        }
+                    } catch (SQLException ex) {
+                        logger.log(Level.WARNING, "[Heartbeat] Per-player refresh failed for " + entry.getKey(), ex);
+                    }
+                }
+            }
+
+            // Handle failed players — quarantine and kick
+            for (UUID uuid : failedPlayers) {
+                Long fencingToken = playerFencingTokens.get(uuid);
+                logger.log(Level.SEVERE, "[Heartbeat] Lock refresh failed for " + uuid
+                    + " (ft=" + fencingToken + ") — lock may have been taken by another server!"
+                    + " Quarantining player and scheduling kick.");
+
+                // Mark as quarantined — quit handler will see this and skip normal save
+                quarantinedPlayers.add(uuid);
+
+                // Remove from active players to stop periodic saves
+                activePlayers.remove(uuid);
+
+                // Kick the player — they must reconnect to re-acquire their lock.
+                // Do NOT remove playerVersions/playerFencingTokens — keep them for
+                // diagnostics and so the quit handler can log the fencing token.
+                kickPlayerForLockLoss(uuid);
+            }
+        } finally {
+            heartbeatRunning.set(false);
+        }
+    }
+
+    /**
+     * Kick a player whose lock was lost during heartbeat. Runs on the main
+     * thread (or region thread for Folia) to safely interact with the player
+     * entity.
+     */
+    private void kickPlayerForLockLoss(UUID uuid) {
+        Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
+        SchedulerUtil.runForPlayer(plugin, uuid, player -> {
+            player.kick(net.kyori.adventure.text.Component.text(
+                "[FastSync] Your data lock was lost. Please reconnect to re-sync your data.",
+                net.kyori.adventure.text.format.NamedTextColor.RED));
+        }, () -> {
+            // Player already offline — nothing to kick
+            if (config.isDebug()) {
+                logger.fine("[Heartbeat] Player " + uuid + " already offline; no kick needed.");
+            }
+        });
     }
 
     public void cleanupStaleEntries() {
@@ -1625,6 +1790,10 @@ public class SyncManager {
         long startTime = System.nanoTime();
         // Set save cause for snapshot trigger matching and audit logging
         data.setSaveCause(kind.causeName);
+
+        // Retry flag for same-fencing self-conflict (our own previous save advanced the version).
+        boolean retried = false;
+
         try {
             // 1. Serialize
             byte[] serialized = PlayerDataSerializer.serialize(data);
@@ -1659,43 +1828,84 @@ public class SyncManager {
             if (saveLatency != null) saveLatency.record(saveElapsedMs);
 
             if (!saved) {
-                // 5a. Conflict
+                // 5a. Conflict — check if this is a same-fencing self-conflict
                 long actualVersion = databaseManager.getCurrentVersion(uuid);
                 long actualFencingToken = databaseManager.getCurrentFencingToken(uuid);
-                conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
-                logger.warning("[Fencing] " + kind + " save rejected for " + uuid +
-                    " (expected v" + expectedVersion + "/ft" + fencingToken +
-                    ", actual v" + actualVersion + "/ft" + actualFencingToken + ")");
 
-                logOperation(uuid, OperationType.CONFLICT, fencingToken, expectedVersion,
-                    compressed.length, kind + " conflict: expected v" + expectedVersion + "/ft" + fencingToken +
-                    ", actual v" + actualVersion + "/ft" + actualFencingToken);
+                // Same-fencing retry: if the fencing token matches and the actual
+                // version is higher, our own previous save (periodic/death/etc.)
+                // advanced the version while we waited for the saveLock. This is
+                // NOT an external conflict — retry with the actual version.
+                if (kind.releaseLock && !retried
+                    && actualFencingToken == fencingToken
+                    && actualVersion > expectedVersion) {
 
-                if (saveLatency != null) saveLatency.recordError();
+                    logger.info("[Fencing] " + kind + " save for " + uuid
+                        + " — same-fencing self-conflict (expected v" + expectedVersion
+                        + ", actual v" + actualVersion + ", ft=" + fencingToken
+                        + "). Retrying with actual version.");
 
-                if (kind.releaseLock) {
-                    // Quit save: release lock even on conflict — player is leaving
-                    try {
-                        databaseManager.releaseLock(uuid, config.getServerName());
-                    } catch (SQLException lockEx) {
-                        logger.log(Level.WARNING, "Failed to release lock after " + kind + " conflict for " + uuid, lockEx);
+                    // Update data with the actual version and re-serialize
+                    data.setVersion(actualVersion);
+                    retried = true;
+
+                    // Re-serialize with updated version
+                    serialized = PlayerDataSerializer.serialize(data);
+                    compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
+                    checksum = DatabaseManager.computeChecksum(serialized);
+
+                    // Retry the save with the actual version
+                    if (kind.releaseLock) {
+                        saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                    } else {
+                        saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
                     }
-                    notifyLockReleased(uuid);
-                }
-                // Online save: do NOT release lock — player is still on this server.
-                // The CAS failure means someone else wrote (fencing token violation),
-                // which is a serious bug. Log it at SEVERE and keep the lock.
-                if (!kind.releaseLock) {
-                    logger.log(Level.SEVERE, "[Fencing] Online save conflict for " + uuid
-                        + " — possible lock infringement! The lock should be held by us but CAS failed."
-                        + " expected v" + expectedVersion + "/ft" + fencingToken
-                        + ", actual v" + actualVersion + "/ft" + actualFencingToken);
+
+                    if (saved) {
+                        // Retry succeeded — treat as success with the actual version
+                        expectedVersion = actualVersion;
+                    }
                 }
 
-                return SaveResult.conflict(expectedVersion, actualVersion, compressed.length);
-            } else {
-                // 5b. Success: advance version + log + snapshot + publish
-                advanceVersion(uuid, expectedVersion);
+                if (!saved) {
+                    // Genuine conflict (external fencing violation or retry also failed)
+                    conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
+                    logger.warning("[Fencing] " + kind + " save rejected for " + uuid +
+                        " (expected v" + expectedVersion + "/ft" + fencingToken +
+                        ", actual v" + actualVersion + "/ft" + actualFencingToken + ")"
+                        + (retried ? " [after retry]" : ""));
+
+                    logOperation(uuid, OperationType.CONFLICT, fencingToken, expectedVersion,
+                        compressed.length, kind + " conflict: expected v" + expectedVersion + "/ft" + fencingToken +
+                        ", actual v" + actualVersion + "/ft" + actualFencingToken);
+
+                    if (saveLatency != null) saveLatency.recordError();
+
+                    if (kind.releaseLock) {
+                        // Quit save: release lock even on conflict — player is leaving
+                        try {
+                            databaseManager.releaseLock(uuid, config.getServerName());
+                        } catch (SQLException lockEx) {
+                            logger.log(Level.WARNING, "Failed to release lock after " + kind + " conflict for " + uuid, lockEx);
+                        }
+                        notifyLockReleased(uuid);
+                    }
+                    // Online save: do NOT release lock — player is still on this server.
+                    // The CAS failure means someone else wrote (fencing token violation),
+                    // which is a serious bug. Log it at SEVERE and keep the lock.
+                    if (!kind.releaseLock) {
+                        logger.log(Level.SEVERE, "[Fencing] Online save conflict for " + uuid
+                            + " — possible lock infringement! The lock should be held by us but CAS failed."
+                            + " expected v" + expectedVersion + "/ft" + fencingToken
+                            + ", actual v" + actualVersion + "/ft" + actualFencingToken);
+                    }
+
+                    return SaveResult.conflict(expectedVersion, actualVersion, compressed.length);
+                }
+            }
+
+            // 5b. Success: advance version + log + snapshot + publish
+            advanceVersion(uuid, expectedVersion);
 
                 if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {
                     snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
@@ -1724,7 +1934,6 @@ public class SyncManager {
                 }
 
                 return SaveResult.success(expectedVersion, compressed.length);
-            }
         } catch (Exception e) {
             logger.log(Level.SEVERE, kind + " save failed for " + uuid, e);
 
@@ -1859,6 +2068,22 @@ public class SyncManager {
 
     public int getPendingLoadCount() {
         return pendingLoadCount.get();
+    }
+
+    /**
+     * Returns the number of players currently quarantined (lock lost during
+     * heartbeat). These players have been kicked and are pending reconnection.
+     */
+    public int getQuarantinedPlayerCount() {
+        return quarantinedPlayers.size();
+    }
+
+    /**
+     * Returns the number of players currently tracked as active (online with
+     * a valid lock on this server).
+     */
+    public int getActivePlayerCount() {
+        return activePlayers.size();
     }
 
     public boolean isRedisHealthy() {
