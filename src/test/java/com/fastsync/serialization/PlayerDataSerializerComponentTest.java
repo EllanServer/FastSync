@@ -167,10 +167,26 @@ class PlayerDataSerializerComponentTest {
     }
 
     @Test
-    void testEmptyComponentReturnsNull() throws IOException {
+    void testEmptyComponentProducesPresentPayload() throws IOException {
+        // Phase 3: empty components must produce a valid payload with _present=true,
+        // NOT null. This ensures that "player has no potion effects" is distinguishable
+        // from "potion effects component was not collected". Without this, removing
+        // all potion effects would not clear the old state on the target server.
         PlayerData empty = new PlayerData();
         byte[] bytes = PlayerDataSerializer.serializeComponent("PDC", empty);
-        assertNull(bytes, "Empty PDC should serialize to null");
+        assertNotNull(bytes, "Empty PDC should produce a _present payload, not null");
+        assertTrue(bytes.length > 0, "Empty PDC payload should be non-empty (contains _present marker)");
+
+        // Deserialize should clear the target PDC (set to empty map)
+        PlayerData target = new PlayerData();
+        java.util.Map<String, byte[]> oldPdc = new java.util.HashMap<>();
+        oldPdc.put("old:key", new byte[]{1, 2, 3});
+        target.setPersistentDataContainer(oldPdc);
+
+        PlayerDataSerializer.deserializeComponent("PDC", bytes, target);
+        assertNotNull(target.getPersistentDataContainer());
+        assertTrue(target.getPersistentDataContainer().isEmpty(),
+            "Deserializing empty PDC payload should clear the target PDC");
     }
 
     @Test
@@ -248,5 +264,28 @@ class PlayerDataSerializerComponentTest {
 
         assertNotNull(target.getAdvancements());
         assertEquals(1700000000000L, target.getAdvancements().get("minecraft:story/mine_diamond").get("got_diamond"));
+    }
+
+    @Test
+    void testEmptyPotionEffectsClearsTarget() throws IOException {
+        // Phase 3: empty POTION_EFFECTS payload must clear target effects.
+        // This prevents a player who lost all potion effects from getting
+        // the old effects back on next login.
+        PlayerData empty = new PlayerData();
+        // Ensure potion effects is empty (default)
+        byte[] bytes = PlayerDataSerializer.serializeComponent("POTION_EFFECTS", empty);
+        assertNotNull(bytes, "Empty POTION_EFFECTS should produce a _present payload");
+
+        // Set up a target with old effects
+        PlayerData target = new PlayerData();
+        java.util.List<PlayerData.PotionEffectData> oldEffects = new java.util.ArrayList<>();
+        oldEffects.add(new PlayerData.PotionEffectData("minecraft:speed", 200, 1, false, true, true));
+        target.setPotionEffects(oldEffects);
+
+        // Deserialize the empty payload — should clear the old effects
+        PlayerDataSerializer.deserializeComponent("POTION_EFFECTS", bytes, target);
+        assertNotNull(target.getPotionEffects());
+        assertTrue(target.getPotionEffects().isEmpty(),
+            "Empty POTION_EFFECTS payload should clear old effects");
     }
 }

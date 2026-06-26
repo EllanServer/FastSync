@@ -608,8 +608,11 @@ public class PlayerDataSerializer {
                 return null;
             }
         }
-        // Return null if the component wrote no fields (e.g. empty PDC).
-        if (c.isEmpty()) return null;
+        // Mark this component as present (collected) even if empty.
+        // This distinguishes "component was collected but is empty" (e.g. no
+        // potion effects) from "component was not collected at all" (null).
+        // On deserialize, _present=true with empty fields means "clear target".
+        c.putBoolean("_present", true);
         return c;
     }
 
@@ -641,8 +644,11 @@ public class PlayerDataSerializer {
                 data.setTotalExperience(c.getInt("totalExperience"));
             }
             case "POTION_EFFECTS" -> {
+                // If _present=true, always set effects (empty list = clear).
+                // This handles the case where a player's potion effects were
+                // removed — the empty component payload must clear the old state.
+                java.util.List<PlayerData.PotionEffectData> effects = new java.util.ArrayList<>();
                 if (c.get("potionEffects") instanceof ListTag list) {
-                    java.util.List<PlayerData.PotionEffectData> effects = new java.util.ArrayList<>();
                     for (int i = 0; i < list.size(); i++) {
                         if (list.get(i) instanceof CompoundTag e) {
                             byte flags = e.getByte("flags");
@@ -651,8 +657,8 @@ public class PlayerDataSerializer {
                                 (flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0));
                         }
                     }
-                    data.setPotionEffects(effects);
                 }
+                data.setPotionEffects(effects);
             }
             case "GAME_MODE" -> {
                 int ord = c.getByte("gameMode") & 0xFF;
@@ -669,8 +675,9 @@ public class PlayerDataSerializer {
                 data.setAllowFlight(c.getBoolean("allowFlight"));
             }
             case "ADVANCEMENTS" -> {
+                // _present=true means always set (empty map = clear)
+                java.util.Map<String, java.util.Map<String, Long>> advs = new java.util.HashMap<>();
                 if (c.get("advancements") instanceof CompoundTag a) {
-                    java.util.Map<String, java.util.Map<String, Long>> advs = new java.util.HashMap<>();
                     for (String key : a.keySet()) {
                         if (a.get(key) instanceof CompoundTag crit) {
                             java.util.Map<String, Long> m = new java.util.HashMap<>();
@@ -678,12 +685,12 @@ public class PlayerDataSerializer {
                             advs.put(key, m);
                         }
                     }
-                    data.setAdvancements(advs);
                 }
+                data.setAdvancements(advs);
             }
             case "STATISTICS" -> {
+                java.util.Map<String, java.util.Map<String, Integer>> stats = new java.util.HashMap<>();
                 if (c.get("statistics") instanceof CompoundTag s) {
-                    java.util.Map<String, java.util.Map<String, Integer>> stats = new java.util.HashMap<>();
                     for (String cat : s.keySet()) {
                         if (s.get(cat) instanceof CompoundTag catTag) {
                             java.util.Map<String, Integer> m = new java.util.HashMap<>();
@@ -691,12 +698,12 @@ public class PlayerDataSerializer {
                             stats.put(cat, m);
                         }
                     }
-                    data.setStatistics(stats);
                 }
+                data.setStatistics(stats);
             }
             case "ATTRIBUTES" -> {
+                java.util.List<PlayerData.AttributeData> attrs = new java.util.ArrayList<>();
                 if (c.get("attributes") instanceof ListTag list) {
-                    java.util.List<PlayerData.AttributeData> attrs = new java.util.ArrayList<>();
                     for (int i = 0; i < list.size(); i++) {
                         if (list.get(i) instanceof CompoundTag a) {
                             java.util.List<PlayerData.ModifierData> mods = new java.util.ArrayList<>();
@@ -713,15 +720,15 @@ public class PlayerDataSerializer {
                             attrs.add(new PlayerData.AttributeData(a.getString("key"), a.getDouble("base"), mods));
                         }
                     }
-                    data.setAttributes(attrs);
                 }
+                data.setAttributes(attrs);
             }
             case "PDC" -> {
+                java.util.Map<String, byte[]> pdc = new java.util.HashMap<>();
                 if (c.get("pdc") instanceof CompoundTag pdcTag) {
-                    java.util.Map<String, byte[]> pdc = new java.util.HashMap<>();
                     for (String key : pdcTag.keySet()) pdc.put(key, pdcTag.getByteArray(key));
-                    data.setPersistentDataContainer(pdc);
                 }
+                data.setPersistentDataContainer(pdc);
             }
             case "LOCATION" -> {
                 if (c.getString("world") != null && !c.getString("world").isEmpty()) {
