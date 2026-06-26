@@ -156,10 +156,14 @@ public class SyncManager {
                 redissonManager = new RedissonManager(
                     config.getRedisHost(), config.getRedisPort(),
                     config.getRedisPassword(), config.getRedisDatabase(),
-                    config.getServerName(), config.getClusterId(), config.getRedisChannelPrefix());
-                redissonManager.initialize();
-                // Register listener for incoming stream events from other servers
+                    config.getServerName(), config.getClusterId(), config.getRedisChannelPrefix(),
+                    config.isRedisSsl(), config.getRedisTimeout());
+                // Register listener BEFORE initialize() — initialize() starts the
+                // consumer loop and recovers pending entries, which can dispatch
+                // stream events immediately. If the listener isn't registered yet,
+                // those events are silently ack'd and lost.
                 redissonManager.addListener(this::handleStreamEvent);
+                redissonManager.initialize();
                 logger.info("Redis coordination enabled (Redisson: Pub/Sub + Streams).");
             } catch (Exception e) {
                 logger.log(Level.SEVERE, "Failed to connect to Redis! Falling back to database polling.", e);
@@ -717,8 +721,9 @@ public class SyncManager {
                     persistCollectedData(uuid, data, SaveKind.QUIT);
                 } finally {
                     saveLock.unlock();
-                    playerSaveLocks.remove(uuid, saveLock);
-                    // Clean up version/token tracking now that save is complete
+                    // Do NOT remove lock from map — prevents lock-object split if
+                    // another thread is waiting on the same lock instance.
+                    // Locks are cleaned up lazily by cleanupStaleEntries().
                     playerVersions.remove(uuid);
                     playerFencingTokens.remove(uuid);
                     pendingSaveCount.decrementAndGet();
@@ -735,7 +740,6 @@ public class SyncManager {
                 persistCollectedData(uuid, data, SaveKind.QUIT);
             } finally {
                 saveLock.unlock();
-                playerSaveLocks.remove(uuid, saveLock);
                 playerVersions.remove(uuid);
                 playerFencingTokens.remove(uuid);
                 pendingSaveCount.decrementAndGet();
@@ -786,17 +790,22 @@ public class SyncManager {
         try {
             data = collectPlayerData(player);
         } catch (Exception e) {
+            // Collection failed — DO NOT release the lock!
+            // Releasing the lock would allow another server to load stale data,
+            // silently losing the player's final state. Instead, leave the lock
+            // held so the player cannot log in elsewhere until lock-timeout
+            // expires. This gives operators a window to investigate and recover.
+            // The DB still contains the last successfully saved version (from
+            // periodic save or initial load), so no data is lost — it's just
+            // not the very latest state.
             logger.log(Level.SEVERE, "Failed to collect data for " + uuid
-                + " in sync fallback — releasing lock without saving", e);
+                + " in sync fallback — NOT releasing lock. The lock will expire"
+                + " after " + config.getLockTimeout() + "s. Manual recovery may be needed."
+                + " The DB still contains the last saved version.", e);
             activePlayers.remove(uuid);
-            playerVersions.remove(uuid);
-            playerFencingTokens.remove(uuid);
-            try {
-                databaseManager.releaseLock(uuid, config.getServerName());
-                notifyLockReleased(uuid);
-            } catch (SQLException ex) {
-                logger.log(Level.WARNING, "Failed to release lock after sync collection failure for " + uuid, ex);
-            }
+            // Do NOT remove playerVersions/playerFencingTokens — they identify
+            // which lock we hold. The heartbeat task will skip this player
+            // (no longer in activePlayers), and the lock will expire naturally.
             return;
         }
 
@@ -810,7 +819,6 @@ public class SyncManager {
             persistCollectedData(uuid, data, SaveKind.QUIT);
         } finally {
             saveLock.unlock();
-            playerSaveLocks.remove(uuid, saveLock);
             playerVersions.remove(uuid);
             playerFencingTokens.remove(uuid);
         }
@@ -1234,13 +1242,17 @@ public class SyncManager {
      * <p><b>Folia-safe:</b> Data collection is dispatched per-player via
      * {@link SchedulerUtil#runAtEntity} to ensure it runs on the correct
      * region thread. Serialization + DB write happen async, and we wait
-     * for all futures to complete before returning.
+     * for all futures to complete (with a global deadline) before returning.
+     *
+     * @param kind BULK for /saveall (keep lock), SHUTDOWN for onDisable (release lock)
+     * @return result with total/success/failed counts and per-UUID failure reasons
      */
-    public void saveAllOnlinePlayers() {
+    public SaveAllResult saveAllOnlinePlayers(SaveKind kind) {
         int total = 0;
         int success = 0;
         int failed = 0;
-        List<CompletableFuture<SaveResult>> futures = new ArrayList<>();
+        Map<UUID, String> failures = new HashMap<>();
+        List<Map.Entry<UUID, CompletableFuture<SaveResult>>> futures = new ArrayList<>();
         Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
 
         for (Player player : Bukkit.getOnlinePlayers()) {
@@ -1255,7 +1267,6 @@ public class SyncManager {
                 try {
                     PlayerData data = collectPlayerData(player);
                     pendingSaveCount.incrementAndGet();
-                    // Use per-UUID lock to serialize with any in-flight periodic/quit save
                     java.util.concurrent.locks.ReentrantLock saveLock =
                         playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
                     try {
@@ -1264,10 +1275,9 @@ public class SyncManager {
                             try {
                                 saveLock.lock();
                                 try {
-                                    result = persistCollectedData(uuid, data, SaveKind.BULK);
+                                    result = persistCollectedData(uuid, data, kind);
                                 } finally {
                                     saveLock.unlock();
-                                    playerSaveLocks.remove(uuid, saveLock);
                                 }
                             } catch (Exception e) {
                                 result = SaveResult.error(e.getMessage());
@@ -1277,44 +1287,62 @@ public class SyncManager {
                             future.complete(result);
                         });
                     } catch (java.util.concurrent.RejectedExecutionException e) {
-                        // Queue full during bulk save — record failure, don't block wait loop
                         pendingSaveCount.decrementAndGet();
-                        logger.log(Level.WARNING, "Async queue full during bulk save for " + uuid, e);
+                        logger.log(Level.WARNING, "Async queue full during " + kind + " save for " + uuid, e);
                         future.complete(SaveResult.error("async queue full"));
                     }
                 } catch (Exception e) {
-                    logger.log(Level.SEVERE, "Failed to collect data for " + uuid + " during bulk save", e);
+                    logger.log(Level.SEVERE, "Failed to collect data for " + uuid + " during " + kind + " save", e);
                     future.complete(SaveResult.error(e.getMessage()));
                 }
             }, () -> {
                 future.complete(SaveResult.error("entity retired"));
             });
-            futures.add(future);
+            futures.add(Map.entry(uuid, future));
         }
 
-        // Wait for all DB saves with per-future timeout (5s each).
-        // Prevents Folia onDisable hang when entity scheduler is unreliable.
-        for (CompletableFuture<SaveResult> f : futures) {
+        // Wait for all DB saves with a global deadline (30s total, not per-player).
+        long deadlineMs = 30_000;
+        long deadlineStart = System.currentTimeMillis();
+        for (Map.Entry<UUID, CompletableFuture<SaveResult>> entry : futures) {
+            UUID uuid = entry.getKey();
+            CompletableFuture<SaveResult> f = entry.getValue();
+            long remaining = deadlineMs - (System.currentTimeMillis() - deadlineStart);
+            if (remaining <= 0) {
+                failed++;
+                failures.put(uuid, "global deadline exceeded");
+                continue;
+            }
             try {
-                SaveResult result = f.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                SaveResult result = f.get(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
                 if (result.success()) {
                     success++;
                 } else {
                     failed++;
+                    failures.put(uuid, result.errorMessage() != null ? result.errorMessage() : "unknown error");
                 }
             } catch (java.util.concurrent.TimeoutException e) {
-                logger.warning("saveAllOnlinePlayers: timeout waiting for player save (5s)");
+                logger.warning(kind + ": global deadline exceeded waiting for " + uuid);
                 failed++;
+                failures.put(uuid, "timeout");
             } catch (Exception e) {
                 failed++;
+                failures.put(uuid, e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
             }
         }
 
         if (failed > 0) {
-            logger.warning("saveAllOnlinePlayers: " + success + "/" + total + " succeeded, " + failed + " failed.");
+            logger.warning(kind + ": " + success + "/" + total + " succeeded, " + failed + " failed.");
         } else {
-            logger.info("Saved data for all " + total + " online players.");
+            logger.info(kind + ": saved data for all " + total + " online players.");
         }
+
+        return new SaveAllResult(total, success, failed, failures);
+    }
+
+    /** Backward-compatible overload: defaults to BULK (keep lock, for /saveall command). */
+    public SaveAllResult saveAllOnlinePlayers() {
+        return saveAllOnlinePlayers(SaveKind.BULK);
     }
 
     /**
@@ -1367,7 +1395,6 @@ public class SyncManager {
                         logger.log(Level.WARNING, finalKind + " save failed for " + uuid, e);
                     } finally {
                         saveLock.unlock();
-                        playerSaveLocks.remove(uuid, saveLock);
                         pendingSaveCount.decrementAndGet();
                     }
             });
@@ -1406,6 +1433,42 @@ public class SyncManager {
      * — a timeout, not an ordering. Clock skew may cause cleanup to happen slightly
      * early or late, but cannot cause data corruption.
      */
+    /**
+     * Heartbeat: refresh locked_at for all online players whose locks we hold.
+     *
+     * <p>This runs on a separate timer from periodic saves and is the PRIMARY
+     * mechanism for keeping online locks alive. Periodic saves also refresh
+     * locked_at as a side effect, but relying solely on saves is unsafe when
+     * periodic-save is disabled (default) or the interval exceeds lock-timeout.
+     *
+     * <p>If refreshLock returns false for a player, it means our lock was
+     * already taken over by another server (stale expiry or infringement).
+     * This is a SEVERE condition — the player's data may be inconsistent.
+     * We log it at SEVERE and remove the player from active tracking to
+     * prevent further saves that would conflict.
+     */
+    public void heartbeatOnlinePlayers() {
+        String serverName = config.getServerName();
+        for (UUID uuid : activePlayers.keySet()) {
+            Long fencingToken = playerFencingTokens.get(uuid);
+            if (fencingToken == null) continue;
+            try {
+                boolean refreshed = databaseManager.refreshLock(uuid, serverName, fencingToken);
+                if (!refreshed) {
+                    // Lock no longer ours — possible infringement or stale expiry
+                    logger.log(Level.SEVERE, "[Heartbeat] Lock refresh failed for " + uuid
+                        + " (ft=" + fencingToken + ") — lock may have been taken by another server!"
+                        + " Removing player from active tracking to prevent data corruption.");
+                    activePlayers.remove(uuid);
+                    playerVersions.remove(uuid);
+                    playerFencingTokens.remove(uuid);
+                }
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "[Heartbeat] Failed to refresh lock for " + uuid, e);
+            }
+        }
+    }
+
     public void cleanupStaleEntries() {
         long now = System.currentTimeMillis();
         long staleThreshold = 5 * 60 * 1000; // 5 minutes
@@ -1426,6 +1489,11 @@ public class SyncManager {
                 });
             }
         });
+
+        // Clean up save locks for players no longer active (quit > 5 min ago).
+        // This prevents unbounded growth of the playerSaveLocks map.
+        playerSaveLocks.keySet().removeIf(uuid -> !activePlayers.containsKey(uuid)
+            && !pendingData.containsKey(uuid) && !pendingEmptyData.contains(uuid));
     }
 
     // ==================== Shutdown ====================
@@ -1481,12 +1549,16 @@ public class SyncManager {
         QUIT("disconnect", true),
         /** Periodic online save — lock kept, data refreshed. */
         PERIODIC("periodic", false),
-        /** Bulk save (shutdown / /saveall) — for shutdown this is final, but online players keep lock. */
+        /** Bulk save (/saveall command) — online players keep lock. */
         BULK("bulk", false),
         /** World-save triggered save — online save, lock kept. */
         WORLD_SAVE("world_save", false),
         /** Death-triggered save — online save, lock kept. */
-        DEATH("death", false);
+        DEATH("death", false),
+        /** Server shutdown / plugin disable — final save, lock released.
+         *  Distinct from QUIT so audit logs and snapshot triggers can
+         *  differentiate a graceful disconnect from a server stop. */
+        SHUTDOWN("shutdown", true);
 
         final String causeName;
         final boolean releaseLock;
@@ -1495,6 +1567,12 @@ public class SyncManager {
             this.causeName = causeName;
             this.releaseLock = releaseLock;
         }
+    }
+
+    /** Result of a bulk saveAll operation, returned to the command layer. */
+    public record SaveAllResult(int total, int success, int failed,
+                                Map<UUID, String> failures) {
+        public boolean allSucceeded() { return failed == 0; }
     }
 
     /** Result of a save operation. */

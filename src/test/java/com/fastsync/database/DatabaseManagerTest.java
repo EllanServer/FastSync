@@ -218,4 +218,226 @@ class DatabaseManagerTest {
         assertFalse(saveSql.toUpperCase().contains("FOR UPDATE"),
                 "saveData SQL must not use FOR UPDATE (single-row PK CAS)");
     }
+
+    // ==================== Keep-Lock vs Release-Lock Tests ====================
+
+    @Test
+    void testSaveDataKeepLock_keepsLockedByAndRefreshesLockedAt() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        byte[] data = new byte[]{1, 2, 3};
+        long checksum = DatabaseManager.computeChecksum(data);
+
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(lock.acquired());
+
+        // Save with keep-lock (online/periodic save)
+        boolean saved = databaseManager.saveDataKeepLock(uuid, data, checksum, 0,
+            lock.fencingToken(), "server-a");
+        assertTrue(saved, "saveDataKeepLock should succeed");
+
+        // Verify locked_by is still set to our server
+        String lockHolder = databaseManager.getLockHolder(uuid);
+        assertEquals("server-a", lockHolder,
+            "locked_by should still be 'server-a' after keep-lock save");
+
+        // Verify locked_at was refreshed (should be close to now)
+        // We can't read locked_at directly through the public API, but we can
+        // verify it by checking that another server CANNOT acquire the lock
+        // (locked_at is recent, so the lock is not stale).
+        LockResult lockByOther = databaseManager.acquireLock(uuid, "server-b");
+        assertFalse(lockByOther.acquired(),
+            "Another server should NOT be able to acquire the lock after keep-lock save");
+    }
+
+    @Test
+    void testSaveDataAndReleaseLock_clearsLockedBy() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        byte[] data = new byte[]{1, 2, 3};
+        long checksum = DatabaseManager.computeChecksum(data);
+
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(lock.acquired());
+
+        // Save with release-lock (quit/final save)
+        boolean saved = databaseManager.saveDataAndReleaseLock(uuid, data, checksum, 0,
+            lock.fencingToken(), "server-a");
+        assertTrue(saved, "saveDataAndReleaseLock should succeed");
+
+        // Verify locked_by is cleared
+        String lockHolder = databaseManager.getLockHolder(uuid);
+        assertNull(lockHolder,
+            "locked_by should be NULL after release-lock save");
+
+        // Another server should now be able to acquire the lock
+        LockResult lockByOther = databaseManager.acquireLock(uuid, "server-b");
+        assertTrue(lockByOther.acquired(),
+            "Another server should be able to acquire the lock after release-lock save");
+    }
+
+    @Test
+    void testSaveDataKeepLock_advancesVersion() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        byte[] data1 = new byte[]{1, 2, 3};
+        long checksum1 = DatabaseManager.computeChecksum(data1);
+
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(lock.acquired());
+
+        // First keep-lock save
+        assertTrue(databaseManager.saveDataKeepLock(uuid, data1, checksum1, 0,
+            lock.fencingToken(), "server-a"));
+
+        VersionedData after1 = databaseManager.loadData(uuid);
+        assertEquals(1, after1.version(), "Version should be 1 after first save");
+
+        // Second keep-lock save (version advances)
+        byte[] data2 = new byte[]{4, 5, 6};
+        long checksum2 = DatabaseManager.computeChecksum(data2);
+        assertTrue(databaseManager.saveDataKeepLock(uuid, data2, checksum2, after1.version(),
+            lock.fencingToken(), "server-a"));
+
+        VersionedData after2 = databaseManager.loadData(uuid);
+        assertEquals(2, after2.version(), "Version should be 2 after second keep-lock save");
+        assertArrayEquals(data2, after2.data());
+    }
+
+    @Test
+    void testSaveDataKeepLock_rejectsStaleFencingToken() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        byte[] data = new byte[]{1, 2, 3};
+        long checksum = DatabaseManager.computeChecksum(data);
+
+        // Server A acquires lock (token 1)
+        LockResult lockA = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(databaseManager.saveDataKeepLock(uuid, data, checksum, 0,
+            lockA.fencingToken(), "server-a"));
+
+        // Server A releases, Server B acquires (token 2)
+        databaseManager.releaseLock(uuid, "server-a");
+        LockResult lockB = databaseManager.acquireLock(uuid, "server-b");
+        assertTrue(lockB.acquired());
+
+        // Server A tries keep-lock save with stale token — must fail
+        byte[] staleData = new byte[]{7, 8, 9};
+        long staleChecksum = DatabaseManager.computeChecksum(staleData);
+        VersionedData current = databaseManager.loadData(uuid);
+        boolean saved = databaseManager.saveDataKeepLock(uuid, staleData, staleChecksum,
+            current.version(), lockA.fencingToken(), "server-a");
+        assertFalse(saved, "Keep-lock save with stale fencing token must be rejected");
+
+        // Lock should still be held by server B
+        assertEquals("server-b", databaseManager.getLockHolder(uuid));
+    }
+
+    // ==================== Heartbeat (refreshLock) Tests ====================
+
+    @Test
+    void testRefreshLock_returnsTrueWhenWeHoldLock() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(lock.acquired());
+
+        boolean refreshed = databaseManager.refreshLock(uuid, "server-a", lock.fencingToken());
+        assertTrue(refreshed, "refreshLock should return true when we hold the lock");
+
+        // Another server should not be able to acquire (lock is fresh)
+        LockResult lockByOther = databaseManager.acquireLock(uuid, "server-b");
+        assertFalse(lockByOther.acquired(), "Lock should still be held after heartbeat refresh");
+    }
+
+    @Test
+    void testRefreshLock_returnsFalseWhenLockTakenOver() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+
+        // Server A acquires lock
+        LockResult lockA = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(lockA.acquired());
+
+        // Server A releases, Server B acquires (new fencing token)
+        databaseManager.releaseLock(uuid, "server-a");
+        LockResult lockB = databaseManager.acquireLock(uuid, "server-b");
+        assertTrue(lockB.acquired());
+
+        // Server A tries to refresh with old token — must fail
+        boolean refreshed = databaseManager.refreshLock(uuid, "server-a", lockA.fencingToken());
+        assertFalse(refreshed, "refreshLock should return false when lock was taken by another server");
+
+        // Server B can still refresh
+        boolean bRefreshed = databaseManager.refreshLock(uuid, "server-b", lockB.fencingToken());
+        assertTrue(bRefreshed, "Current lock holder should be able to refresh");
+    }
+
+    @Test
+    void testRefreshLock_returnsFalseForWrongServer() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(lock.acquired());
+
+        // Server B tries to refresh server A's lock — must fail
+        boolean refreshed = databaseManager.refreshLock(uuid, "server-b", lock.fencingToken());
+        assertFalse(refreshed, "refreshLock should return false for wrong server name");
+    }
+
+    // ==================== Online Save Conflict Tests ====================
+
+    @Test
+    void testOnlineSaveConflict_doesNotReleaseLock() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        byte[] data = new byte[]{1, 2, 3};
+        long checksum = DatabaseManager.computeChecksum(data);
+
+        // Server A acquires lock and saves (keep-lock)
+        LockResult lockA = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(databaseManager.saveDataKeepLock(uuid, data, checksum, 0,
+            lockA.fencingToken(), "server-a"));
+
+        // Simulate lock infringement: Server A releases, Server B takes over
+        databaseManager.releaseLock(uuid, "server-a");
+        LockResult lockB = databaseManager.acquireLock(uuid, "server-b");
+        assertTrue(lockB.acquired());
+
+        // Server A tries another keep-lock save with old token — must fail (conflict)
+        VersionedData current = databaseManager.loadData(uuid);
+        byte[] newData = new byte[]{4, 5, 6};
+        long newChecksum = DatabaseManager.computeChecksum(newData);
+        boolean saved = databaseManager.saveDataKeepLock(uuid, newData, newChecksum,
+            current.version(), lockA.fencingToken(), "server-a");
+        assertFalse(saved, "Online save with stale token must fail (conflict)");
+
+        // Critical: lock should STILL be held by server B (not released by failed save)
+        assertEquals("server-b", databaseManager.getLockHolder(uuid),
+            "Lock must NOT be released after online save conflict — holder unchanged");
+    }
+
+    @Test
+    void testQuitSaveConflict_releasesLock() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        byte[] data = new byte[]{1, 2, 3};
+        long checksum = DatabaseManager.computeChecksum(data);
+
+        // Server A acquires lock and saves (keep-lock)
+        LockResult lockA = databaseManager.acquireLock(uuid, "server-a");
+        assertTrue(databaseManager.saveDataKeepLock(uuid, data, checksum, 0,
+            lockA.fencingToken(), "server-a"));
+
+        // Lock infringement: Server B takes over
+        databaseManager.releaseLock(uuid, "server-a");
+        LockResult lockB = databaseManager.acquireLock(uuid, "server-b");
+
+        // Server A tries release-lock save (quit) with old token — must fail
+        VersionedData current = databaseManager.loadData(uuid);
+        boolean saved = databaseManager.saveDataAndReleaseLock(uuid, data, checksum,
+            current.version(), lockA.fencingToken(), "server-a");
+        assertFalse(saved, "Quit save with stale token must fail (conflict)");
+
+        // For quit saves, the code calls releaseLock() after conflict.
+        // But releaseLock only clears if locked_by = serverName, and the lock
+        // is now held by server-b, so releaseLock("server-a") is a no-op.
+        databaseManager.releaseLock(uuid, "server-a");
+
+        // Lock should still be held by server B
+        assertEquals("server-b", databaseManager.getLockHolder(uuid),
+            "Quit save conflict should not release another server's lock");
+    }
 }

@@ -77,6 +77,7 @@ public class ConfigManager {
     private boolean periodicSave;
     private int periodicSaveIntervalSeconds;
     private int periodicSaveBatchSize;
+    private int heartbeatIntervalSeconds;
 
     // Sync - new features
     private boolean syncAdvancements;
@@ -242,7 +243,7 @@ public class ConfigManager {
         syncFireTicks = source.getBoolean("sync.sync-fire-ticks", true);
         syncAir = source.getBoolean("sync.sync-air", true);
         syncExtraData = source.getBoolean("sync.sync-extra-data", true);
-        lockTimeout = source.getInt("sync.lock-timeout", 30);
+        lockTimeout = source.getInt("sync.lock-timeout", 60);
         lockRetryIntervalMs = source.getLong("sync.lock-retry-interval-ms", 1000);
         lockMaxRetries = source.getInt("sync.lock-max-retries", 30);
         saveDelay = source.getInt("sync.save-delay", 0);
@@ -254,6 +255,22 @@ public class ConfigManager {
         periodicSave = source.getBoolean("sync.periodic-save", false);
         periodicSaveIntervalSeconds = source.getInt("sync.periodic-save-interval-seconds", 300);
         periodicSaveBatchSize = source.getInt("sync.periodic-save-batch-size", 10);
+        heartbeatIntervalSeconds = source.getInt("sync.heartbeat-interval-seconds", 10);
+
+        // Validate: heartbeat must be <= lockTimeout / 3 to guarantee the lock
+        // is refreshed well before it expires. If misconfigured, auto-correct
+        // and warn so the server still starts safely.
+        int maxHeartbeat = lockTimeout / 3;
+        if (maxHeartbeat < 1) maxHeartbeat = 1;
+        if (heartbeatIntervalSeconds > maxHeartbeat) {
+            logger.warning("[Config] heartbeat-interval-seconds (" + heartbeatIntervalSeconds
+                + ") is too large for lock-timeout (" + lockTimeout
+                + "). Auto-correcting to " + maxHeartbeat + "s (lock-timeout/3).");
+            heartbeatIntervalSeconds = maxHeartbeat;
+        }
+        if (heartbeatIntervalSeconds < 1) {
+            heartbeatIntervalSeconds = 1;
+        }
 
         // Sync - new features
         syncAdvancements = source.getBoolean("sync.sync-advancements", true);
@@ -302,7 +319,7 @@ public class ConfigManager {
 
         // Death save
         saveOnDeath = source.getBoolean("sync.save-on-death", false);
-        saveOnWorldSave = source.getBoolean("sync.save-on-world-save", true);
+        saveOnWorldSave = source.getBoolean("sync.save-on-world-save", false);
 
         // Cluster
         clusterId = source.getString("cluster-id", "");
@@ -383,6 +400,7 @@ public class ConfigManager {
     public boolean isPeriodicSave() { return periodicSave; }
     public int getPeriodicSaveIntervalSeconds() { return periodicSaveIntervalSeconds; }
     public int getPeriodicSaveBatchSize() { return periodicSaveBatchSize; }
+    public int getHeartbeatIntervalSeconds() { return heartbeatIntervalSeconds; }
 
     public boolean isSyncAdvancements() { return syncAdvancements; }
     public boolean isSyncStatistics() { return syncStatistics; }

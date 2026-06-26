@@ -47,6 +47,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
     private Object cleanupTask;
     private Object periodicSaveTask;
+    private Object heartbeatTask;
 
     @Override
     public void onEnable() {
@@ -107,6 +108,17 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             syncManager.cleanupStaleEntries();
         }, 6000L, 6000L);
 
+        // Start heartbeat task — refreshes locked_at for all online players.
+        // This is the PRIMARY mechanism for keeping online locks alive.
+        // Runs on async thread (DB I/O only, no Bukkit API calls).
+        long heartbeatTicks = configManager.getHeartbeatIntervalSeconds() * 20L;
+        heartbeatTask = SchedulerUtil.runAsyncTimer(this, () -> {
+            syncManager.heartbeatOnlinePlayers();
+        }, heartbeatTicks, heartbeatTicks);
+        getLogger().info("Lock heartbeat enabled: every " +
+            configManager.getHeartbeatIntervalSeconds() + " seconds (lock-timeout=" +
+            configManager.getLockTimeout() + "s).");
+
         // Start periodic save task (if enabled)
         if (configManager.isPeriodicSave()) {
             long intervalTicks = configManager.getPeriodicSaveIntervalSeconds() * 20L;
@@ -143,11 +155,14 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         // Cancel scheduled tasks (Paper/Folia compatible)
         SchedulerUtil.cancel(cleanupTask);
         SchedulerUtil.cancel(periodicSaveTask);
+        SchedulerUtil.cancel(heartbeatTask);
 
-        // Save all online players synchronously
+        // Save all online players synchronously (release locks — server is stopping)
         if (syncManager != null) {
-            getLogger().info("Saving all online players...");
-            syncManager.saveAllOnlinePlayers();
+            getLogger().info("Saving all online players (shutdown)...");
+            SyncManager.SaveAllResult result = syncManager.saveAllOnlinePlayers(SyncManager.SaveKind.SHUTDOWN);
+            getLogger().info("Shutdown save: " + result.success() + "/" + result.total()
+                + " succeeded" + (result.failed() > 0 ? ", " + result.failed() + " failed" : "") + ".");
         }
 
         // Shut down sync manager (waits for pending saves, closes Redis + thread pool)
@@ -205,10 +220,20 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saving all online players...");
                 SchedulerUtil.runAsync(this, () -> {
                     try {
-                        syncManager.saveAllOnlinePlayers();
-                        SchedulerUtil.runGlobal(this, () ->
-                            sender.sendMessage(ChatColor.GREEN + "[FastSync] All players saved!")
-                        );
+                        SyncManager.SaveAllResult result = syncManager.saveAllOnlinePlayers(SyncManager.SaveKind.BULK);
+                        SchedulerUtil.runGlobal(this, () -> {
+                            if (result.allSucceeded()) {
+                                sender.sendMessage(ChatColor.GREEN + "[FastSync] All " + result.total() + " players saved!");
+                            } else {
+                                sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saved " + result.success()
+                                    + "/" + result.total() + " players. " + ChatColor.RED + result.failed() + " failed.");
+                                if (!result.failures().isEmpty()) {
+                                    sender.sendMessage(ChatColor.GRAY + "Failed players:");
+                                    result.failures().forEach((uuid, reason) ->
+                                        sender.sendMessage(ChatColor.GRAY + "  " + uuid + ": " + ChatColor.RED + reason));
+                                }
+                            }
+                        });
                     } catch (Exception e) {
                         getLogger().log(Level.SEVERE, "Saveall failed", e);
                         SchedulerUtil.runGlobal(this, () ->

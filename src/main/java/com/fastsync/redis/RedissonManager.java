@@ -91,6 +91,8 @@ public class RedissonManager {
     private final String password;
     private final int database;
     private final String serverName;
+    private final boolean ssl;
+    private final int timeout;
 
     private volatile boolean debug = false;
 
@@ -118,14 +120,19 @@ public class RedissonManager {
      *                      to skip self-published events
      * @param clusterId     cluster identifier for namespace isolation (empty = default)
      * @param channelPrefix Redis channel prefix (default "fastsync:lock:")
+     * @param ssl           whether to use TLS (rediss:// scheme)
+     * @param timeout       Redis connection + command timeout in milliseconds
      */
     public RedissonManager(String host, int port, String password, int database,
-                           String serverName, String clusterId, String channelPrefix) {
+                           String serverName, String clusterId, String channelPrefix,
+                           boolean ssl, int timeout) {
         this.host = host;
         this.port = port;
         this.password = password;
         this.database = database;
         this.serverName = serverName;
+        this.ssl = ssl;
+        this.timeout = timeout;
 
         // Build namespace-aware names to prevent cross-cluster message mixing
         // when multiple FastSync deployments share the same Redis.
@@ -144,10 +151,10 @@ public class RedissonManager {
     }
 
     /**
-     * Legacy constructor without namespace isolation (uses "default" cluster).
+     * Legacy constructor without namespace isolation or SSL/timeout (uses "default" cluster, no TLS).
      */
     public RedissonManager(String host, int port, String password, int database, String serverName) {
-        this(host, port, password, database, serverName, "", "");
+        this(host, port, password, database, serverName, "", "", false, 5000);
     }
 
     /**
@@ -169,9 +176,12 @@ public class RedissonManager {
      */
     public void initialize() {
         Config config = new Config();
+        String scheme = ssl ? "rediss://" : "redis://";
         SingleServerConfig single = config.useSingleServer()
-            .setAddress("redis://" + host + ":" + port)
-            .setDatabase(database);
+            .setAddress(scheme + host + ":" + port)
+            .setDatabase(database)
+            .setConnectTimeout(timeout)
+            .setTimeout(timeout);
         if (password != null && !password.isEmpty()) {
             single.setPassword(password);
         }

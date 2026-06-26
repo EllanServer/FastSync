@@ -518,6 +518,34 @@ public class DatabaseManager {
     }
 
     /**
+     * Refresh the lock timestamp for an online player (heartbeat).
+     *
+     * <p>This is called periodically by the heartbeat task to prevent the lock
+     * from expiring while the player is still online. The update is conditional
+     * on {@code locked_by = serverName AND fencing_token = fencingToken} to
+     * ensure we only refresh our own lock — if the lock was already taken over
+     * by another server (stale lock expiry), this update affects 0 rows and
+     * returns false, signalling a serious lock-infringement condition.
+     *
+     * @param uuid         player UUID
+     * @param serverName   server that holds the lock
+     * @param fencingToken fencing token assigned when the lock was acquired
+     * @return true if the lock was refreshed (still ours), false if the lock
+     *         is no longer held by us (possible infringement — must reload)
+     */
+    public boolean refreshLock(UUID uuid, String serverName, long fencingToken) throws SQLException {
+        long now = System.currentTimeMillis();
+        try (Connection conn = dataSource.getConnection()) {
+            return dsl(conn).update(playerData)
+                .set(LOCKED_AT_FIELD, now)
+                .where(UUID_FIELD.eq(uuid.toString())
+                    .and(LOCKED_BY_FIELD.eq(serverName))
+                    .and(FENCING_TOKEN_FIELD.eq(fencingToken)))
+                .execute() > 0;
+        }
+    }
+
+    /**
      * Get the server that currently holds the lock for a player.
      * Returns null if not locked.
      */

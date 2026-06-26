@@ -88,7 +88,13 @@ sync:
   sync-extra-data: true
 
   # Lock timeout in seconds (how long before a lock from another server is considered stale)
-  lock-timeout: 30
+  lock-timeout: 60
+
+  # Heartbeat interval for online lock refresh (seconds).
+  # The heartbeat task refreshes locked_at for all online players, preventing
+  # the lock from expiring while the player is still connected.
+  # Rule: heartbeat-interval <= lock-timeout / 3 (auto-corrected if violated).
+  heartbeat-interval-seconds: 10
 
   # Lock retry settings (when data is locked by another server)
   lock-retry-interval-ms: 1000
