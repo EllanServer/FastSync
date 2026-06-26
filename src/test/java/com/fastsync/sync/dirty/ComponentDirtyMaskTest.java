@@ -195,4 +195,92 @@ class ComponentDirtyMaskTest {
                 "With interval=1, every save should trigger validation");
         }
     }
+
+    /**
+     * Reproduces the lost-update race that the epoch-based clearDirty prevents:
+     *
+     *   T1: snapshot dirty = {INVENTORY}
+     *   T2: markDirty(INVENTORY)  // new change arrives during DB write
+     *   T1: clearDirty(snapshot)  // must NOT clear the new signal
+     *   ⚠ old behavior (boolean set): INVENTORY gets cleared, T2's change is lost
+     *   ✅ new behavior (epoch): INVENTORY stays dirty because epoch differs
+     */
+    @Test
+    void testEpochProtectsAgainstLostUpdateDuringSave() {
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+
+        // Step 1: snapshot dirty state at the start of a save
+        ComponentDirtyMask.DirtySnapshot snapshot = mask.snapshotDirty(player1);
+        assertEquals(1, snapshot.size(), "snapshot should have 1 dirty component");
+        assertTrue(snapshot.components().contains(ComponentDirtyMask.Component.INVENTORY));
+
+        // Step 2: simulate a concurrent markDirty arriving during the DB write
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+
+        // Step 3: clearDirty with the old snapshot — must NOT clear INVENTORY
+        // because its epoch was bumped by the concurrent markDirty.
+        mask.clearDirty(player1, snapshot);
+
+        assertTrue(mask.isAnyDirty(player1),
+            "INVENTORY must remain dirty — concurrent markDirty bumped the epoch");
+        assertTrue(mask.getDirty(player1).contains(ComponentDirtyMask.Component.INVENTORY),
+            "INVENTORY must still be in the dirty set");
+    }
+
+    /**
+     * Verifies that clearDirty(snapshot) DOES clear components whose epoch
+     * matches the snapshot — i.e. the normal happy path still works.
+     */
+    @Test
+    void testClearDirtyWithMatchingEpoch() {
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+        mask.markDirty(player1, ComponentDirtyMask.Component.VITALS);
+
+        ComponentDirtyMask.DirtySnapshot snapshot = mask.snapshotDirty(player1);
+        // No concurrent markDirty — epochs still match
+        mask.clearDirty(player1, snapshot);
+
+        assertFalse(mask.isAnyDirty(player1),
+            "All dirty components should be cleared when epochs match");
+        assertTrue(mask.getDirty(player1).isEmpty());
+    }
+
+    /**
+     * Verifies that clearDirty(snapshot) only clears components whose epoch
+     * matches — a concurrent markDirty on ONE component must NOT cause other
+     * components (whose epochs still match) to be skipped.
+     */
+    @Test
+    void testClearDirtyClearsMatchingComponentsOnly() {
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+        mask.markDirty(player1, ComponentDirtyMask.Component.VITALS);
+        mask.markDirty(player1, ComponentDirtyMask.Component.EXPERIENCE);
+
+        ComponentDirtyMask.DirtySnapshot snapshot = mask.snapshotDirty(player1);
+
+        // Concurrent markDirty on INVENTORY only — bumps its epoch
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+
+        mask.clearDirty(player1, snapshot);
+
+        // INVENTORY stays dirty (epoch mismatch), VITALS + EXPERIENCE cleared
+        Set<ComponentDirtyMask.Component> dirty = mask.getDirty(player1);
+        assertEquals(1, dirty.size(),
+            "Only INVENTORY should remain dirty (epoch mismatch)");
+        assertTrue(dirty.contains(ComponentDirtyMask.Component.INVENTORY));
+    }
+
+    /**
+     * Verifies that snapshotDirty on a player with no mask returns EMPTY
+     * (not null) and clearDirty(EMPTY) is a no-op.
+     */
+    @Test
+    void testSnapshotDirtyForUnknownPlayerIsEmpty() {
+        ComponentDirtyMask.DirtySnapshot snapshot = mask.snapshotDirty(player2);
+        assertSame(ComponentDirtyMask.DirtySnapshot.EMPTY, snapshot);
+        assertTrue(snapshot.isEmpty());
+        // clearDirty on EMPTY is safe — no-op
+        mask.clearDirty(player2, snapshot);
+        assertFalse(mask.isAnyDirty(player2));
+    }
 }

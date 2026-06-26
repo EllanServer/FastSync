@@ -484,7 +484,25 @@ public class PlayerDataSerializer {
             case "INVENTORY" -> {
                 if (data.getInventory() != null) c.put("inventory", toItemStackList(data.getInventory()));
                 if (data.getArmor() != null) c.put("armor", toItemStackList(data.getArmor()));
-                if (data.getOffhand() != null) c.putByteArray("offhand", ItemStackCompat.serialize(data.getOffhand()));
+                // CRITICAL: offhand must have an explicit present flag.
+                //
+                // If we only write the offhand field when getOffhand() != null
+                // (the old behavior), then a player who clears their offhand
+                // produces a component payload with NO offhand field. On the
+                // next load, deserializeComponentFields() sees no offhand field
+                // and leaves data.offhand untouched — which means the BASELINE
+                // Blob's old offhand item silently persists in the player's
+                // offhand slot. The empty-state signal is lost.
+                //
+                // offhandPresent=true  → offhand field is meaningful (may be null/empty)
+                // offhandPresent=false → offhand was explicitly cleared to null
+                // (field absent)       → legacy baseline Blob path; do not touch offhand
+                if (data.getOffhand() != null) {
+                    c.putBoolean("offhandPresent", true);
+                    c.putByteArray("offhand", ItemStackCompat.serialize(data.getOffhand()));
+                } else {
+                    c.putBoolean("offhandPresent", false);
+                }
             }
             case "ENDER_CHEST" -> {
                 if (data.getEnderChest() != null) c.put("enderChest", toItemStackList(data.getEnderChest()));
@@ -624,7 +642,23 @@ public class PlayerDataSerializer {
             case "INVENTORY" -> {
                 if (c.get("inventory") instanceof ListTag inv) data.setInventory(fromItemStackList(inv));
                 if (c.get("armor") instanceof ListTag arm) data.setArmor(fromItemStackList(arm));
-                if (c.get("offhand") != null) data.setOffhand(ItemStackCompat.deserialize(c.getByteArray("offhand")));
+                // offhandPresent gates whether the offhand field is meaningful.
+                // See serializeComponentFields() for the rationale: without this
+                // flag, a player who cleared their offhand would have no offhand
+                // field written, and the baseline Blob's stale offhand item
+                // would silently persist on next load.
+                if (c.get("offhandPresent") != null) {
+                    if (c.getBoolean("offhandPresent")) {
+                        data.setOffhand(ItemStackCompat.deserialize(c.getByteArray("offhand")));
+                    } else {
+                        // Explicit empty state — clear the offhand slot.
+                        data.setOffhand(null);
+                    }
+                }
+                // else: legacy payload without offhandPresent. Leave data.offhand
+                // untouched so the baseline Blob's offhand (if any) is preserved
+                // — this maintains backward compatibility with components written
+                // before the offhandPresent flag was introduced.
             }
             case "ENDER_CHEST" -> {
                 if (c.get("enderChest") instanceof ListTag ec) data.setEnderChest(fromItemStackList(ec));

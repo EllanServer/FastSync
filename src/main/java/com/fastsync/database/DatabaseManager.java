@@ -512,7 +512,7 @@ public class DatabaseManager {
     // ==================== Phase 2: Full Blob Save + Component Cleanup ====================
 
     /**
-     * Full Blob save + release lock + atomically clear all component rows.
+     * Full Blob save + release lock + atomically invalidate old component rows.
      *
      * <p><b>Why this exists:</b> When component-storage is enabled, periodic
      * saves write dirty components to the {@code player_component} table. If a
@@ -526,14 +526,25 @@ public class DatabaseManager {
      *   <li>CAS-updating player_data with the new Blob + version+1 + clearing
      *       the lock (same as {@link #saveDataAndReleaseLock})</li>
      *   <li>Setting {@code component_bitmap = 0} (no components migrated)</li>
-     *   <li>Deleting all rows from {@code player_component} for this UUID</li>
+     *   <li>Incrementing {@code component_generation} by 1 — this makes all
+     *       existing rows in {@code player_component} for this UUID
+     *       <em>invisible</em> to future loads, because
+     *       {@link #loadComponentsWithGeneration} only returns rows whose
+     *       {@code generation} column matches the current
+     *       {@code player_data.component_generation}.</li>
      * </ol>
      *
-     * <p>If the CAS fails (version/fencing mismatch), the transaction is
-     * rolled back and no component rows are deleted — preserving them for
-     * diagnosis. Returns false in that case, same as {@link #saveDataAndReleaseLock}.
+     * <p><b>Rows are NOT deleted</b> — only made invisible. A background
+     * GC task ({@link #gcOldComponentRows}) can delete rows from old
+     * generations later. This is intentional: deleting rows in the same
+     * transaction as the CAS would hold row locks longer and complicate
+     * rollback semantics.
      *
-     * @return true if the full Blob was saved and components cleared;
+     * <p>If the CAS fails (version/fencing mismatch), the transaction is
+     * rolled back and no rows are touched — preserving them for diagnosis.
+     * Returns false in that case, same as {@link #saveDataAndReleaseLock}.
+     *
+     * @return true if the full Blob was saved and component_generation bumped;
      *         false if CAS failed (version/fencing conflict).
      */
     public boolean saveDataAndReleaseLockClearComponents(UUID uuid, byte[] data, long checksum,
@@ -904,197 +915,107 @@ public class DatabaseManager {
     /**
      * Load all migrated components for a player in a single round-trip.
      *
-     * <p>Returns a map of {@code component name → ComponentData}. Only
-     * components present in the table are returned — callers must merge this
-     * with the legacy Blob for non-migrated components.
+     * <p><b>DEPRECATED &amp; DANGEROUS.</b> This overload does NOT filter by
+     * {@code component_generation}, so it can return stale component rows left
+     * behind by a previous baseline (before a full Blob save incremented the
+     * generation). Loading those rows and overlaying them on the current Blob
+     * silently rolls back the player's state to whenever the component was
+     * last written.
      *
-     * <p>Uses {@code SELECT ... WHERE uuid = ? AND component IN (...)} so the
-     * entire batch is one DB round-trip regardless of how many components are
-     * migrated.
+     * <p>Use {@link #loadComponentsWithGeneration(UUID, java.util.Set, long)}
+     * instead, which takes the current {@code component_generation} from
+     * {@code player_data} and only returns rows matching that generation.
+     *
+     * @deprecated since 1.0.0, for removal. Use
+     *             {@link #loadComponentsWithGeneration(UUID, java.util.Set, long)}.
+     * @throws UnsupportedOperationException always — this method exists only to
+     *         produce a clear compile-time deprecation and a loud runtime error
+     *         if any caller still references it.
      */
+    @Deprecated(since = "1.0.0", forRemoval = true)
     public java.util.Map<String, ComponentData> loadComponents(UUID uuid,
             java.util.Set<String> componentNames) throws SQLException {
-        if (componentNames == null || componentNames.isEmpty()) {
-            return java.util.Collections.emptyMap();
-        }
-        java.util.Map<String, ComponentData> result = new java.util.HashMap<>();
-        try (Connection conn = dataSource.getConnection()) {
-            // Use raw SQL with IN clause — jOOQ's DSL.in() with a collection
-            // is verbose for our case.
-            String placeholders = String.join(",", java.util.Collections.nCopies(componentNames.size(), "?"));
-            String sql = String.format(
-                "SELECT `component`, `data`, `version`, `checksum` FROM `%s` WHERE `uuid` = ? AND `component` IN (%s)",
-                componentTable);
-
-            try (var ps = conn.prepareStatement(sql)) {
-                ps.setString(1, uuid.toString());
-                int i = 2;
-                for (String name : componentNames) {
-                    ps.setString(i++, name);
-                }
-                try (var rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        result.put(rs.getString("component"),
-                            new ComponentData(
-                                rs.getBytes("data"),
-                                rs.getLong("version"),
-                                rs.getLong("checksum")));
-                    }
-                }
-            }
-        }
-        return result;
+        throw new UnsupportedOperationException(
+            "loadComponents() is deprecated and unsafe — it does not filter by component_generation. "
+            + "Use loadComponentsWithGeneration(uuid, names, generation) instead, where generation "
+            + "is the current component_generation from player_data.");
     }
 
     /**
      * Upsert a single component: INSERT if not present, UPDATE if present.
-     * Uses {@code INSERT ... ON DUPLICATE KEY UPDATE} for atomicity.
      *
-     * <p>Version is incremented on every write (no CAS here — the player-level
-     * fencing token + the per-UUID saveLock already serialize writes for the
-     * same player, so per-component version is just a monotonic counter for
-     * diagnostics, not a correctness mechanism).
+     * <p><b>DEPRECATED &amp; DANGEROUS.</b> This method has three correctness gaps:
+     * <ol>
+     *   <li>No {@code locked_by} / {@code fencing_token} validation — a stale
+     *       lock holder can write component rows that later override the fresh
+     *       full Blob on load.</li>
+     *   <li>No {@code generation} column written — the row would have
+     *       generation=0 (or NULL) and never match the current generation
+     *       filter on load, so it would be silently invisible — OR if a
+     *       previous valid row existed, it would corrupt the bitmap without
+     *       bumping version.</li>
+     *   <li>No {@code player_data.version} bump and no {@code component_bitmap}
+     *       update — the playerVersions map drifts out of sync, and the next
+     *       full Blob save CAS-fails with a stale-version conflict.</li>
+     * </ol>
      *
-     * @return the new version number of the component (1 on first write,
-     *         previous+1 on update).
+     * <p>Use {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map,
+     * String, long, long)} instead — it does SELECT FOR UPDATE + fencing
+     * validation + per-generation upsert + bitmap/version update all in one
+     * transaction.
+     *
+     * @deprecated since 1.0.0, for removal. Use
+     *             {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map, String, long, long)}.
+     * @throws UnsupportedOperationException always.
      */
+    @Deprecated(since = "1.0.0", forRemoval = true)
     public long upsertComponent(UUID uuid, String componentName, byte[] data, long checksum)
             throws SQLException {
-        long now = System.currentTimeMillis();
-        // Use raw SQL: jOOQ's onDuplicateKeyUpdate() works but the version
-        // increment via VALUES() + LAST_INSERT_ID() is cleaner in raw SQL.
-        String sql = String.format("""
-            INSERT INTO `%s` (uuid, component, data, version, checksum, updated_at)
-            VALUES (?, ?, ?, 1, ?, ?)
-            ON DUPLICATE KEY UPDATE
-                data = VALUES(data),
-                version = LAST_INSERT_ID(version + 1),
-                checksum = VALUES(checksum),
-                updated_at = VALUES(updated_at)
-            """, componentTable);
-
-        try (Connection conn = dataSource.getConnection()) {
-            DSLContext dsl = dsl(conn);
-            dsl.execute(sql, uuid.toString(), componentName, data, checksum, now);
-            Object result = dsl.fetchValue("SELECT LAST_INSERT_ID()");
-            return result != null ? ((Number) result).longValue() : 1L;
-        }
+        throw new UnsupportedOperationException(
+            "upsertComponent() is deprecated and unsafe — it has no fencing/generation/bitmap update. "
+            + "Use upsertComponentsIfLockHeld(uuid, componentsWithData, componentsWithChecksum, "
+            + "serverName, fencingToken, dirtyBits) instead.");
     }
 
     /**
      * Upsert multiple components in a single transaction.
-     * Used by the save path when multiple components are dirty.
      *
-     * <p><b>Security:</b> This method validates the player_data lock BEFORE any
-     * component write. The validation uses {@code SELECT ... FOR UPDATE} on the
-     * player_data row to lock it for the duration of the transaction, then checks
-     * that {@code locked_by = serverName} AND {@code fencing_token = fencingToken}.
-     * If either check fails, the transaction is rolled back and an exception is
-     * thrown — no component rows are written.
+     * <p><b>DEPRECATED &amp; DANGEROUS.</b> Although this overload validates
+     * {@code locked_by} + {@code fencing_token}, it still has two correctness gaps:
+     * <ol>
+     *   <li>It does NOT write the {@code generation} column on component rows —
+     *       rows would be written with generation=0 (or NULL) and never match
+     *       the current generation filter on load, so they would be invisible
+     *       — OR if a previous valid row existed at the current generation, it
+     *       would be overwritten with a wrong generation, corrupting the load
+     *       path.</li>
+     *   <li>It does NOT bump {@code player_data.version} and does NOT update
+     *       {@code component_bitmap} in the same transaction. The local
+     *       playerVersions map drifts out of sync with the DB, and components
+     *       that were just written are not marked as migrated in the bitmap —
+     *       so the next load would not even attempt to read them.</li>
+     * </ol>
      *
-     * <p>This prevents a stale lock holder (e.g. a server that lost the lock due
-     * to GC pause or heartbeat timeout) from writing component rows that would
-     * later override the fresh full Blob on load. Without this check, the
-     * component table would become a side door that bypasses the main table's
-     * fencing token / version CAS defense.
+     * <p>Use {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map,
+     * String, long, long)} instead — it does SELECT FOR UPDATE + fencing
+     * validation + per-generation upsert + bitmap/version update all in one
+     * transaction.
      *
-     * @return a map of {@code component name → new version} for each upserted row.
-     * @throws SQLException with message "Component save rejected: lock/fencing
-     *         mismatch" if the caller does not hold the lock with the given
-     *         fencing token.
+     * @deprecated since 1.0.0, for removal. Use
+     *             {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map, String, long, long)}.
+     * @throws UnsupportedOperationException always.
      */
+    @Deprecated(since = "1.0.0", forRemoval = true)
     public java.util.Map<String, Long> upsertComponentsBatch(UUID uuid,
             java.util.Map<String, byte[]> componentsWithData,
             java.util.Map<String, Long> componentsWithChecksum,
             String serverName,
             long fencingToken) throws SQLException {
-        if (componentsWithData == null || componentsWithData.isEmpty()) {
-            return java.util.Collections.emptyMap();
-        }
-        long now = System.currentTimeMillis();
-        java.util.Map<String, Long> versions = new java.util.HashMap<>();
-
-        try (Connection conn = dataSource.getConnection()) {
-            conn.setAutoCommit(false);
-            try {
-                // 1. Lock the player_data row and verify the caller holds the lock
-                //    with the expected fencing token. FOR UPDATE prevents concurrent
-                //    lock holders from interfering during this transaction.
-                String lockCheckSql = String.format(
-                    "SELECT `locked_by`, `fencing_token` FROM `%s` WHERE `uuid` = ? FOR UPDATE",
-                    dataTable);
-                String lockedBy = null;
-                Long storedFencingToken = null;
-                try (var ps = conn.prepareStatement(lockCheckSql)) {
-                    ps.setString(1, uuid.toString());
-                    try (var rs = ps.executeQuery()) {
-                        if (rs.next()) {
-                            lockedBy = rs.getString("locked_by");
-                            storedFencingToken = rs.getLong("fencing_token");
-                            if (rs.wasNull()) storedFencingToken = null;
-                        }
-                    }
-                }
-
-                if (lockedBy == null
-                        || !serverName.equals(lockedBy)
-                        || storedFencingToken == null
-                        || storedFencingToken != fencingToken) {
-                    conn.rollback();
-                    throw new SQLException("Component save rejected: lock/fencing mismatch for "
-                        + uuid + " (expected: " + serverName + "/ft" + fencingToken
-                        + ", actual: " + lockedBy + "/ft" + storedFencingToken + ")");
-                }
-
-                // 2. Upsert components — now safe because we verified the lock
-                String sql = String.format("""
-                    INSERT INTO `%s` (uuid, component, data, version, checksum, updated_at)
-                    VALUES (?, ?, ?, 1, ?, ?)
-                    ON DUPLICATE KEY UPDATE
-                        data = VALUES(data),
-                        version = version + 1,
-                        checksum = VALUES(checksum),
-                        updated_at = VALUES(updated_at)
-                    """, componentTable);
-
-                try (var ps = conn.prepareStatement(sql)) {
-                    for (var entry : componentsWithData.entrySet()) {
-                        String name = entry.getKey();
-                        byte[] data = entry.getValue();
-                        long checksum = componentsWithChecksum.getOrDefault(name, 0L);
-                        ps.setString(1, uuid.toString());
-                        ps.setString(2, name);
-                        ps.setBytes(3, data);
-                        ps.setLong(4, checksum);
-                        ps.setLong(5, now);
-                        ps.addBatch();
-                    }
-                    ps.executeBatch();
-                }
-                conn.commit();
-
-                // Read back the new versions in one query (outside the lock transaction)
-                java.util.Set<String> names = componentsWithData.keySet();
-                String placeholders = String.join(",", java.util.Collections.nCopies(names.size(), "?"));
-                String selectSql = String.format(
-                    "SELECT `component`, `version` FROM `%s` WHERE `uuid` = ? AND `component` IN (%s)",
-                    componentTable);
-                try (var ps = conn.prepareStatement(selectSql)) {
-                    ps.setString(1, uuid.toString());
-                    int i = 2;
-                    for (String name : names) ps.setString(i++, name);
-                    try (var rs = ps.executeQuery()) {
-                        while (rs.next()) {
-                            versions.put(rs.getString("component"), rs.getLong("version"));
-                        }
-                    }
-                }
-            } catch (SQLException e) {
-                conn.rollback();
-                throw e;
-            }
-        }
-        return versions;
+        throw new UnsupportedOperationException(
+            "upsertComponentsBatch() is deprecated and unsafe — it does not write generation "
+            + "or update player_data.version/component_bitmap. Use upsertComponentsIfLockHeld("
+            + "uuid, componentsWithData, componentsWithChecksum, serverName, fencingToken, "
+            + "dirtyBits) instead.");
     }
 
     /**
