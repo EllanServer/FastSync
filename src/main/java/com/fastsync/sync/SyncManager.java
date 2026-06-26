@@ -2286,10 +2286,13 @@ public class SyncManager {
             long serElapsed = (System.nanoTime() - startSer) / 1_000_000;
             if (serializeLatency != null) serializeLatency.record(serElapsed);
 
-            // Batch upsert all dirty components in one transaction
+            // Batch upsert all dirty components in one transaction.
+            // Pass serverName + fencingToken so the DB layer can verify we
+            // still hold the lock before writing any component rows.
             long dbStart = System.nanoTime();
             java.util.Map<String, Long> newVersions =
-                databaseManager.upsertComponentsBatch(uuid, componentBlobs, componentChecksums);
+                databaseManager.upsertComponentsBatch(uuid, componentBlobs, componentChecksums,
+                    config.getServerName(), data.getFencingToken());
             long dbElapsed = (System.nanoTime() - dbStart) / 1_000_000;
             if (saveLatency != null) saveLatency.record(dbElapsed);
 
@@ -2425,11 +2428,23 @@ public class SyncManager {
 
             boolean saved;
             if (kind.releaseLock) {
-                // Final save (quit): release lock after successful write
-                saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                // Final save (quit): release lock after successful write.
+                // If component-storage is enabled, use the ClearComponents variant
+                // to atomically delete stale component rows + reset bitmap,
+                // preventing stale override on next login.
+                if (config.isComponentStorageEnabled()) {
+                    saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                } else {
+                    saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                }
             } else {
-                // Online save (periodic/bulk/world_save/death): keep lock, refresh locked_at
-                saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                // Online save (periodic/bulk/world_save/death): keep lock, refresh locked_at.
+                // Same ClearComponents logic applies — full Blob is the new baseline.
+                if (config.isComponentStorageEnabled()) {
+                    saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                } else {
+                    saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                }
             }
 
             long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
@@ -2467,9 +2482,17 @@ public class SyncManager {
 
                     // Retry the save with the actual version
                     if (kind.releaseLock) {
-                        saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        if (config.isComponentStorageEnabled()) {
+                            saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        } else {
+                            saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        }
                     } else {
-                        saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        if (config.isComponentStorageEnabled()) {
+                            saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        } else {
+                            saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        }
                     }
 
                     if (saved) {

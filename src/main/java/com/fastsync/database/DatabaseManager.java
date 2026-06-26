@@ -497,6 +497,126 @@ public class DatabaseManager {
         return saveDataAndReleaseLock(uuid, data, checksum, expectedVersion, fencingToken, serverName);
     }
 
+    // ==================== Phase 2: Full Blob Save + Component Cleanup ====================
+
+    /**
+     * Full Blob save + release lock + atomically clear all component rows.
+     *
+     * <p><b>Why this exists:</b> When component-storage is enabled, periodic
+     * saves write dirty components to the {@code player_component} table. If a
+     * later full Blob save (QUIT/SHUTDOWN) writes the complete player state but
+     * leaves old component rows behind, the next login would load the fresh
+     * full Blob, then overlay it with stale component rows — silently rolling
+     * back the player's state to when the component was last written.
+     *
+     * <p>This method prevents that by, in a single transaction:
+     * <ol>
+     *   <li>CAS-updating player_data with the new Blob + version+1 + clearing
+     *       the lock (same as {@link #saveDataAndReleaseLock})</li>
+     *   <li>Setting {@code component_bitmap = 0} (no components migrated)</li>
+     *   <li>Deleting all rows from {@code player_component} for this UUID</li>
+     * </ol>
+     *
+     * <p>If the CAS fails (version/fencing mismatch), the transaction is
+     * rolled back and no component rows are deleted — preserving them for
+     * diagnosis. Returns false in that case, same as {@link #saveDataAndReleaseLock}.
+     *
+     * @return true if the full Blob was saved and components cleared;
+     *         false if CAS failed (version/fencing conflict).
+     */
+    public boolean saveDataAndReleaseLockClearComponents(UUID uuid, byte[] data, long checksum,
+            long expectedVersion, long fencingToken, String serverName) throws SQLException {
+        long now = System.currentTimeMillis();
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                // 1. CAS update player_data with new Blob + clear lock + reset bitmap
+                int updated = dsl(conn).update(playerData)
+                    .set(DATA_FIELD, data)
+                    .set(VERSION_FIELD, VERSION_FIELD.plus(1))
+                    .set(CHECKSUM_FIELD, checksum)
+                    .set(LOCKED_BY_FIELD, (String) null)
+                    .set(LOCKED_AT_FIELD, (Long) null)
+                    .set(LAST_SERVER_FIELD, serverName)
+                    .set(LAST_UPDATED_FIELD, now)
+                    .set(COMPONENT_BITMAP_FIELD, 0L)
+                    .where(UUID_FIELD.eq(uuid.toString())
+                        .and(VERSION_FIELD.eq(expectedVersion))
+                        .and(FENCING_TOKEN_FIELD.eq(fencingToken))
+                        .and(LOCKED_BY_FIELD.eq(serverName)))
+                    .execute();
+
+                if (updated <= 0) {
+                    // CAS failed — don't delete components, preserve for diagnosis
+                    conn.rollback();
+                    return false;
+                }
+
+                // 2. Delete all component rows for this UUID
+                dsl(conn).deleteFrom(playerComponent)
+                    .where(UUID_FIELD.eq(uuid.toString()))
+                    .execute();
+
+                conn.commit();
+                return true;
+            } catch (SQLException | RuntimeException e) {
+                conn.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Full Blob save + keep lock + atomically clear all component rows.
+     *
+     * <p>Same as {@link #saveDataAndReleaseLockClearComponents} but keeps the
+     * lock (online/periodic save path). Used when a full Blob save happens
+     * while component-storage is enabled — the full Blob becomes the new
+     * baseline, so old component rows must be cleared to prevent stale
+     * override on next load.
+     *
+     * @return true if the full Blob was saved and components cleared;
+     *         false if CAS failed (version/fencing conflict).
+     */
+    public boolean saveDataKeepLockClearComponents(UUID uuid, byte[] data, long checksum,
+            long expectedVersion, long fencingToken, String serverName) throws SQLException {
+        long now = System.currentTimeMillis();
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                int updated = dsl(conn).update(playerData)
+                    .set(DATA_FIELD, data)
+                    .set(VERSION_FIELD, VERSION_FIELD.plus(1))
+                    .set(CHECKSUM_FIELD, checksum)
+                    .set(LAST_SERVER_FIELD, serverName)
+                    .set(LAST_UPDATED_FIELD, now)
+                    .set(LOCKED_AT_FIELD, now)
+                    .set(COMPONENT_BITMAP_FIELD, 0L)
+                    // locked_by is NOT cleared — we still hold the lock
+                    .where(UUID_FIELD.eq(uuid.toString())
+                        .and(VERSION_FIELD.eq(expectedVersion))
+                        .and(FENCING_TOKEN_FIELD.eq(fencingToken))
+                        .and(LOCKED_BY_FIELD.eq(serverName)))
+                    .execute();
+
+                if (updated <= 0) {
+                    conn.rollback();
+                    return false;
+                }
+
+                dsl(conn).deleteFrom(playerComponent)
+                    .where(UUID_FIELD.eq(uuid.toString()))
+                    .execute();
+
+                conn.commit();
+                return true;
+            } catch (SQLException | RuntimeException e) {
+                conn.rollback();
+                throw e;
+            }
+        }
+    }
+
     /**
      * Get the current fencing token for a player in the database.
      * Used for conflict diagnosis (determining if a stale lock holder tried to write).
@@ -856,11 +976,29 @@ public class DatabaseManager {
      * Upsert multiple components in a single transaction.
      * Used by the save path when multiple components are dirty.
      *
+     * <p><b>Security:</b> This method validates the player_data lock BEFORE any
+     * component write. The validation uses {@code SELECT ... FOR UPDATE} on the
+     * player_data row to lock it for the duration of the transaction, then checks
+     * that {@code locked_by = serverName} AND {@code fencing_token = fencingToken}.
+     * If either check fails, the transaction is rolled back and an exception is
+     * thrown — no component rows are written.
+     *
+     * <p>This prevents a stale lock holder (e.g. a server that lost the lock due
+     * to GC pause or heartbeat timeout) from writing component rows that would
+     * later override the fresh full Blob on load. Without this check, the
+     * component table would become a side door that bypasses the main table's
+     * fencing token / version CAS defense.
+     *
      * @return a map of {@code component name → new version} for each upserted row.
+     * @throws SQLException with message "Component save rejected: lock/fencing
+     *         mismatch" if the caller does not hold the lock with the given
+     *         fencing token.
      */
     public java.util.Map<String, Long> upsertComponentsBatch(UUID uuid,
             java.util.Map<String, byte[]> componentsWithData,
-            java.util.Map<String, Long> componentsWithChecksum) throws SQLException {
+            java.util.Map<String, Long> componentsWithChecksum,
+            String serverName,
+            long fencingToken) throws SQLException {
         if (componentsWithData == null || componentsWithData.isEmpty()) {
             return java.util.Collections.emptyMap();
         }
@@ -870,6 +1008,36 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
+                // 1. Lock the player_data row and verify the caller holds the lock
+                //    with the expected fencing token. FOR UPDATE prevents concurrent
+                //    lock holders from interfering during this transaction.
+                String lockCheckSql = String.format(
+                    "SELECT `locked_by`, `fencing_token` FROM `%s` WHERE `uuid` = ? FOR UPDATE",
+                    dataTable);
+                String lockedBy = null;
+                Long storedFencingToken = null;
+                try (var ps = conn.prepareStatement(lockCheckSql)) {
+                    ps.setString(1, uuid.toString());
+                    try (var rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            lockedBy = rs.getString("locked_by");
+                            storedFencingToken = rs.getLong("fencing_token");
+                            if (rs.wasNull()) storedFencingToken = null;
+                        }
+                    }
+                }
+
+                if (lockedBy == null
+                        || !serverName.equals(lockedBy)
+                        || storedFencingToken == null
+                        || storedFencingToken != fencingToken) {
+                    conn.rollback();
+                    throw new SQLException("Component save rejected: lock/fencing mismatch for "
+                        + uuid + " (expected: " + serverName + "/ft" + fencingToken
+                        + ", actual: " + lockedBy + "/ft" + storedFencingToken + ")");
+                }
+
+                // 2. Upsert components — now safe because we verified the lock
                 String sql = String.format("""
                     INSERT INTO `%s` (uuid, component, data, version, checksum, updated_at)
                     VALUES (?, ?, ?, 1, ?, ?)
@@ -896,7 +1064,7 @@ public class DatabaseManager {
                 }
                 conn.commit();
 
-                // Read back the new versions in one query
+                // Read back the new versions in one query (outside the lock transaction)
                 java.util.Set<String> names = componentsWithData.keySet();
                 String placeholders = String.join(",", java.util.Collections.nCopies(names.size(), "?"));
                 String selectSql = String.format(
