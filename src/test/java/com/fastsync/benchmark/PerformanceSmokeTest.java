@@ -41,23 +41,31 @@ class PerformanceSmokeTest {
     @BeforeEach
     void setUp() throws Exception {
         tempDir = Files.createTempDirectory("perf-smoke");
+        // CQ initialization is deferred to ensureCqReady() — only CQ tests call it.
+        // Non-CQ tests (LZ4, CRC32, StreamEvent) don't need Chronicle Queue.
+    }
+
+    /**
+     * Lazy CQ initialization + probe. Only called by CQ-specific tests.
+     * Skips the test if Chronicle Queue can't initialize (CI without --add-opens).
+     */
+    private void ensureCqReady() {
+        if (logManager != null) return;
         try {
             logManager = new ChronicleQueueLogManager(tempDir, 500);
             logManager.initialize();
-            // Probe: do a test append to trigger Chronicle Queue mmap initialization.
-            // If --add-opens is not configured (CI), this will fail and we skip CQ tests.
             UUID probeId = UUID.randomUUID();
             OperationLog probeLog = OperationLog.create(probeId, OperationType.SAVE,
                 "probe", 0, 0, 0, "probe");
             logManager.append(probeLog).join();
+            List<OperationLog> probeResult = logManager.queryHistory(probeId, 1);
+            if (probeResult.isEmpty()) {
+                throw new IllegalStateException("CQ probe: append succeeded but query returned empty");
+            }
         } catch (Throwable e) {
-            // Chronicle Queue requires --add-opens for sun.nio.ch on JDK 16+.
-            // In CI without proper JVM args, the mmap initialization fails.
-            // Skip CQ tests gracefully — production (Paper server) will have
-            // these JVM args configured in the startup script.
             logManager = null;
             org.junit.jupiter.api.Assumptions.assumeTrue(false,
-                "Chronicle Queue skipped (JVM --add-opens not configured): " + e.getMessage());
+                "Chronicle Queue skipped: " + e.getMessage());
         }
     }
 
@@ -79,6 +87,7 @@ class PerformanceSmokeTest {
 
     @Test
     void chronicleQueue_appendThroughput() {
+        ensureCqReady();
         UUID playerId = UUID.randomUUID();
         int count = 1000;
 
@@ -100,6 +109,7 @@ class PerformanceSmokeTest {
 
     @Test
     void chronicleQueue_queryHistoryLatency() {
+        ensureCqReady();
         UUID playerId = UUID.randomUUID();
         int count = 500;
 
@@ -135,6 +145,7 @@ class PerformanceSmokeTest {
 
     @Test
     void chronicleQueue_prunePerformance() {
+        ensureCqReady();
         UUID playerId = UUID.randomUUID();
         int count = 1000;
 
@@ -254,6 +265,7 @@ class PerformanceSmokeTest {
 
     @Test
     void chronicleQueue_concurrentAppend() throws Exception {
+        ensureCqReady();
         UUID playerId = UUID.randomUUID();
         int threadCount = 4;
         int entriesPerThread = 250;
