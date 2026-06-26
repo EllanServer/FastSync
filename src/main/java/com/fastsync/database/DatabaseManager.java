@@ -56,7 +56,9 @@ public class DatabaseManager {
     // Phase 2: per-component storage fields (table: fastsync_player_component)
     private static final Field<String> COMPONENT_NAME_FIELD = field(name("component"), String.class);
     private static final Field<Long> COMPONENT_BITMAP_FIELD = field(name("component_bitmap"), Long.class);
+    private static final Field<Long> COMPONENT_GENERATION_FIELD = field(name("component_generation"), Long.class);
     private static final Field<Long> COMPONENT_UPDATED_AT_FIELD = field(name("updated_at"), Long.class);
+    private static final Field<Long> GENERATION_FIELD = field(name("generation"), Long.class);
 
     private final Logger logger;
     private final ConfigManager config;
@@ -159,6 +161,7 @@ public class DatabaseManager {
                 `last_server` VARCHAR(64) DEFAULT NULL,
                 `last_updated` BIGINT NOT NULL DEFAULT 0,
                 `component_bitmap` BIGINT NOT NULL DEFAULT 0,
+                `component_generation` BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (`uuid`),
                 INDEX idx_locked (`locked_by`, `locked_at`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -173,18 +176,21 @@ public class DatabaseManager {
         // and checksum. The composite PK (uuid, component) gives O(1) point
         // lookups and lets us UPDATE only the changed component on save.
         //
-        // component_bitmap on player_data tracks which components have been
-        // migrated to this table — readers check the bitmap to decide whether
-        // to read from player_data.data (legacy) or player_component (new).
+        // The `generation` column tracks which full-Blob baseline this component
+        // row belongs to. On load, only rows where generation == player_data.component_generation
+        // are read — older generation rows are ignored (they belong to a previous
+        // baseline that has been superseded by a full Blob save).
         String componentTableSql = String.format("""
             CREATE TABLE IF NOT EXISTS `%s` (
                 `uuid` VARCHAR(36) NOT NULL,
                 `component` VARCHAR(32) NOT NULL,
+                `generation` BIGINT NOT NULL DEFAULT 0,
                 `data` LONGBLOB NOT NULL,
                 `version` BIGINT NOT NULL DEFAULT 0,
                 `checksum` BIGINT NOT NULL DEFAULT 0,
                 `updated_at` BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (`uuid`, `component`)
+                PRIMARY KEY (`uuid`, `component`),
+                INDEX idx_uuid_generation (`uuid`, `generation`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """, componentTable);
 
@@ -216,6 +222,12 @@ public class DatabaseManager {
             // migrated from the legacy single-Blob to the per-component table.
             // Default 0 = no components migrated yet (pure Blob mode).
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `component_bitmap` BIGINT NOT NULL DEFAULT 0", dataTable),
+            // component_generation: incremented on every full Blob save. Component
+            // rows are only read if their generation matches player_data.component_generation.
+            // This prevents stale component rows from overriding a fresh full Blob.
+            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `component_generation` BIGINT NOT NULL DEFAULT 0", dataTable),
+            // player_component: add generation column for baseline tracking
+            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `generation` BIGINT NOT NULL DEFAULT 0", componentTable),
             String.format("ALTER TABLE `%s` DROP COLUMN IF NOT EXISTS `op_seq`", dataTable)
         };
         try (Connection conn = dataSource.getConnection()) {
@@ -530,7 +542,11 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
-                // 1. CAS update player_data with new Blob + clear lock + reset bitmap
+                // CAS update player_data with new Blob + clear lock + reset bitmap
+                // + increment component_generation. The generation increment
+                // invalidates all old component rows without deleting them —
+                // on load, only rows where generation == current generation are read.
+                // Old rows can be GC'd later by a background task.
                 int updated = dsl(conn).update(playerData)
                     .set(DATA_FIELD, data)
                     .set(VERSION_FIELD, VERSION_FIELD.plus(1))
@@ -540,6 +556,7 @@ public class DatabaseManager {
                     .set(LAST_SERVER_FIELD, serverName)
                     .set(LAST_UPDATED_FIELD, now)
                     .set(COMPONENT_BITMAP_FIELD, 0L)
+                    .set(COMPONENT_GENERATION_FIELD, COMPONENT_GENERATION_FIELD.plus(1))
                     .where(UUID_FIELD.eq(uuid.toString())
                         .and(VERSION_FIELD.eq(expectedVersion))
                         .and(FENCING_TOKEN_FIELD.eq(fencingToken))
@@ -547,16 +564,13 @@ public class DatabaseManager {
                     .execute();
 
                 if (updated <= 0) {
-                    // CAS failed — don't delete components, preserve for diagnosis
                     conn.rollback();
                     return false;
                 }
 
-                // 2. Delete all component rows for this UUID
-                dsl(conn).deleteFrom(playerComponent)
-                    .where(UUID_FIELD.eq(uuid.toString()))
-                    .execute();
-
+                // Note: we do NOT delete component rows here. The generation
+                // increment makes them invisible to future loads. A background
+                // GC task can clean them up: DELETE WHERE generation < current - 1.
                 conn.commit();
                 return true;
             } catch (SQLException | RuntimeException e) {
@@ -567,15 +581,13 @@ public class DatabaseManager {
     }
 
     /**
-     * Full Blob save + keep lock + atomically clear all component rows.
+     * Full Blob save + keep lock + invalidate old component rows via generation bump.
      *
      * <p>Same as {@link #saveDataAndReleaseLockClearComponents} but keeps the
-     * lock (online/periodic save path). Used when a full Blob save happens
-     * while component-storage is enabled — the full Blob becomes the new
-     * baseline, so old component rows must be cleared to prevent stale
-     * override on next load.
+     * lock (online/periodic save path). The full Blob becomes the new baseline,
+     * so component_generation is incremented to invalidate old component rows.
      *
-     * @return true if the full Blob was saved and components cleared;
+     * @return true if the full Blob was saved;
      *         false if CAS failed (version/fencing conflict).
      */
     public boolean saveDataKeepLockClearComponents(UUID uuid, byte[] data, long checksum,
@@ -592,6 +604,7 @@ public class DatabaseManager {
                     .set(LAST_UPDATED_FIELD, now)
                     .set(LOCKED_AT_FIELD, now)
                     .set(COMPONENT_BITMAP_FIELD, 0L)
+                    .set(COMPONENT_GENERATION_FIELD, COMPONENT_GENERATION_FIELD.plus(1))
                     // locked_by is NOT cleared — we still hold the lock
                     .where(UUID_FIELD.eq(uuid.toString())
                         .and(VERSION_FIELD.eq(expectedVersion))
@@ -603,10 +616,6 @@ public class DatabaseManager {
                     conn.rollback();
                     return false;
                 }
-
-                dsl(conn).deleteFrom(playerComponent)
-                    .where(UUID_FIELD.eq(uuid.toString()))
-                    .execute();
 
                 conn.commit();
                 return true;
@@ -1107,5 +1116,309 @@ public class DatabaseManager {
             return data != null && data.length > 0;
         }
         public static ComponentData EMPTY = new ComponentData(new byte[0], 0L, 0L);
+    }
+
+    /**
+     * Result of a batch component upsert with lock validation.
+     *
+     * @param success         whether the upsert succeeded
+     * @param oldVersion      the player_data.version before this upsert
+     * @param newVersion      the player_data.version after this upsert (oldVersion + 1)
+     * @param componentBitmap the new component_bitmap (old | dirtyBits)
+     * @param generation      the current component_generation
+     * @param errorMessage    rejection reason if success=false
+     */
+    public record ComponentBatchResult(
+            boolean success,
+            long oldVersion,
+            long newVersion,
+            long componentBitmap,
+            long generation,
+            String errorMessage) {
+        public static ComponentBatchResult rejected(String msg) {
+            return new ComponentBatchResult(false, -1, -1, 0, 0, msg);
+        }
+        public static ComponentBatchResult success(long oldVersion, long newVersion,
+                long bitmap, long generation) {
+            return new ComponentBatchResult(true, oldVersion, newVersion, bitmap, generation, null);
+        }
+    }
+
+    /**
+     * Full player_data row for load path, including component storage metadata.
+     *
+     * <p>Extends {@link VersionedData} with component_bitmap and component_generation,
+     * needed by the load path to decide whether to read component rows and at
+     * which generation.
+     */
+    public record PlayerDataRow(
+            byte[] data,
+            long version,
+            long checksum,
+            long fencingToken,
+            long componentBitmap,
+            long componentGeneration) {
+        public boolean hasData() {
+            return data != null && data.length > 0;
+        }
+        public static PlayerDataRow EMPTY = new PlayerDataRow(
+            new byte[0], 0, 0, 0, 0, 0);
+    }
+
+    /**
+     * Load the full player_data row including component storage metadata.
+     *
+     * <p>This is the phase-3 replacement for {@link #loadData(UUID)} — it returns
+     * component_bitmap and component_generation so the caller can decide whether
+     * to load component rows and at which generation.
+     */
+    public PlayerDataRow loadPlayerDataRow(UUID uuid) throws SQLException {
+        try (Connection conn = dataSource.getConnection()) {
+            Record record = dsl(conn)
+                .select(DATA_FIELD, VERSION_FIELD, CHECKSUM_FIELD, FENCING_TOKEN_FIELD,
+                        COMPONENT_BITMAP_FIELD, COMPONENT_GENERATION_FIELD)
+                .from(playerData)
+                .where(UUID_FIELD.eq(uuid.toString()))
+                .fetchOne();
+
+            if (record != null) {
+                byte[] data = record.get(DATA_FIELD);
+                if (data != null && data.length > 0) {
+                    return new PlayerDataRow(
+                        data,
+                        record.get(VERSION_FIELD),
+                        record.get(CHECKSUM_FIELD),
+                        record.get(FENCING_TOKEN_FIELD),
+                        record.get(COMPONENT_BITMAP_FIELD),
+                        record.get(COMPONENT_GENERATION_FIELD));
+                }
+            }
+        }
+        return PlayerDataRow.EMPTY;
+    }
+
+    /**
+     * Load components for a player at a specific generation.
+     *
+     * <p>Only rows where {@code generation = ?} are returned. This ensures that
+     * stale component rows from a previous baseline (before a full Blob save
+     * incremented the generation) are not loaded.
+     *
+     * @param uuid           player UUID
+     * @param componentNames which components to load
+     * @param generation     the current component_generation from player_data
+     */
+    public java.util.Map<String, ComponentData> loadComponentsWithGeneration(
+            UUID uuid, java.util.Set<String> componentNames, long generation) throws SQLException {
+        if (componentNames == null || componentNames.isEmpty()) {
+            return java.util.Collections.emptyMap();
+        }
+        java.util.Map<String, ComponentData> result = new java.util.HashMap<>();
+        try (Connection conn = dataSource.getConnection()) {
+            String placeholders = String.join(",", java.util.Collections.nCopies(componentNames.size(), "?"));
+            String sql = String.format(
+                "SELECT `component`, `data`, `version`, `checksum` FROM `%s` " +
+                "WHERE `uuid` = ? AND `generation` = ? AND `component` IN (%s)",
+                componentTable);
+
+            try (var ps = conn.prepareStatement(sql)) {
+                ps.setString(1, uuid.toString());
+                ps.setLong(2, generation);
+                int i = 3;
+                for (String name : componentNames) {
+                    ps.setString(i++, name);
+                }
+                try (var rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        result.put(rs.getString("component"),
+                            new ComponentData(
+                                rs.getBytes("data"),
+                                rs.getLong("version"),
+                                rs.getLong("checksum")));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Get the current component_generation for a player.
+     */
+    public long getComponentGeneration(UUID uuid) throws SQLException {
+        try (Connection conn = dataSource.getConnection()) {
+            Long gen = dsl(conn).select(COMPONENT_GENERATION_FIELD)
+                .from(playerData)
+                .where(UUID_FIELD.eq(uuid.toString()))
+                .fetchOne(COMPONENT_GENERATION_FIELD);
+            return gen != null ? gen : 0L;
+        }
+    }
+
+    /**
+     * Phase 3: Single-transaction component upsert with full fencing validation.
+     *
+     * <p>This is the core safe component save method. In ONE database transaction:
+     * <ol>
+     *   <li>{@code SELECT player_data ... FOR UPDATE} — locks the row</li>
+     *   <li>Validate {@code locked_by = serverName} AND {@code fencing_token = fencingToken}</li>
+     *   <li>Upsert all dirty component rows WITH the current generation</li>
+     *   <li>{@code UPDATE player_data} SET {@code version = version + 1},
+     *       {@code component_bitmap = component_bitmap | dirtyBits},
+     *       {@code locked_at = now}</li>
+     *   <li>Commit</li>
+     * </ol>
+     *
+     * <p>If any validation fails, the transaction is rolled back and no component
+     * rows are written. This satisfies invariants 2, 3, and 5 from the RFC:
+     * <ul>
+     *   <li>Component writes cannot bypass locked_by + fencing_token</li>
+     *   <li>Old fencing tokens can never write component rows</li>
+     *   <li>component_bitmap and component rows are updated in the same transaction</li>
+     * </ul>
+     *
+     * <p>The method also increments player_data.version (satisfying the RFC
+     * requirement that component saves bump the global version), so the version
+     * returned in the result must be used to update the local playerVersions map.
+     *
+     * @param dirtyBits  bitmask of dirty component ordinals (for bitmap update)
+     * @return ComponentBatchResult with new version/bitmap/generation, or rejected
+     */
+    public ComponentBatchResult upsertComponentsIfLockHeld(
+            UUID uuid,
+            java.util.Map<String, byte[]> componentsWithData,
+            java.util.Map<String, Long> componentsWithChecksum,
+            String serverName,
+            long fencingToken,
+            long dirtyBits) throws SQLException {
+        if (componentsWithData == null || componentsWithData.isEmpty()) {
+            return ComponentBatchResult.rejected("no components to upsert");
+        }
+        long now = System.currentTimeMillis();
+
+        try (Connection conn = dataSource.getConnection()) {
+            boolean oldAutoCommit = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                // 1. Lock player_data row and read metadata
+                String lockSql = String.format(
+                    "SELECT `version`, `fencing_token`, `locked_by`, `component_bitmap`, `component_generation` " +
+                    "FROM `%s` WHERE `uuid` = ? FOR UPDATE", dataTable);
+
+                long currentVersion;
+                long currentBitmap;
+                long generation;
+                String lockedBy;
+                long dbFencing;
+
+                try (var ps = conn.prepareStatement(lockSql)) {
+                    ps.setString(1, uuid.toString());
+                    try (var rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            conn.rollback();
+                            conn.setAutoCommit(oldAutoCommit);
+                            return ComponentBatchResult.rejected("missing player_data row");
+                        }
+                        currentVersion = rs.getLong("version");
+                        dbFencing = rs.getLong("fencing_token");
+                        lockedBy = rs.getString("locked_by");
+                        currentBitmap = rs.getLong("component_bitmap");
+                        generation = rs.getLong("component_generation");
+                    }
+                }
+
+                // 2. Validate lock + fencing token
+                if (!serverName.equals(lockedBy) || dbFencing != fencingToken) {
+                    conn.rollback();
+                    conn.setAutoCommit(oldAutoCommit);
+                    return ComponentBatchResult.rejected("lock/fencing mismatch (expected: "
+                        + serverName + "/ft" + fencingToken
+                        + ", actual: " + lockedBy + "/ft" + dbFencing + ")");
+                }
+
+                // 3. Upsert component rows with current generation
+                String upsertSql = String.format("""
+                    INSERT INTO `%s` (uuid, component, generation, data, version, checksum, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?, ?)
+                    ON DUPLICATE KEY UPDATE
+                        generation = VALUES(generation),
+                        data = VALUES(data),
+                        version = version + 1,
+                        checksum = VALUES(checksum),
+                        updated_at = VALUES(updated_at)
+                    """, componentTable);
+
+                try (var ps = conn.prepareStatement(upsertSql)) {
+                    for (var entry : componentsWithData.entrySet()) {
+                        String name = entry.getKey();
+                        byte[] data = entry.getValue();
+                        long checksum = componentsWithChecksum.getOrDefault(name, 0L);
+                        ps.setString(1, uuid.toString());
+                        ps.setString(2, name);
+                        ps.setLong(3, generation);
+                        ps.setBytes(4, data);
+                        ps.setLong(5, checksum);
+                        ps.setLong(6, now);
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+
+                // 4. Update player_data metadata: version+1, bitmap|=dirtyBits, locked_at=now
+                long newVersion = currentVersion + 1;
+                long newBitmap = currentBitmap | dirtyBits;
+                String updateSql = String.format(
+                    "UPDATE `%s` SET `version` = ?, `component_bitmap` = ?, `locked_at` = ?, " +
+                    "`last_updated` = ?, `last_server` = ? " +
+                    "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ?",
+                    dataTable);
+
+                int updated;
+                try (var ps = conn.prepareStatement(updateSql)) {
+                    ps.setLong(1, newVersion);
+                    ps.setLong(2, newBitmap);
+                    ps.setLong(3, now);
+                    ps.setLong(4, now);
+                    ps.setString(5, serverName);
+                    ps.setString(6, uuid.toString());
+                    ps.setString(7, serverName);
+                    ps.setLong(8, fencingToken);
+                    updated = ps.executeUpdate();
+                }
+
+                if (updated <= 0) {
+                    conn.rollback();
+                    conn.setAutoCommit(oldAutoCommit);
+                    return ComponentBatchResult.rejected("failed to update player_data metadata");
+                }
+
+                conn.commit();
+                conn.setAutoCommit(oldAutoCommit);
+                return ComponentBatchResult.success(currentVersion, newVersion, newBitmap, generation);
+
+            } catch (SQLException | RuntimeException e) {
+                try { conn.rollback(); } catch (SQLException ignored) {}
+                try { conn.setAutoCommit(oldAutoCommit); } catch (SQLException ignored) {}
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Background GC: delete component rows from old generations.
+     * Safe to call periodically — only deletes rows where generation < current - 1.
+     */
+    public int gcOldComponentRows(UUID uuid, long currentGeneration) throws SQLException {
+        if (currentGeneration <= 1) return 0;
+        try (Connection conn = dataSource.getConnection()) {
+            String sql = String.format(
+                "DELETE FROM `%s` WHERE `uuid` = ? AND `generation` < ?",
+                componentTable);
+            try (var ps = conn.prepareStatement(sql)) {
+                ps.setString(1, uuid.toString());
+                ps.setLong(2, currentGeneration - 1);
+                return ps.executeUpdate();
+            }
+        }
     }
 }

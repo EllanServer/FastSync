@@ -502,13 +502,16 @@ public class SyncManager {
 
             PlayerData data = PlayerDataSerializer.deserialize(decompressed);
 
-            // Phase 2: merge per-component overrides from player_component table.
-            // If component_bitmap is non-zero, some components have been migrated to
-            // the per-component table — load them and overwrite the corresponding
-            // fields in PlayerData. This gives the freshest state: full Blob as
-            // base, component rows as overrides on top.
+            // Phase 3: merge per-component overrides from player_component table.
+            // Use loadPlayerDataRow to get component_bitmap AND component_generation,
+            // then only load component rows that match the current generation.
+            // This prevents stale component rows from a previous baseline (before
+            // a full Blob save incremented generation) from overriding the fresh Blob.
             if (config.isComponentStorageEnabled()) {
-                long bitmap = databaseManager.getComponentBitmap(uuid);
+                com.fastsync.database.DatabaseManager.PlayerDataRow row =
+                    databaseManager.loadPlayerDataRow(uuid);
+                long bitmap = row.componentBitmap();
+                long generation = row.componentGeneration();
                 if (bitmap != 0) {
                     java.util.Set<String> migratedNames = new java.util.HashSet<>();
                     for (com.fastsync.sync.dirty.ComponentDirtyMask.Component c :
@@ -518,14 +521,22 @@ public class SyncManager {
                         }
                     }
                     if (!migratedNames.isEmpty()) {
+                        // Load only components matching the current generation
                         java.util.Map<String, com.fastsync.database.DatabaseManager.ComponentData> components =
-                            databaseManager.loadComponents(uuid, migratedNames);
+                            databaseManager.loadComponentsWithGeneration(uuid, migratedNames, generation);
                         for (var entry : components.entrySet()) {
                             String name = entry.getKey();
                             byte[] compData = entry.getValue().data();
                             if (entry.getValue().hasData()) {
                                 try {
                                     byte[] decompressedComp = CompressionUtil.unwrap(compData);
+                                    // Verify component checksum before deserializing
+                                    if (config.isVerifyChecksum()
+                                            && !DatabaseManager.verifyChecksum(decompressedComp, entry.getValue().checksum())) {
+                                        logger.warning("[Load] Component checksum mismatch for "
+                                            + name + " on " + uuid + " — skipping component override");
+                                        continue;
+                                    }
                                     PlayerDataSerializer.deserializeComponent(name, decompressedComp, data);
                                 } catch (Exception e) {
                                     logger.warning("[Load] Failed to deserialize component "
@@ -534,7 +545,8 @@ public class SyncManager {
                             }
                         }
                         if (config.isDebug()) {
-                            logger.info("Merged " + components.size() + " component overrides for " + uuid);
+                            logger.info("Merged " + components.size() + " component overrides for " + uuid
+                                + " (gen=" + generation + ", bitmap=0x" + Long.toHexString(bitmap) + ")");
                         }
                     }
                 }
@@ -2220,6 +2232,9 @@ public class SyncManager {
         public static SaveResult success(long version, int size) {
             return new SaveResult(true, version, version + 1, size, null);
         }
+        public static SaveResult success(long oldVersion, long newVersion, int size) {
+            return new SaveResult(true, oldVersion, newVersion, size, null);
+        }
         public static SaveResult conflict(long expected, long actual, int size) {
             return new SaveResult(false, expected, actual, size, "version conflict");
         }
@@ -2298,27 +2313,37 @@ public class SyncManager {
             long serElapsed = (System.nanoTime() - startSer) / 1_000_000;
             if (serializeLatency != null) serializeLatency.record(serElapsed);
 
-            // Batch upsert all dirty components in one transaction.
-            // Pass serverName + fencingToken so the DB layer can verify we
-            // still hold the lock before writing any component rows.
+            // Calculate dirtyBits bitmask for component_bitmap update
+            long dirtyBits = 0L;
+            for (com.fastsync.sync.dirty.ComponentDirtyMask.Component c : dirty) {
+                if (componentBlobs.containsKey(c.name())) {
+                    dirtyBits |= (1L << c.ordinal());
+                }
+            }
+
+            // Single-transaction component upsert with fencing validation.
+            // This method does SELECT FOR UPDATE + validates locked_by/fencing_token
+            // + upserts component rows + updates player_data.version/bitmap/locked_at
+            // all in one DB transaction. If the lock was lost (GC pause, heartbeat
+            // timeout), the transaction is rolled back and no component rows are written.
             long dbStart = System.nanoTime();
-            java.util.Map<String, Long> newVersions =
-                databaseManager.upsertComponentsBatch(uuid, componentBlobs, componentChecksums,
-                    config.getServerName(), data.getFencingToken());
+            com.fastsync.database.DatabaseManager.ComponentBatchResult batchResult =
+                databaseManager.upsertComponentsIfLockHeld(
+                    uuid, componentBlobs, componentChecksums,
+                    config.getServerName(), data.getFencingToken(), dirtyBits);
             long dbElapsed = (System.nanoTime() - dbStart) / 1_000_000;
             if (saveLatency != null) saveLatency.record(dbElapsed);
 
-            // Update component_bitmap to mark newly-migrated components
-            long bitmap = databaseManager.getComponentBitmap(uuid);
-            long newBitmap = bitmap;
-            for (com.fastsync.sync.dirty.ComponentDirtyMask.Component c : dirty) {
-                if (componentBlobs.containsKey(c.name())) {
-                    newBitmap |= (1L << c.ordinal());
-                }
+            if (!batchResult.success()) {
+                logger.warning("[Component] Save rejected for " + uuid + ": " + batchResult.errorMessage());
+                return null;  // fall back to full save
             }
-            if (newBitmap != bitmap) {
-                databaseManager.setComponentBitmap(uuid, newBitmap);
-            }
+
+            // Update local version tracking with the new version from the DB.
+            // upsertComponentsIfLockHeld incremented player_data.version, so
+            // the local playerVersions map must be updated to match.
+            playerVersions.put(uuid, batchResult.newVersion());
+            data.setVersion(batchResult.newVersion());
 
             // Clear dirty flags for the components we just saved
             dirtyMask.clearDirty(uuid, dirty);
@@ -2327,17 +2352,18 @@ public class SyncManager {
                 logger.info("Component save " + kind + " for " + uuid + ": "
                     + componentBlobs.size() + " components, "
                     + totalCompressedSize + " bytes, "
-                    + "ser=" + serElapsed + "ms db=" + dbElapsed + "ms");
+                    + "ser=" + serElapsed + "ms db=" + dbElapsed + "ms"
+                    + " v" + batchResult.oldVersion() + "->v" + batchResult.newVersion()
+                    + " bitmap=0x" + Long.toHexString(batchResult.componentBitmap())
+                    + " gen=" + batchResult.generation());
             }
 
             // Log operation
             logOperation(uuid, OperationType.SAVE, data.getFencingToken(),
-                data.getVersion(), totalCompressedSize,
-                "Component save " + kind + " (" + componentBlobs.size() + " components)");
+                batchResult.newVersion(), totalCompressedSize,
+                "Component save " + kind + " (" + componentBlobs.size() + " components, gen=" + batchResult.generation() + ")");
 
-            // Component saves don't increment player_data.version — that's only
-            // bumped on full Blob saves. We report the unchanged version here.
-            return SaveResult.success(data.getVersion(), totalCompressedSize);
+            return SaveResult.success(batchResult.oldVersion(), batchResult.newVersion(), totalCompressedSize);
 
         } catch (Exception e) {
             logger.log(Level.WARNING, "Component save failed for " + uuid + ", falling back to full save", e);
@@ -2351,7 +2377,8 @@ public class SyncManager {
      */
     private boolean isComponentSyncEnabled(com.fastsync.sync.dirty.ComponentDirtyMask.Component c) {
         return switch (c) {
-            case INVENTORY, ENDER_CHEST -> config.isSyncInventory() || config.isSyncEnderChest();
+            case INVENTORY -> config.isSyncInventory();
+            case ENDER_CHEST -> config.isSyncEnderChest();
             case VITALS -> config.isSyncHealth();
             case FOOD -> config.isSyncFood();
             case EXPERIENCE -> config.isSyncExperience();
