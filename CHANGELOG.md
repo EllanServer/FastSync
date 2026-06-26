@@ -6,6 +6,20 @@
 
 ## [未发布]
 
+### 修复（第二轮审查）
+
+- **PDC 反射方法查找修正**：`getMethod()` 只找 public 方法，Paper 的 `CraftPersistentDataContainer#serializeToBytes()` 可能是 package-private → 改用 `getDeclaredMethod()` + 沿继承链向上查找
+- **applyAdvancements 使用缓存**：收集侧已缓存 `Bukkit.advancementIterator()`，但应用侧仍每次全量遍历 → 统一使用 `cachedAdvancements`
+- **saveLatency.record(0) 污染统计**：周期保存成功后仍记录 0ms → 删除该行，不再污染 p50/p99 统计
+- **snapshot.save-trigger 扩展为 cause 列表**：从 `never`/`always` 二值扩展为逗号分隔的 cause 列表（如 `death,disconnect,shutdown`）
+- **config.yml 注释澄清**：明确说明 `save-trigger: never` 时冲突路径仍无条件创建快照
+- **锁丢失唤醒后 DB 探测**：Redis Pub/Sub 消息丢失时，玩家会等待满 `lockMaxRetries × lockRetryIntervalMs`（最多 30 秒）才被踢 → 超时后先做一次 `getLockHolder(uuid)` DB 探测，如果锁已释放则立即重试，跳过 sleep
+
+### 备注
+
+- **#17 UUID → BINARY(16)**：放弃。VARCHAR(36) 索引在 InnoDB 里性能足够，改 schema 风险/收益比不划算
+- **#18 Zstd + 字典压缩**：当前 LZ4 足够快（压缩 3.6GB/s），不引入额外依赖。未来如果切到"按玩家分片同步"（小 payload 变多），考虑引入 Zstd level 3 + 预训练字典
+
 ### 性能优化
 
 - **LatencyTracker 改用环形缓冲区**：`ConcurrentLinkedDeque<Long>` → 预分配 `long[]` + `AtomicInteger` head 指针，消除装箱分配；`logStats()` 从 3 次 `toArray()+sort()` 改为单次排序

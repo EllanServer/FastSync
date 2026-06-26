@@ -153,9 +153,12 @@ snapshot:
   backup-frequency-ms: 14400000
 
   # When to create a snapshot on a successful save.
-  #   "always" - create a snapshot on every successful save (high write amplification)
-  #   "never"  - (default) do not snapshot on save; conflict-driven snapshots created
-  #              unconditionally by ConflictManager are still kept.
+  #   "never"  - (default) no snapshots on save. Conflict-driven snapshots
+  #              created by ConflictManager are STILL created unconditionally,
+  #              so conflict recovery is never lost.
+  #   "always" - create a snapshot on every successful save (high write amplification).
+  #   Comma-separated cause list, e.g. "death,disconnect,shutdown,world_save"
+  #              - only snapshot when the save cause matches one listed.
   save-trigger: "never"
 
 # ------------------------------------------------------------

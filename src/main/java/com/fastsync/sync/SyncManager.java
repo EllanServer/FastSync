@@ -217,6 +217,25 @@ public class SyncManager {
                     if (released && config.isDebug()) {
                         logger.info("Received lock release notification for " + uuid);
                     }
+                    // If the pub/sub notification was lost (e.g. listener registered
+                    // after the message was published), the lock may have already been
+                    // released in the DB. Do a quick DB probe before retrying — if the
+                    // lock is free, skip the sleep and retry immediately, avoiding up
+                    // to lockMaxRetries × lockRetryIntervalMs of unnecessary waiting.
+                    if (!released) {
+                        try {
+                            String holder = databaseManager.getLockHolder(uuid);
+                            if (holder == null || holder.isEmpty()) {
+                                // Lock is actually free — retry immediately
+                                if (config.isDebug()) {
+                                    logger.info("Lock already released in DB for " + uuid + " (pub message missed)");
+                                }
+                                continue;
+                            }
+                        } catch (SQLException probeEx) {
+                            // DB probe failed — fall through to normal retry
+                        }
+                    }
                     // Whether or not we got the notification, retry acquiring
                 } else {
                     // Fallback: sleep and retry
@@ -572,10 +591,13 @@ public class SyncManager {
                     if (saveLatency != null) saveLatency.recordError();
                 } else {
                     // Success - create snapshot only when configured to do so on save.
-                    // Conflict-driven snapshots (in ConflictManager) are always created
-                    // regardless of this setting, so defaulting to "never" still keeps
-                    // conflict-recovery snapshots while eliminating save write amplification.
-                    if (snapshotManager != null && "always".equals(config.getSnapshotSaveTrigger())) {
+                    // Snapshot creation is controlled by snapshot.save-trigger config.
+                    // Values: "never" (default, only conflict-driven snapshots),
+                    // "always" (every save), or a comma-separated cause list like
+                    // "death,disconnect,shutdown,world_save".
+                    // Conflict-driven snapshots in ConflictManager are ALWAYS created
+                    // regardless of this setting.
+                    if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {
                         snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
                             .thenRun(() -> snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots()));
                     }
@@ -848,15 +870,19 @@ public class SyncManager {
 
     private void collectPDC(Player player, PlayerData data) {
         try {
-            // Paper/CraftBukkit's PersistentDataContainer implementation has a
-            // serializeToBytes() method, but it's not exposed in the Bukkit API.
-            // We use reflection to access it, with a fallback to empty if unavailable.
             org.bukkit.persistence.PersistentDataContainer pdc = player.getPersistentDataContainer();
             if (pdc == null || pdc.isEmpty()) {
                 data.setPersistentDataContainer(new HashMap<>());
                 return;
             }
-            java.lang.reflect.Method serialize = pdc.getClass().getMethod("serializeToBytes");
+            java.lang.reflect.Method serialize = findMethod(pdc.getClass(), "serializeToBytes");
+            if (serialize == null) {
+                if (config.isDebug()) {
+                    logger.fine("[PDC] serializeToBytes not found on " + pdc.getClass().getName() + ", PDC sync disabled");
+                }
+                data.setPersistentDataContainer(new HashMap<>());
+                return;
+            }
             serialize.setAccessible(true);
             byte[] bytes = (byte[]) serialize.invoke(pdc);
             if (bytes != null && bytes.length > 0) {
@@ -866,12 +892,6 @@ public class SyncManager {
             } else {
                 data.setPersistentDataContainer(new HashMap<>());
             }
-        } catch (NoSuchMethodException e) {
-            // Paper version doesn't have serializeToBytes - PDC sync unavailable
-            if (config.isDebug()) {
-                logger.fine("[PDC] serializeToBytes not available, PDC sync disabled");
-            }
-            data.setPersistentDataContainer(new HashMap<>());
         } catch (Exception e) {
             if (config.isDebug()) {
                 logger.warning("Failed to collect PDC: " + e.getMessage());
@@ -880,14 +900,41 @@ public class SyncManager {
         }
     }
 
+    /**
+     * Walk the class hierarchy (including superclasses) to find a declared
+     * method by name, even if it is package-private or protected.
+     *
+     * <p>{@code Class.getMethod()} only finds public methods, which fails for
+     * Paper's {@code CraftPersistentDataContainer#serializeToBytes()} when it
+     * is package-private on certain versions. This method uses
+     * {@code getDeclaredMethod()} on each class in the hierarchy.
+     */
+    private static java.lang.reflect.Method findMethod(Class<?> clazz, String name, Class<?>... paramTypes) {
+        Class<?> c = clazz;
+        while (c != null && c != Object.class) {
+            try {
+                return c.getDeclaredMethod(name, paramTypes);
+            } catch (NoSuchMethodException ignored) {
+                c = c.getSuperclass();
+            }
+        }
+        return null;
+    }
+
     // ==================== Data Apply Helpers ====================
 
     @SuppressWarnings("deprecation")
     private void applyAdvancements(Player player, PlayerData data) {
         try {
-            java.util.Iterator<org.bukkit.advancement.Advancement> it = Bukkit.advancementIterator();
-            while (it.hasNext()) {
-                org.bukkit.advancement.Advancement adv = it.next();
+            // Use the cached advancement list (populated by collectAdvancements)
+            // instead of calling Bukkit.advancementIterator() again on every join.
+            if (cachedAdvancements == null) {
+                java.util.List<org.bukkit.advancement.Advancement> list = new ArrayList<>();
+                java.util.Iterator<org.bukkit.advancement.Advancement> it = Bukkit.advancementIterator();
+                while (it.hasNext()) list.add(it.next());
+                cachedAdvancements = list.toArray(new org.bukkit.advancement.Advancement[0]);
+            }
+            for (org.bukkit.advancement.Advancement adv : cachedAdvancements) {
                 String key = adv.getKey().toString();
                 Map<String, Long> criteria = data.getAdvancements().get(key);
                 if (criteria == null) continue;
@@ -1010,7 +1057,13 @@ public class SyncManager {
         }
         try {
             org.bukkit.persistence.PersistentDataContainer pdc = player.getPersistentDataContainer();
-            java.lang.reflect.Method deserialize = pdc.getClass().getMethod("deserializeBytes", byte[].class);
+            java.lang.reflect.Method deserialize = findMethod(pdc.getClass(), "deserializeBytes", byte[].class);
+            if (deserialize == null) {
+                if (config.isDebug()) {
+                    logger.fine("[PDC] deserializeBytes not found on " + pdc.getClass().getName());
+                }
+                return;
+            }
             deserialize.setAccessible(true);
             deserialize.invoke(pdc, pdcBytes);
         } catch (Exception e) {
@@ -1104,8 +1157,6 @@ public class SyncManager {
                     long actualVersion = databaseManager.getCurrentVersion(uuid);
                     conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
                     if (saveLatency != null) saveLatency.recordError();
-                } else if (saveLatency != null) {
-                    saveLatency.record(0); // periodic save, timing already tracked elsewhere
                 }
 
                 if (config.isDebug()) {
@@ -1184,6 +1235,40 @@ public class SyncManager {
     }
 
     // ==================== Helpers ====================
+
+    // ==================== Snapshot Trigger Helper ====================
+
+    /**
+     * Determine whether a snapshot should be created for the given save cause,
+     * based on the {@code snapshot.save-trigger} config value.
+     *
+     * <p>Supported values:
+     * <ul>
+     *   <li>{@code "never"} (default) — no snapshots on save; conflict-driven
+     *       snapshots in ConflictManager are still created unconditionally.</li>
+     *   <li>{@code "always"} — snapshot on every successful save.</li>
+     *   <li>Comma-separated cause list, e.g. {@code "death,disconnect,shutdown,world_save"}
+     *       — snapshot only when the save cause matches one of the listed values.</li>
+     * </ul>
+     */
+    private boolean shouldCreateSnapshot(String saveCause) {
+        String trigger = config.getSnapshotSaveTrigger();
+        if (trigger == null || trigger.isBlank() || "never".equalsIgnoreCase(trigger)) {
+            return false;
+        }
+        if ("always".equalsIgnoreCase(trigger)) {
+            return true;
+        }
+        // Cause list: "death,disconnect,shutdown"
+        if (saveCause == null) return false;
+        String[] causes = trigger.split(",");
+        for (String c : causes) {
+            if (saveCause.equalsIgnoreCase(c.trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /**
      * Normalize an ItemStack[] so empty/AIR slots become null. The array length
