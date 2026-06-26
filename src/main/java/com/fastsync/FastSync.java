@@ -162,7 +162,8 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             getLogger().info("Saving all online players (shutdown)...");
             SyncManager.SaveAllResult result = syncManager.saveAllOnlinePlayers(SyncManager.SaveKind.SHUTDOWN);
             getLogger().info("Shutdown save: " + result.success() + "/" + result.total()
-                + " succeeded" + (result.failed() > 0 ? ", " + result.failed() + " failed" : "") + ".");
+                + " succeeded" + (result.failed() > 0 ? ", " + result.failed() + " failed" : "")
+                + (result.incomplete().isEmpty() ? "." : ", incomplete/still-running=" + result.incomplete() + "."));
         }
 
         // Shut down sync manager (waits for pending saves, closes Redis + thread pool)
@@ -346,6 +347,14 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sender.sendMessage(ChatColor.YELLOW + "Async threads: " + ChatColor.WHITE +
             "active=" + syncManager.getAsyncActiveCount() +
             ", queue=" + syncManager.getAsyncQueueSize());
+        sender.sendMessage(ChatColor.YELLOW + "Final-save threads: " + ChatColor.WHITE +
+            "active=" + syncManager.getFinalSaveActiveCount() +
+            ", queue=" + syncManager.getFinalSaveQueueSize());
+        sender.sendMessage(ChatColor.YELLOW + "Fallback counters: " + ChatColor.WHITE +
+            "retired_quit_save_total=" + syncManager.getRetiredQuitSaveTotal() +
+            ", sync_fallback_save_total=" + syncManager.getSyncFallbackSaveTotal() +
+            ", sync_fallback_collect_failed_total=" + syncManager.getSyncFallbackCollectFailedTotal() +
+            ", emergency_sync_db_save_total=" + syncManager.getEmergencySyncDbSaveTotal());
         sender.sendMessage(ChatColor.YELLOW + "Compression: " +
             (configManager.isCompressionEnabled() ? ChatColor.GREEN + "LZ4" : ChatColor.RED + "Disabled"));
         sender.sendMessage(ChatColor.YELLOW + "Debug: " +

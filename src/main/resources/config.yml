@@ -26,7 +26,9 @@ database:
   pool-size: 10
   # Max tasks pending in the async executor queue (prevents OOM under login storms).
   # When full, AbortPolicy throws RejectedExecutionException.
-  # Quit saves fall back to synchronous execution; periodic saves are skipped (coalesced).
+  # Quit/shutdown saves use a separate final-save executor first.
+  # Only if that is rejected do they enter emergency synchronous fallback.
+  # Periodic saves are skipped (coalesced).
   queue-capacity: 256
   connection-timeout: 10000
   idle-timeout: 300000

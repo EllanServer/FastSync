@@ -46,7 +46,7 @@ CAS 写入主库:
 失败: 保存冲突快照, 记录 CONFLICT 日志
 ```
 
-Redis 只负责协调（通知谁该重试），数据库的 fencing token + version CAS 才是防脑裂写覆盖的真正保障。
+Redis 只负责协调（通知谁该重试）和审计/恢复事件投递（Streams 至少一次语义），不是强一致恢复层；数据库的 fencing token + version CAS 才是防脑裂写覆盖的真正保障。
 
 ## 支持的版本
 

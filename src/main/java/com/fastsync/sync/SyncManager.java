@@ -67,6 +67,7 @@ public class SyncManager {
     private final Logger logger;
 
     private AsyncExecutor asyncExecutor;
+    private AsyncExecutor finalSaveExecutor;
     private RedissonManager redissonManager;
     private SnapshotManager snapshotManager;
     private ConflictManager conflictManager;
@@ -105,6 +106,16 @@ public class SyncManager {
     private final AtomicInteger pendingSaveCount = new AtomicInteger(0);
     private final AtomicInteger pendingLoadCount = new AtomicInteger(0);
 
+    // Fallback/emergency counters exposed via status and shutdown logs.
+    private final AtomicInteger retiredQuitSaveTotal = new AtomicInteger(0);
+    private final AtomicInteger syncFallbackSaveTotal = new AtomicInteger(0);
+    private final AtomicInteger syncFallbackCollectFailedTotal = new AtomicInteger(0);
+    private final AtomicInteger emergencySyncDbSaveTotal = new AtomicInteger(0);
+
+    // Last touch time for per-UUID locks; cleanup uses this plus ReentrantLock state
+    // so it never removes a lock while a save is running or queued.
+    private final ConcurrentHashMap<UUID, Long> playerSaveLockLastUsed = new ConcurrentHashMap<>();
+
     // Cached Bukkit registries (immutable for the server lifetime) to avoid
     // re-iterating Bukkit.advancementIterator()/Attribute.values() on every save.
     private volatile org.bukkit.advancement.Advancement[] cachedAdvancements;
@@ -142,6 +153,8 @@ public class SyncManager {
         // Create dedicated thread pool (NOT ForkJoinPool.commonPool)
         int poolSize = Math.max(2, config.getPoolSize() / 2);
         asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize, config.getQueueCapacity());
+        int finalSavePoolSize = Math.max(2, Math.min(4, config.getPoolSize() / 2));
+        finalSaveExecutor = new AsyncExecutor(logger, "FastSync-FinalSave", finalSavePoolSize, config.getQueueCapacity());
 
         // Initialize snapshot system if enabled
         if (config.isSnapshotEnabled()) {
@@ -713,14 +726,16 @@ public class SyncManager {
         // preventing version conflicts from concurrent saves for the same player.
         pendingSaveCount.incrementAndGet();
         java.util.concurrent.locks.ReentrantLock saveLock =
-            playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+            getSaveLock(uuid);
         try {
-            asyncExecutor.execute(() -> {
+            finalSaveExecutor.execute(() -> {
+                touchSaveLock(uuid);
                 saveLock.lock(); // must wait — quit save must persist final state
                 try {
                     persistCollectedData(uuid, data, SaveKind.QUIT);
                 } finally {
                     saveLock.unlock();
+                    touchSaveLock(uuid);
                     // Do NOT remove lock from map — prevents lock-object split if
                     // another thread is waiting on the same lock instance.
                     // Locks are cleaned up lazily by cleanupStaleEntries().
@@ -733,8 +748,9 @@ public class SyncManager {
             // Queue full — quit save MUST NOT be lost.
             // Fallback: run synchronously on the current thread (PlayerQuitEvent
             // is on main/region thread, but this is better than losing data).
-            logger.log(Level.SEVERE, "Async executor rejected quit save for " + uuid
-                + " — running synchronously as fallback", e);
+            logger.log(Level.SEVERE, "Final-save executor rejected quit save for " + uuid
+                + " — running emergency synchronous DB fallback", e);
+            emergencySyncDbSaveTotal.incrementAndGet();
             saveLock.lock();
             try {
                 persistCollectedData(uuid, data, SaveKind.QUIT);
@@ -798,6 +814,7 @@ public class SyncManager {
             // The DB still contains the last successfully saved version (from
             // periodic save or initial load), so no data is lost — it's just
             // not the very latest state.
+            syncFallbackCollectFailedTotal.incrementAndGet();
             logger.log(Level.SEVERE, "Failed to collect data for " + uuid
                 + " in sync fallback — NOT releasing lock. The lock will expire"
                 + " after " + config.getLockTimeout() + "s. Manual recovery may be needed."
@@ -811,9 +828,12 @@ public class SyncManager {
 
         activePlayers.remove(uuid);
 
+        retiredQuitSaveTotal.incrementAndGet();
+        syncFallbackSaveTotal.incrementAndGet();
+
         // Save synchronously with per-UUID lock to avoid races with any in-flight save
         java.util.concurrent.locks.ReentrantLock saveLock =
-            playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+            getSaveLock(uuid);
         saveLock.lock();
         try {
             persistCollectedData(uuid, data, SaveKind.QUIT);
@@ -1226,17 +1246,6 @@ public class SyncManager {
     // ==================== Periodic Save ====================
 
     /**
-     * Save all online players' data (for periodic saves and shutdown).
-     *
-     * <p>Data collection happens on the calling thread because Bukkit's player API
-     * is not thread-safe (during shutdown this is the main thread). The expensive
-     * serialization and database write for each player is dispatched to the async
-     * executor and run in parallel, and we block on
-     * {@code CompletableFuture.allOf(...).join()} so that shutdown does not return
-     * until every save has completed. This avoids saving every player synchronously
-     * on the main thread, which would hang the server during shutdown.
-     */
-    /**
      * Save all online players' data synchronously (for shutdown / /fastsync saveall).
      *
      * <p><b>Folia-safe:</b> Data collection is dispatched per-player via
@@ -1252,6 +1261,7 @@ public class SyncManager {
         int success = 0;
         int failed = 0;
         Map<UUID, String> failures = new HashMap<>();
+        java.util.Set<UUID> incomplete = new java.util.HashSet<>();
         List<Map.Entry<UUID, CompletableFuture<SaveResult>>> futures = new ArrayList<>();
         Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
 
@@ -1268,16 +1278,19 @@ public class SyncManager {
                     PlayerData data = collectPlayerData(player);
                     pendingSaveCount.incrementAndGet();
                     java.util.concurrent.locks.ReentrantLock saveLock =
-                        playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+                        getSaveLock(uuid);
                     try {
-                        asyncExecutor.execute(() -> {
+                        AsyncExecutor executor = kind.releaseLock ? finalSaveExecutor : asyncExecutor;
+                        executor.execute(() -> {
                             SaveResult result;
                             try {
+                                touchSaveLock(uuid);
                                 saveLock.lock();
                                 try {
                                     result = persistCollectedData(uuid, data, kind);
                                 } finally {
                                     saveLock.unlock();
+                                    touchSaveLock(uuid);
                                 }
                             } catch (Exception e) {
                                 result = SaveResult.error(e.getMessage());
@@ -1310,7 +1323,8 @@ public class SyncManager {
             long remaining = deadlineMs - (System.currentTimeMillis() - deadlineStart);
             if (remaining <= 0) {
                 failed++;
-                failures.put(uuid, "global deadline exceeded");
+                failures.put(uuid, "global deadline exceeded (save may still be running)");
+                incomplete.add(uuid);
                 continue;
             }
             try {
@@ -1324,7 +1338,8 @@ public class SyncManager {
             } catch (java.util.concurrent.TimeoutException e) {
                 logger.warning(kind + ": global deadline exceeded waiting for " + uuid);
                 failed++;
-                failures.put(uuid, "timeout");
+                failures.put(uuid, "timeout (save may still be running)");
+                incomplete.add(uuid);
             } catch (Exception e) {
                 failed++;
                 failures.put(uuid, e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
@@ -1332,12 +1347,13 @@ public class SyncManager {
         }
 
         if (failed > 0) {
-            logger.warning(kind + ": " + success + "/" + total + " succeeded, " + failed + " failed.");
+            logger.warning(kind + ": " + success + "/" + total + " succeeded, " + failed + " failed"
+                + (incomplete.isEmpty() ? "." : "; incomplete/still-running=" + incomplete + "."));
         } else {
             logger.info(kind + ": saved data for all " + total + " online players.");
         }
 
-        return new SaveAllResult(total, success, failed, failures);
+        return new SaveAllResult(total, success, failed, failures, incomplete);
     }
 
     /** Backward-compatible overload: defaults to BULK (keep lock, for /saveall command). */
@@ -1376,7 +1392,7 @@ public class SyncManager {
 
             pendingSaveCount.incrementAndGet();
             java.util.concurrent.locks.ReentrantLock saveLock =
-                playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+                getSaveLock(uuid);
             try {
                 asyncExecutor.execute(() -> {
                     // Online save: skip if a save is already in progress for this player.
@@ -1490,10 +1506,24 @@ public class SyncManager {
             }
         });
 
-        // Clean up save locks for players no longer active (quit > 5 min ago).
+        // Clean up save locks for players no longer active (unused > 10 min).
         // This prevents unbounded growth of the playerSaveLocks map.
-        playerSaveLocks.keySet().removeIf(uuid -> !activePlayers.containsKey(uuid)
-            && !pendingData.containsKey(uuid) && !pendingEmptyData.contains(uuid));
+        playerSaveLocks.entrySet().removeIf(entry -> {
+            UUID uuid = entry.getKey();
+            java.util.concurrent.locks.ReentrantLock lock = entry.getValue();
+            long lastUsed = playerSaveLockLastUsed.getOrDefault(uuid, 0L);
+            boolean stale = (now - lastUsed) > 10 * 60 * 1000;
+            boolean removable = stale
+                && !activePlayers.containsKey(uuid)
+                && !pendingData.containsKey(uuid)
+                && !pendingEmptyData.contains(uuid)
+                && !lock.isLocked()
+                && !lock.hasQueuedThreads();
+            if (removable) {
+                playerSaveLockLastUsed.remove(uuid);
+            }
+            return removable;
+        });
     }
 
     // ==================== Shutdown ====================
@@ -1505,8 +1535,15 @@ public class SyncManager {
         // Log final latency stats before shutdown
         logLatencyStats();
 
-        // Wait for pending saves first
+        // Wait for pending saves first. If any remain, make the shutdown
+        // state explicit before closing Redis/executors/database so operators
+        // know these saves are incomplete/still running, not silently ignored.
         waitForPendingSaves(5000);
+        int remainingSaves = pendingSaveCount.get();
+        if (remainingSaves > 0) {
+            logger.severe("Shutdown continuing with " + remainingSaves
+                + " pending save(s) still incomplete before resource close.");
+        }
 
         // Close Redis (Redisson: Pub/Sub + Streams unified, publishes SERVER_STOP)
         if (redissonManager != null) {
@@ -1521,6 +1558,10 @@ public class SyncManager {
         }
 
         // Shut down thread pool
+        if (finalSaveExecutor != null) {
+            finalSaveExecutor.shutdown(10);
+            finalSaveExecutor = null;
+        }
         if (asyncExecutor != null) {
             asyncExecutor.shutdown(10);
             asyncExecutor = null;
@@ -1534,6 +1575,15 @@ public class SyncManager {
      * Uses compute() with Math.max to handle the race between periodic save
      * advancing to v+1 and quit save having already set a higher version.
      */
+    private void touchSaveLock(UUID uuid) {
+        playerSaveLockLastUsed.put(uuid, System.currentTimeMillis());
+    }
+
+    private java.util.concurrent.locks.ReentrantLock getSaveLock(UUID uuid) {
+        touchSaveLock(uuid);
+        return playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+    }
+
     private void advanceVersion(UUID uuid, long savedVersion) {
         playerVersions.compute(uuid, (k, current) -> {
             if (current == null) return null; // player already cleaned up (quit)
@@ -1571,7 +1621,11 @@ public class SyncManager {
 
     /** Result of a bulk saveAll operation, returned to the command layer. */
     public record SaveAllResult(int total, int success, int failed,
-                                Map<UUID, String> failures) {
+                                Map<UUID, String> failures, java.util.Set<UUID> incomplete) {
+        public SaveAllResult {
+            failures = java.util.Collections.unmodifiableMap(new java.util.HashMap<>(failures));
+            incomplete = java.util.Collections.unmodifiableSet(new java.util.HashSet<>(incomplete));
+        }
         public boolean allSucceeded() { return failed == 0; }
     }
 
@@ -1862,6 +1916,19 @@ public class SyncManager {
     public int getAsyncQueueSize() {
         return asyncExecutor != null ? asyncExecutor.getQueueSize() : -1;
     }
+
+    public int getFinalSaveActiveCount() {
+        return finalSaveExecutor != null ? finalSaveExecutor.getActiveCount() : -1;
+    }
+
+    public int getFinalSaveQueueSize() {
+        return finalSaveExecutor != null ? finalSaveExecutor.getQueueSize() : -1;
+    }
+
+    public int getRetiredQuitSaveTotal() { return retiredQuitSaveTotal.get(); }
+    public int getSyncFallbackSaveTotal() { return syncFallbackSaveTotal.get(); }
+    public int getSyncFallbackCollectFailedTotal() { return syncFallbackCollectFailedTotal.get(); }
+    public int getEmergencySyncDbSaveTotal() { return emergencySyncDbSaveTotal.get(); }
 
     /**
      * Log an operation to the per-UUID operation log (Raft-inspired).
