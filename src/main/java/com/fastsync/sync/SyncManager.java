@@ -2520,6 +2520,15 @@ public class SyncManager {
             // 5b. Success: advance version + log + snapshot + publish
             advanceVersion(uuid, expectedVersion);
 
+            // Full Blob save contains the latest state of all enabled components,
+            // so all dirty flags can be cleared. Without this, a player who was
+            // once marked dirty would stay dirty forever (in component-storage=false
+            // mode), causing every subsequent periodic save to do a full collect +
+            // serialize + DB write — defeating the dirty tracking optimization.
+            if (dirtyMask != null) {
+                dirtyMask.clearAll(uuid);
+            }
+
                 if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {
                     snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
                         .thenRun(() -> snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots()));

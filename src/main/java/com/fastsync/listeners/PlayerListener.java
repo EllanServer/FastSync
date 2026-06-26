@@ -49,16 +49,21 @@ public class PlayerListener implements Listener {
         SyncManager.LoadResult result = syncManager.loadPlayerData(uuid);
 
         if (!result.isSuccess()) {
+            String msg;
             if (result.getStatus() == SyncManager.LoadResult.Status.LOCKED) {
-                String msg = ChatColor.translateAlternateColorCodes('&',
-                    plugin.getConfigManager().getLockTimeoutKickMessage());
-                event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, msg);
+                msg = plugin.getConfigManager().getLockTimeoutKickMessage();
+            } else if (result.getStatus() == SyncManager.LoadResult.Status.BUSY) {
+                // Login backpressure: too many concurrent loads. Use the
+                // dedicated busy-kick-message so players know to retry.
+                msg = plugin.getConfigManager().getBusyKickMessage();
             } else {
                 plugin.getLogger().warning("Failed to load data for " + uuid + ": " + result.getMessage());
-                String msg = ChatColor.translateAlternateColorCodes('&',
-                    plugin.getConfigManager().getLoadFailKickMessage());
-                event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, msg);
+                msg = plugin.getConfigManager().getLoadFailKickMessage();
             }
+            event.disallow(
+                AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                ChatColor.translateAlternateColorCodes('&', msg)
+            );
         }
     }
 

@@ -614,13 +614,18 @@ public class RedissonManager {
                 return false;
             }
             // Lightweight health probe — Redisson 4.6.1 doesn't expose a direct
-            // pingAll() on RedissonClient. Use a bucket isExists() check which
-            // does a single Redis EXISTS command (1 round-trip).
-            // This verifies the connection is actually usable, not just that
-            // the client object isn't shut down.
-            cachedHealthy = c.getBucket("fastsync:health:" + serverName).isExists();
+            // pingAll() on RedissonClient. Use a bucket get() which does a single
+            // Redis GET command (1 round-trip).
+            //
+            // IMPORTANT: We use get(), not isExists(). isExists() returns false when
+            // the key doesn't exist, which would falsely report Redis as unhealthy
+            // on a fresh install where the health key was never created. The correct
+            // semantic is "the command succeeded" — if GET returns without throwing,
+            // the connection is usable, regardless of whether the key exists.
+            c.getBucket("fastsync:health:" + serverName).get();
+            cachedHealthy = true;
             lastHealthCheckMs = now;
-            return cachedHealthy;
+            return true;
         } catch (Exception e) {
             cachedHealthy = false;
             lastHealthCheckMs = now;

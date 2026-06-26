@@ -45,8 +45,10 @@ public class DataListener implements Listener {
         }
 
         Player player = event.getEntity();
-        // saveCause: "death"
-        syncManager.savePlayerAsync(player);
+        // Pass SaveKind.DEATH so that snapshot.save-trigger: "death" works,
+        // operation logs record the correct cause, and dirty/component
+        // strategies can distinguish death saves from periodic saves.
+        syncManager.savePlayerAsync(player, SyncManager.SaveKind.DEATH);
 
         if (config.isDebug()) {
             logger.info("[FastSync] Saved data for " + player.getUniqueId() + " on death.");
@@ -63,8 +65,9 @@ public class DataListener implements Listener {
         }
 
         for (Player player : Bukkit.getOnlinePlayers()) {
-            // saveCause: "world_save"
-            syncManager.savePlayerAsync(player);
+            // Pass SaveKind.WORLD_SAVE so that snapshot.save-trigger: "world_save"
+            // works and operation logs record the correct cause.
+            syncManager.savePlayerAsync(player, SyncManager.SaveKind.WORLD_SAVE);
         }
 
         if (config.isDebug()) {
