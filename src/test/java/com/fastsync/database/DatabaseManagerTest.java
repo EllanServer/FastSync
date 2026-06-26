@@ -40,7 +40,7 @@ class DatabaseManagerTest {
     private static final Logger LOGGER = Logger.getLogger(DatabaseManagerTest.class.getName());
 
     private static boolean dockerAvailable;
-    private static MySQLContainer<?> mysql;
+    private static MySQLContainer mysql;
 
     private DatabaseManager databaseManager;
     private ConfigManager config;
@@ -54,7 +54,7 @@ class DatabaseManagerTest {
         }
 
         LOGGER.info("Starting MySQL container for integration tests...");
-        mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.4"))
+        mysql = new MySQLContainer(DockerImageName.parse("mysql:8.4"))
                 .withDatabaseName("fastsync_test")
                 .withUsername("test")
                 .withPassword("test");
