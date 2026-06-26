@@ -114,6 +114,14 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
         if (data == null || data.length == 0) return;
         PersistentDataContainer pdc = player.getPersistentDataContainer();
 
+        // Clear all registered keys before restore to prevent "ghost keys" —
+        // keys that exist on the target server but were removed on the source
+        // server. Without this clear, stale PDC values from a previous session
+        // on this server would persist after the restore.
+        for (NamespacedKey registeredKey : registeredKeys.keySet()) {
+            pdc.remove(registeredKey);
+        }
+
         try (var bais = new ByteArrayInputStream(data);
              var in = new DataInputStream(bais)) {
             int count = in.readInt();

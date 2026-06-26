@@ -221,9 +221,13 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 }
                 // Restart heartbeat task — interval may have changed
                 restartHeartbeatTask();
-                // Reset protection mode on reload — gives operator a way to
-                // recover without restarting the server
-                syncManager.resetProtectionMode();
+                // Reset protection mode on reload — only if DB is healthy
+                boolean resetOk = syncManager.resetProtectionMode();
+                if (resetOk) {
+                    sender.sendMessage(ChatColor.GREEN + "[FastSync] Protection mode reset.");
+                } else {
+                    sender.sendMessage(ChatColor.RED + "[FastSync] Protection mode still active: database is unhealthy.");
+                }
                 sender.sendMessage(ChatColor.GREEN + "[FastSync] Configuration reloaded.");
                 sender.sendMessage(ChatColor.GRAY + "Server: " + configManager.getServerName());
                 sender.sendMessage(ChatColor.GRAY + "Compression: " +

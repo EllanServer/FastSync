@@ -93,6 +93,7 @@ public class RedissonManager {
     private final String serverName;
     private final boolean ssl;
     private final int timeout;
+    private final boolean streamsEnabled;
 
     private volatile boolean debug = false;
 
@@ -125,7 +126,7 @@ public class RedissonManager {
      */
     public RedissonManager(String host, int port, String password, int database,
                            String serverName, String clusterId, String channelPrefix,
-                           boolean ssl, int timeout) {
+                           boolean ssl, int timeout, boolean streamsEnabled) {
         this.host = host;
         this.port = port;
         this.password = password;
@@ -133,6 +134,7 @@ public class RedissonManager {
         this.serverName = serverName;
         this.ssl = ssl;
         this.timeout = timeout;
+        this.streamsEnabled = streamsEnabled;
 
         // Build namespace-aware names to prevent cross-cluster message mixing
         // when multiple FastSync deployments share the same Redis.
@@ -154,7 +156,7 @@ public class RedissonManager {
      * Legacy constructor without namespace isolation or SSL/timeout (uses "default" cluster, no TLS).
      */
     public RedissonManager(String host, int port, String password, int database, String serverName) {
-        this(host, port, password, database, serverName, "", "", false, 5000);
+        this(host, port, password, database, serverName, "", "", false, 5000, true);
     }
 
     /**
@@ -196,32 +198,36 @@ public class RedissonManager {
         lockTopic = client.getTopic(lockTopicName, StringCodec.INSTANCE);
         lockTopic.addListener(String.class, (channel, msg) -> onLockMessage(msg));
 
-        // ---- Streams: String,String entries so StreamEvent.toMap()/fromMap() round-trip cleanly ----
-        stream = client.getStream(streamKeyName, StringCodec.INSTANCE);
+        if (streamsEnabled) {
+            // ---- Streams: String,String entries so StreamEvent.toMap()/fromMap() round-trip cleanly ----
+            stream = client.getStream(streamKeyName, StringCodec.INSTANCE);
 
-        createConsumerGroup();
-        recoverPendingEntries();
+            createConsumerGroup();
+            recoverPendingEntries();
 
-        // IMPORTANT: create dispatcher BEFORE starting the consumer loop.
-        // If messages exist in the stream, the consumer may immediately try to
-        // dispatch them via messageDispatcher — if it's null, that's an NPE.
-        messageDispatcher = Executors.newFixedThreadPool(2, r -> {
-            Thread t = new Thread(r, "FastSync-Stream-Dispatcher");
-            t.setDaemon(true);
-            return t;
-        });
+            // IMPORTANT: create dispatcher BEFORE starting the consumer loop.
+            // If messages exist in the stream, the consumer may immediately try to
+            // dispatch them via messageDispatcher — if it's null, that's an NPE.
+            messageDispatcher = Executors.newFixedThreadPool(2, r -> {
+                Thread t = new Thread(r, "FastSync-Stream-Dispatcher");
+                t.setDaemon(true);
+                return t;
+            });
 
-        running.set(true);
-        consumerExecutor = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "FastSync-Stream-Consumer");
-            t.setDaemon(true);
-            return t;
-        });
-        consumerExecutor.submit(this::consumeLoop);
+            running.set(true);
+            consumerExecutor = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "FastSync-Stream-Consumer");
+                t.setDaemon(true);
+                return t;
+            });
+            consumerExecutor.submit(this::consumeLoop);
 
-        // Announce this server is up and ready to accept players.
-        publish(StreamEvent.create(StreamEventType.SERVER_START, null, serverName,
-            "", 0, 0, "Server started"));
+            // Announce this server is up and ready to accept players.
+            publish(StreamEvent.create(StreamEventType.SERVER_START, null, serverName,
+                "", 0, 0, "Server started"));
+        } else {
+            LOGGER.info("[Redisson] Redis Streams disabled by config — using Pub/Sub only.");
+        }
 
         LOGGER.info("[Redisson] Redis connected: " + host + ":" + port + " (db=" + database
             + ", topic=" + lockTopicName + ", stream=" + streamKeyName + ").");
@@ -394,8 +400,20 @@ public class RedissonManager {
      * Runs on a daemon thread and blocks up to {@link #BLOCK_MS} per read.
      */
     private void consumeLoop() {
+        int tickCount = 0;
+        // Run autoClaim every ~60 seconds (assuming BLOCK_MS=2000, so ~30 iterations).
+        final int AUTOCLAIM_INTERVAL_TICKS = 30;
+
         while (running.get()) {
             try {
+                // Periodic autoClaim: reclaims messages from crashed/lost consumers.
+                // Runs every N iterations to continuously recover pending entries,
+                // not just at startup.
+                if (tickCount % AUTOCLAIM_INTERVAL_TICKS == 0) {
+                    recoverPendingEntries();
+                }
+                tickCount++;
+
                 Map<StreamMessageId, Map<String, String>> messages = stream.readGroup(
                     consumerGroupName, serverName,
                     StreamReadGroupArgs.neverDelivered()
@@ -445,31 +463,38 @@ public class RedissonManager {
      * are skipped to avoid re-processing our own broadcasts.
      */
     private void handleStreamMessage(StreamMessageId id, Map<String, String> body) {
+        StreamEvent event;
         try {
-            StreamEvent event = StreamEvent.fromMap(id.toString(), body);
-
-            if (serverName.equals(event.server())) {
-                if (debug) {
-                    LOGGER.info("[Redisson] Skipping own event: " + event.type()
-                        + " (id=" + event.id() + ")");
-                }
-                return;
-            }
-
-            if (debug) {
-                LOGGER.info("[Redisson] Received " + event.type() + " from " + event.server()
-                    + " (id=" + event.id() + ", uuid=" + event.uuid() + ")");
-            }
-
-            for (StreamEventListener listener : listeners) {
-                try {
-                    listener.onEvent(event);
-                } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "[Redisson] Stream listener exception for event " + event.id(), e);
-                }
-            }
+            event = StreamEvent.fromMap(id.toString(), body);
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "[Redisson] Failed to handle stream message " + id, e);
+            LOGGER.log(Level.WARNING, "[Redisson] Failed to parse stream message " + id, e);
+            throw new RuntimeException("Failed to parse stream message", e);
+        }
+
+        if (serverName.equals(event.server())) {
+            if (debug) {
+                LOGGER.info("[Redisson] Skipping own event: " + event.type()
+                    + " (id=" + event.id() + ")");
+            }
+            return;
+        }
+
+        if (debug) {
+            LOGGER.info("[Redisson] Received " + event.type() + " from " + event.server()
+                + " (id=" + event.id() + ", uuid=" + event.uuid() + ")");
+        }
+
+        // Dispatch to all listeners. If ANY listener throws, we re-throw so
+        // the caller (consumeLoop / recoverPendingEntries) does NOT ack the
+        // message — it stays in the PEL for reprocessing.
+        for (StreamEventListener listener : listeners) {
+            try {
+                listener.onEvent(event);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "[Redisson] Stream listener exception for event " + event.id()
+                    + " — message will NOT be acked (stays in PEL for retry)", e);
+                throw new RuntimeException("Listener failed for event " + event.id(), e);
+            }
         }
     }
 
@@ -482,31 +507,52 @@ public class RedissonManager {
      * reprocessed, then acknowledged.
      */
     private void recoverPendingEntries() {
-        try {
-            AutoClaimResult<String, String> claimed = stream.autoClaim(
-                consumerGroupName, serverName,
-                AUTOCLAIM_IDLE_MS, TimeUnit.MILLISECONDS,
-                StreamMessageId.ALL, MAX_RECLAIM_PER_CYCLE);
+        int totalRecovered = 0;
+        // Loop until no more pending entries to reclaim. Previously this only
+        // ran once with MAX_RECLAIM_PER_CYCLE=10, leaving entries unprocessed
+        // if a crash accumulated more than 10 pending messages.
+        while (true) {
+            try {
+                AutoClaimResult<String, String> claimed = stream.autoClaim(
+                    consumerGroupName, serverName,
+                    AUTOCLAIM_IDLE_MS, TimeUnit.MILLISECONDS,
+                    StreamMessageId.ALL, MAX_RECLAIM_PER_CYCLE);
 
-            Map<StreamMessageId, Map<String, String>> messages = claimed.getMessages();
-            if (messages == null || messages.isEmpty()) {
-                return;
-            }
-
-            LOGGER.info("[Redisson] Recovered " + messages.size()
-                + " pending entries from previous crash.");
-            for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
-                try {
-                    handleStreamMessage(entry.getKey(), entry.getValue());
-                    // Only ack on success — failed entries stay in PEL for next cycle
-                    stream.ack(consumerGroupName, entry.getKey());
-                } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entry " + entry.getKey()
-                        + " — will retry on next autoClaim cycle", e);
+                Map<StreamMessageId, Map<String, String>> messages = claimed.getMessages();
+                if (messages == null || messages.isEmpty()) {
+                    break; // No more pending entries
                 }
+
+                if (totalRecovered == 0) {
+                    LOGGER.info("[Redisson] Recovering pending entries from previous crash...");
+                }
+
+                for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
+                    try {
+                        handleStreamMessage(entry.getKey(), entry.getValue());
+                        // Only ack on success — failed entries stay in PEL for next cycle
+                        stream.ack(consumerGroupName, entry.getKey());
+                        totalRecovered++;
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entry " + entry.getKey()
+                            + " — will retry on next autoClaim cycle", e);
+                    }
+                }
+
+                // If we got fewer than MAX_RECLAIM_PER_CYCLE, there are no more
+                if (messages.size() < MAX_RECLAIM_PER_CYCLE) {
+                    break;
+                }
+            } catch (Exception e) {
+                if (totalRecovered == 0) {
+                    LOGGER.log(Level.FINE, "[Redisson] No pending entries to recover or autoClaim failed.", e);
+                }
+                break;
             }
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entries", e);
+        }
+        if (totalRecovered > 0) {
+            LOGGER.info("[Redisson] Recovered " + totalRecovered
+                + " pending entries from previous crash.");
         }
     }
 

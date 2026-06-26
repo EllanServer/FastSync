@@ -108,6 +108,11 @@ public class SyncManager {
     // skips the save, only releasing the lock if it somehow still belongs to us.
     private final java.util.Set<UUID> quarantinedPlayers = ConcurrentHashMap.newKeySet();
 
+    // Players who failed the join handshake (no preloaded data, or missing
+    // version/fencing token). They are kicked immediately and must NOT be
+    // saved via the normal QUIT path — they never had a valid lock.
+    private final java.util.Set<UUID> failedJoinPlayers = ConcurrentHashMap.newKeySet();
+
     // Anti-reentry guard for heartbeat — prevents overlapping heartbeat cycles
     // when DB latency causes the previous cycle to exceed the interval.
     private final AtomicBoolean heartbeatRunning = new AtomicBoolean(false);
@@ -177,7 +182,7 @@ public class SyncManager {
                     config.getRedisHost(), config.getRedisPort(),
                     config.getRedisPassword(), config.getRedisDatabase(),
                     config.getServerName(), config.getClusterId(), config.getRedisChannelPrefix(),
-                    config.isRedisSsl(), config.getRedisTimeout());
+                    config.isRedisSsl(), config.getRedisTimeout(), config.isStreamsEnabled());
                 // Register listener BEFORE initialize() — initialize() starts the
                 // consumer loop and recovers pending entries, which can dispatch
                 // stream events immediately. If the listener isn't registered yet,
@@ -335,6 +340,9 @@ public class SyncManager {
      * @return LoadResult indicating success, locked, or error
      */
     public LoadResult loadPlayerData(UUID uuid) {
+        if (protectionMode) {
+            return LoadResult.protection("FastSync protection mode is active");
+        }
         pendingLoadCount.incrementAndGet();
         try {
             return loadPlayerDataInternal(uuid);
@@ -451,13 +459,13 @@ public class SyncManager {
                     "Checksum mismatch: stored=" + loaded.checksum());
 
                 if (loadLatency != null) loadLatency.recordError();
-                try {
-                    databaseManager.releaseLock(uuid, config.getServerName());
-                    notifyLockReleased(uuid);
-                } catch (SQLException ex) {
-                    logger.log(Level.WARNING, "Failed to release lock after checksum failure for " + uuid, ex);
-                }
-                return LoadResult.error("Data checksum mismatch - possible corruption");
+            try {
+                databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                notifyLockReleased(uuid);
+            } catch (SQLException ex) {
+                logger.log(Level.WARNING, "Failed to release lock after checksum failure for " + uuid, ex);
+            }
+            return LoadResult.error("Data checksum mismatch - possible corruption");
             }
 
             PlayerData data = PlayerDataSerializer.deserialize(decompressed);
@@ -492,16 +500,20 @@ public class SyncManager {
             return LoadResult.success();
 
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "Failed to load data for " + uuid, e);
-            // Release lock on error
-            try {
+        logger.log(Level.SEVERE, "Failed to load data for " + uuid, e);
+        // Release lock on error — use token version if we have a valid token
+        try {
+            if (fencingToken > 0) {
+                databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+            } else {
                 databaseManager.releaseLock(uuid, config.getServerName());
-                notifyLockReleased(uuid);
-            } catch (SQLException ex) {
-                logger.log(Level.WARNING, "Failed to release lock after load error for " + uuid, ex);
             }
-            return LoadResult.error(e.getMessage());
+            notifyLockReleased(uuid);
+        } catch (SQLException ex) {
+            logger.log(Level.WARNING, "Failed to release lock after load error for " + uuid, ex);
         }
+        return LoadResult.error(e.getMessage());
+    }
     }
 
     // ==================== Apply (Join) ====================
@@ -517,14 +529,41 @@ public class SyncManager {
         pendingLoadTimes.remove(uuid);
 
         if (data == null) {
-            // New player or no saved data - nothing to apply
-            if (config.isDebug()) {
-                logger.info("No pending data to apply for " + uuid
-                    + (hadEmptyData ? " (new player)" : " (no preloaded data)"));
+        if (hadEmptyData) {
+            // New player with empty data — verify we have a valid fencing token.
+            // Without it, saves would use version=0/fencingToken=0 and corrupt data.
+            Long version = playerVersions.get(uuid);
+            Long fencingToken = playerFencingTokens.get(uuid);
+            if (version == null || fencingToken == null || fencingToken <= 0) {
+                logger.severe("[FastSync] Empty-data player joined without valid version/fencing token: " + uuid);
+                failedJoinPlayers.add(uuid);
+                activePlayers.remove(uuid);
+                player.kick(net.kyori.adventure.text.Component.text(
+                    "[FastSync] Failed to prepare your data. Please reconnect.",
+                    net.kyori.adventure.text.format.NamedTextColor.RED));
+                return;
             }
             activePlayers.put(uuid, true);
+            if (config.isDebug()) {
+                logger.info("No saved data to apply for " + uuid + " (new player, v"
+                    + version + ", ft=" + fencingToken + ")");
+            }
             return;
         }
+        // No pending data AND not empty-data — this means the pre-login load
+        // failed silently or the player bypassed the normal flow. Must NOT
+        // mark active — the player has no valid fencing token.
+        logger.severe("[FastSync] Player joined without preloaded data: " + uuid
+            + " — refusing to mark active.");
+        failedJoinPlayers.add(uuid);
+        activePlayers.remove(uuid);
+        playerVersions.remove(uuid);
+        playerFencingTokens.remove(uuid);
+        player.kick(net.kyori.adventure.text.Component.text(
+            "[FastSync] Failed to prepare your data. Please reconnect.",
+            net.kyori.adventure.text.format.NamedTextColor.RED));
+        return;
+    }
 
         long startTime = config.isLogTiming() ? System.nanoTime() : 0;
 
@@ -716,20 +755,75 @@ public class SyncManager {
     public void collectAndSavePlayerData(Player player) {
         UUID uuid = player.getUniqueId();
 
+        // Check failed-join players — they never became active with a valid lock.
+        // The kick from applyPlayerData triggers PlayerQuitEvent, so we must
+        // intercept here to prevent a save with invalid version/fencingToken.
+        if (failedJoinPlayers.remove(uuid)) {
+            logger.warning("[Quit] Skipping save for failed-join player " + uuid
+                + " — player never became active with a valid lock.");
+            activePlayers.remove(uuid);
+            pendingData.remove(uuid);
+            pendingEmptyData.remove(uuid);
+            pendingLoadTimes.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
+            playerVersions.remove(uuid);
+            if (ft != null && ft > 0) {
+                pendingSaveCount.incrementAndGet();
+                try {
+                    asyncExecutor.execute(() -> {
+                        try {
+                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                            notifyLockReleased(uuid);
+                        } catch (SQLException e) {
+                            logger.log(Level.WARNING, "Failed to release lock for failed-join player " + uuid, e);
+                        } finally {
+                            pendingSaveCount.decrementAndGet();
+                        }
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException e) {
+                    pendingSaveCount.decrementAndGet();
+                    try {
+                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        notifyLockReleased(uuid);
+                    } catch (SQLException ex) {
+                        logger.log(Level.WARNING, "Failed to release lock for failed-join player " + uuid, ex);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Skip save for players who are not active, not pending, and not quarantined.
+        // This catches edge cases where a quit event fires for a player who was
+        // already cleaned up by another path.
+        if (!activePlayers.containsKey(uuid)
+            && !pendingData.containsKey(uuid)
+            && !pendingEmptyData.contains(uuid)
+            && !quarantinedPlayers.contains(uuid)) {
+            logger.warning("[Quit] Skipping save for inactive/untracked player " + uuid);
+            playerVersions.remove(uuid);
+            playerFencingTokens.remove(uuid);
+            return;
+        }
+
         // Check if player has pending data (was kicked during pre-login, never joined)
         if (pendingData.containsKey(uuid) || pendingEmptyData.contains(uuid)) {
             pendingData.remove(uuid);
             pendingEmptyData.remove(uuid);
             pendingLoadTimes.remove(uuid);
             activePlayers.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
             playerVersions.remove(uuid);
-            playerFencingTokens.remove(uuid);
-            // Release lock without saving
+            // Release lock without saving — use token version if available
             pendingSaveCount.incrementAndGet();
             try {
                 asyncExecutor.execute(() -> {
                     try {
-                        databaseManager.releaseLock(uuid, config.getServerName());
+                        if (ft != null && ft > 0) {
+                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        } else {
+                            databaseManager.releaseLock(uuid, config.getServerName());
+                        }
                         notifyLockReleased(uuid);
                         if (config.isDebug()) {
                             logger.info("Released lock for " + uuid + " (never joined)");
@@ -744,7 +838,11 @@ public class SyncManager {
                 // Executor shut down — release lock synchronously
                 pendingSaveCount.decrementAndGet();
                 try {
-                    databaseManager.releaseLock(uuid, config.getServerName());
+                    if (ft != null && ft > 0) {
+                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                    } else {
+                        databaseManager.releaseLock(uuid, config.getServerName());
+                    }
                     notifyLockReleased(uuid);
                 } catch (SQLException ex) {
                     logger.log(Level.WARNING, "Failed to release lock for " + uuid + " (sync fallback)", ex);
@@ -857,21 +955,25 @@ public class SyncManager {
 
         // Check if player has pending data (was kicked during pre-login, never joined)
         if (pendingData.containsKey(uuid) || pendingEmptyData.contains(uuid)) {
-            pendingData.remove(uuid);
-            pendingEmptyData.remove(uuid);
-            pendingLoadTimes.remove(uuid);
-            activePlayers.remove(uuid);
-            playerVersions.remove(uuid);
-            playerFencingTokens.remove(uuid);
-            try {
+        pendingData.remove(uuid);
+        pendingEmptyData.remove(uuid);
+        pendingLoadTimes.remove(uuid);
+        activePlayers.remove(uuid);
+        Long ft = playerFencingTokens.remove(uuid);
+        playerVersions.remove(uuid);
+        try {
+            if (ft != null && ft > 0) {
+                databaseManager.releaseLock(uuid, config.getServerName(), ft);
+            } else {
                 databaseManager.releaseLock(uuid, config.getServerName());
-                notifyLockReleased(uuid);
-                logger.info("Released lock for " + uuid + " (never joined, sync fallback)");
-            } catch (SQLException e) {
-                logger.log(Level.WARNING, "Failed to release lock for " + uuid, e);
             }
-            return;
+            notifyLockReleased(uuid);
+            logger.info("Released lock for " + uuid + " (never joined, sync fallback)");
+        } catch (SQLException e) {
+            logger.log(Level.WARNING, "Failed to release lock for " + uuid, e);
         }
+        return;
+    }
 
         // Best-effort data collection
         PlayerData data;
@@ -1711,11 +1813,20 @@ public class SyncManager {
     }
 
     /**
-     * Reset protection mode — called when the DB recovers or the plugin reloads.
+     * Reset protection mode — only succeeds if the database is healthy.
+     * Called when the DB recovers or the plugin reloads.
+     *
+     * @return true if protection mode was reset, false if DB is still unhealthy
      */
-    public void resetProtectionMode() {
+    public boolean resetProtectionMode() {
+        if (!databaseManager.isHealthy()) {
+            logger.warning("[Protection] Cannot reset protection mode: database is not healthy.");
+            return false;
+        }
         protectionMode = false;
         heartbeatFailureCount.set(0);
+        logger.info("[Protection] Protection mode reset.");
+        return true;
     }
 
     /**
@@ -1742,21 +1853,27 @@ public class SyncManager {
         long staleThreshold = 5 * 60 * 1000; // 5 minutes
 
         pendingLoadTimes.forEach((uuid, loadTime) -> {
-            if (loadTime != null && (now - loadTime) > staleThreshold) {
-                pendingData.remove(uuid);
-                pendingEmptyData.remove(uuid);
-                pendingLoadTimes.remove(uuid);
-                asyncExecutor.execute(() -> {
-                    try {
-                        databaseManager.releaseLock(uuid, config.getServerName());
-                        notifyLockReleased(uuid);
-                        logger.warning("Cleaned up stale pending data for " + uuid);
-                    } catch (SQLException e) {
-                        logger.log(Level.WARNING, "Failed to release stale lock for " + uuid, e);
+        if (loadTime != null && (now - loadTime) > staleThreshold) {
+            pendingData.remove(uuid);
+            pendingEmptyData.remove(uuid);
+            pendingLoadTimes.remove(uuid);
+            Long ft = playerFencingTokens.get(uuid);
+            asyncExecutor.execute(() -> {
+                try {
+                    if (ft != null && ft > 0) {
+                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                    } else {
+                        logger.warning("Stale pending data for " + uuid
+                            + " has no fencing token; refusing unsafe lock release.");
                     }
-                });
-            }
-        });
+                    notifyLockReleased(uuid);
+                    logger.warning("Cleaned up stale pending data for " + uuid);
+                } catch (SQLException e) {
+                    logger.log(Level.WARNING, "Failed to release stale lock for " + uuid, e);
+                }
+            });
+        }
+    });
 
         // Clean up save locks for players no longer active (quit > 5 min ago).
         // This prevents unbounded growth of the playerSaveLocks map.
@@ -2314,7 +2431,7 @@ public class SyncManager {
      * Publish a PLAYER_CHECKOUT event when player data is saved and lock released.
      */
     private void publishCheckout(UUID uuid, long version, long fencingToken, String cause) {
-        if (redissonManager != null) {
+        if (redissonManager != null && config.isStreamsEnabled()) {
             redissonManager.publish(StreamEvent.create(
                 StreamEventType.PLAYER_CHECKOUT, uuid, config.getServerName(),
                 "", version, fencingToken, "cause=" + cause));
@@ -2325,7 +2442,7 @@ public class SyncManager {
      * Publish a PLAYER_CHECKIN event when player data is loaded and lock acquired.
      */
     private void publishCheckin(UUID uuid, long version, long fencingToken) {
-        if (redissonManager != null) {
+        if (redissonManager != null && config.isStreamsEnabled()) {
             redissonManager.publish(StreamEvent.create(
                 StreamEventType.PLAYER_CHECKIN, uuid, config.getServerName(),
                 "", version, fencingToken, "Player loaded"));
@@ -2360,7 +2477,7 @@ public class SyncManager {
     // ==================== LoadResult ====================
 
     public static class LoadResult {
-        public enum Status { SUCCESS, LOCKED, ERROR }
+        public enum Status { SUCCESS, LOCKED, ERROR, PROTECTION }
 
         private final Status status;
         private final String message;
@@ -2373,6 +2490,7 @@ public class SyncManager {
         public static LoadResult success() { return new LoadResult(Status.SUCCESS, null); }
         public static LoadResult locked() { return new LoadResult(Status.LOCKED, null); }
         public static LoadResult error(String message) { return new LoadResult(Status.ERROR, message); }
+    public static LoadResult protection(String message) { return new LoadResult(Status.PROTECTION, message); }
 
         public Status getStatus() { return status; }
         public String getMessage() { return message; }

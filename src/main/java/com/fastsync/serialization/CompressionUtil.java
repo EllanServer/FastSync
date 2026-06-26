@@ -131,12 +131,15 @@ public class CompressionUtil {
                                | ((wrappedData[4] & 0xFF) << 8)
                                | (wrappedData[5] & 0xFF);
 
-            // Guard against corrupted/malicious blobs with inflated original-length
-            if (originalLength > MAX_DECOMPRESSED_SIZE) {
-                throw new IllegalArgumentException(
-                    "Decompressed size " + originalLength + " exceeds max " + MAX_DECOMPRESSED_SIZE
-                    + " — possible data corruption");
-            }
+            // Guard against corrupted/malicious blobs with inflated or negative
+        // original-length. A negative value would cause NegativeArraySizeException
+        // in new byte[originalLength], which is caught by the caller but produces
+        // a confusing error message.
+        if (originalLength < 0 || originalLength > MAX_DECOMPRESSED_SIZE) {
+            throw new IllegalArgumentException(
+                "Invalid decompressed size " + originalLength
+                + " (max " + MAX_DECOMPRESSED_SIZE + ") — possible data corruption");
+        }
 
             int compressedLen = wrappedData.length - 6;
             byte[] restored = new byte[originalLength];

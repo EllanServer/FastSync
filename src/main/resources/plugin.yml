@@ -19,7 +19,7 @@ libraries:
 commands:
   fastsync:
     description: FastSync admin command
-    usage: /fastsync <reload|status|debug|saveall>
+    usage: /fastsync <reload|status|debug|saveall|log>
     permission: fastsync.admin
     aliases: [fsync, fs]
 

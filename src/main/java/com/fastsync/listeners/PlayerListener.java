@@ -51,7 +51,13 @@ public class PlayerListener implements Listener {
         SyncManager.LoadResult result = syncManager.loadPlayerData(uuid);
 
         if (!result.isSuccess()) {
-            if (result.getStatus() == SyncManager.LoadResult.Status.LOCKED) {
+        if (result.getStatus() == SyncManager.LoadResult.Status.PROTECTION) {
+            event.disallow(
+                AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                ChatColor.RED + "[FastSync] Data protection mode is active. Please try again later.");
+            return;
+        }
+        if (result.getStatus() == SyncManager.LoadResult.Status.LOCKED) {
                 String msg = ChatColor.translateAlternateColorCodes('&',
                     plugin.getConfigManager().getLockTimeoutKickMessage());
                 event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, msg);

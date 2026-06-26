@@ -590,10 +590,24 @@ public class DatabaseManager {
             for (UUID uuid : playersToRefresh.keySet()) {
                 // EXECUTE_FAILED (-3) means the driver couldn't execute this
                 // particular statement in the batch. Treat it as a failure.
+                // SUCCESS_NO_INFO (-2) means the driver executed the statement
+                // but doesn't know the row count — we can't prove the lock
+                // was refreshed. Conservative: verify with a single refreshLock().
                 if (i >= results.length
                     || results[i] == java.sql.Statement.EXECUTE_FAILED
                     || results[i] == 0) {
                     failedPlayers.add(uuid);
+                } else if (results[i] == java.sql.Statement.SUCCESS_NO_INFO) {
+                    // Cannot prove that the lock row was actually refreshed.
+                    // Conservative path: verify with a single conditional refresh.
+                    Long token = playersToRefresh.get(uuid);
+                    try {
+                        if (token == null || !refreshLock(uuid, serverName, token)) {
+                            failedPlayers.add(uuid);
+                        }
+                    } catch (SQLException verifyEx) {
+                        failedPlayers.add(uuid);
+                    }
                 }
                 i++;
             }

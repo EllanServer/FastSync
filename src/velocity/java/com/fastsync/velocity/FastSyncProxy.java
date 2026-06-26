@@ -203,30 +203,30 @@ public class FastSyncProxy {
      * Query all registered backend servers for their FastSync status.
      */
     public CompletableFuture<List<HandoffProtocol.StatusResponseData>> queryAllStatus() {
-        List<HandoffProtocol.StatusResponseData> results = new ArrayList<>();
-        List<CompletableFuture<HandoffProtocol.StatusResponseData>> futures = new ArrayList<>();
+        List<CompletableFuture<HandoffProtocol.StatusResponseData>> safeFutures = new ArrayList<>();
 
         for (RegisteredServer server : proxy.getAllServers()) {
             String name = server.getServerInfo().getName();
             CompletableFuture<HandoffProtocol.StatusResponseData> future = new CompletableFuture<>();
             pendingStatusQueries.put(name, future);
-            futures.add(future);
+            // Wrap each future with completeOnTimeout + exceptionally so that
+            // a single slow/unresponsive backend doesn't cause the entire
+            // allOf to fail. The wrapped future always completes (either with
+            // data or with null), so allOf never throws.
+            CompletableFuture<HandoffProtocol.StatusResponseData> safe =
+                future.completeOnTimeout(null, config.getStatusQueryTimeoutMs(), TimeUnit.MILLISECONDS)
+                     .exceptionally(ex -> null);
+            safeFutures.add(safe);
 
             server.sendPluginMessage(HANDOFF_CHANNEL, HandoffProtocol.encodeStatusQuery());
         }
 
-        // Combine all futures with timeout
         CompletableFuture<Void> all = CompletableFuture.allOf(
-            futures.toArray(new CompletableFuture[0]));
-
-        // Add timeout for each future
-        for (var f : futures) {
-            f.orTimeout(config.getStatusQueryTimeoutMs(), TimeUnit.MILLISECONDS)
-             .exceptionally(ex -> null);
-        }
+            safeFutures.toArray(new CompletableFuture[0]));
 
         return all.thenApply(v -> {
-            for (var f : futures) {
+            List<HandoffProtocol.StatusResponseData> results = new ArrayList<>();
+            for (var f : safeFutures) {
                 HandoffProtocol.StatusResponseData data = f.join();
                 if (data != null) results.add(data);
             }

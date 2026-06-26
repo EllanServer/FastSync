@@ -22,7 +22,7 @@ FastSync 采用五层分离架构，每层职责明确：
 |---|---|---|
 | **LZ4 压缩** | `at.yawk.lz4:lz4-java` | 序列化后的 NBT byte[] 压缩，带 2 字节格式头 + 可选 4 字节原始长度 |
 | **Redis 协调** | `org.redisson:redisson` | RTopic 做 Pub/Sub 锁释放通知（fire-and-forget），RStream 做关键事件可靠交付（至少一次 + autoClaim 恢复） |
-| **OCC 写入** | `org.jooq:jooq` + MySQL | jOOQ DSL 构建类型安全的 `WHERE version=? AND fencing_token<=?` 双重 CAS 查询 |
+| **OCC 写入** | `org.jooq:jooq` + MySQL | jOOQ DSL 构建类型安全的 `WHERE version=? AND fencing_token=?` 双重 CAS 查询 |
 | **快照** | MySQL `fastsync_snapshots` 表 | 独立表存储点时备份，按自增 ID 排序（Spanner 教训：不用墙钟） |
 | **顺序日志** | 纯 Java NIO（`FileChannel` + `DataOutputStream`） | 每玩家独立 append-only 文件日志（`data/player-log/{uuid}.log`），无需 `--add-opens` |
 
@@ -40,7 +40,7 @@ Redisson RTopic 广播锁释放通知 → 对端 CountDownLatch 唤醒重试
 CAS 写入主库:
     WHERE uuid = ?
       AND version = expectedVersion        ← Dynamo 风格乐观并发
-      AND fencing_token <= currentToken    ← Kleppmann 风格过期写防御
+      AND fencing_token = currentToken    ← Kleppmann 风格过期写防御
   ↓
 成功: version+1, 释放锁, RStream 发布 PLAYER_CHECKOUT
 失败: 保存冲突快照, 记录 CONFLICT 日志
