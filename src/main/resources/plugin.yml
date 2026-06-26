@@ -8,8 +8,8 @@ description: High-performance cross-server player data synchronization using NBT
 website: https://github.com/Arbousier1/FastSync
 
 libraries:
-  - com.zaxxer:HikariCP:5.1.0
-  - org.lz4:lz4-java:1.8.0
+  - com.zaxxer:HikariCP:7.1.0
+  - org.lz4:lz4-java:1.8.1
   - com.mysql:mysql-connector-j:9.0.0
   - io.lettuce:lettuce-core:7.6.0.RELEASE
   - com.github.ben-manes.caffeine:caffeine:3.2.3
