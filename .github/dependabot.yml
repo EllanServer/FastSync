@@ -36,15 +36,6 @@ updates:
       testcontainers:
         patterns:
           - "org.testcontainers:*"
-        # Sub-modules (mysql, junit-jupiter) don't have 2.0.x releases.
-        # Keep all on 1.21.x for version alignment.
-        ignore:
-          - dependency-name: "org.testcontainers:testcontainers"
-            update-types: ["version-update:semver-major"]
-          - dependency-name: "org.testcontainers:mysql"
-            update-types: ["version-update:semver-major"]
-          - dependency-name: "org.testcontainers:junit-jupiter"
-            update-types: ["version-update:semver-major"]
       mockito:
         patterns:
           - "org.mockito:*"

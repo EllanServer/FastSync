@@ -65,11 +65,13 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter")
     // Gradle 9.x no longer auto-adds the JUnit Platform launcher.
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    // Note: testcontainers sub-modules (mysql, junit-jupiter) don't have 2.0.x
-    // releases yet. Keep sub-modules on 1.21.4 until they catch up.
-    testImplementation("org.testcontainers:testcontainers:2.0.5")
-    testImplementation("org.testcontainers:mysql:1.21.4")
-    testImplementation("org.testcontainers:junit-jupiter:1.21.4")
+    // Testcontainers 2.0: artifact names prefixed with "testcontainers-"
+    // (e.g. "mysql" → "testcontainers-mysql"), and package relocated
+    // (org.testcontainers.containers.MySQLContainer → org.testcontainers.mysql.MySQLContainer).
+    testImplementation(platform("org.testcontainers:testcontainers-bom:2.0.5"))
+    testImplementation("org.testcontainers:testcontainers")
+    testImplementation("org.testcontainers:testcontainers-mysql")
+    testImplementation("org.testcontainers:testcontainers-junit-jupiter")
     testImplementation("org.slf4j:slf4j-simple:2.0.13")
     testImplementation("org.mockito:mockito-core:5.23.0")
     testImplementation("org.mockito:mockito-junit-jupiter:5.23.0")
