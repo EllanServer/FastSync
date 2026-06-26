@@ -360,6 +360,15 @@ public class ConfigManager {
     public boolean isSyncLocation() { return syncLocation; }
     public boolean isSyncLockedMaps() { return syncLockedMaps; }
 
+    // Strategy config methods (used by LocationSyncStrategy and PdcStrategyFactory)
+    public boolean isLocationFallbackToSpawn() { return false; }
+    public boolean isLocationRequireSameWorldName() { return true; }
+    public boolean isLocationRequireSameWorldUuid() { return false; }
+    public boolean isPdcClearBeforeRestore() { return true; }
+    public String getPdcMode() { return "off"; }
+    public boolean isUnsafePdcConfirmed() { return false; }
+    public java.util.List<String> getRegisteredPdcKeys() { return java.util.Collections.emptyList(); }
+
     public boolean isSnapshotEnabled() { return snapshotEnabled; }
     public int getMaxSnapshots() { return maxSnapshots; }
     public long getSnapshotBackupFrequencyMs() { return snapshotBackupFrequencyMs; }
