@@ -87,7 +87,15 @@ public final class SchedulerUtil {
         if (FOLIA) {
             Bukkit.getGlobalRegionScheduler().run(plugin, t -> task.run());
         } else {
-            Bukkit.getScheduler().runTask(plugin, task);
+            // Inline execution when already on the main thread — avoids
+            // scheduling overhead and prevents self-deadlock during shutdown
+            // (onDisable calls saveAllOnlinePlayers which waits on futures
+            // that would otherwise be queued to the next tick).
+            if (Bukkit.isPrimaryThread()) {
+                task.run();
+            } else {
+                Bukkit.getScheduler().runTask(plugin, task);
+            }
         }
     }
 
@@ -120,7 +128,16 @@ public final class SchedulerUtil {
             entity.getScheduler().run(plugin, t -> task.run(),
                 retired != null ? retired : () -> {});
         } else {
-            Bukkit.getScheduler().runTask(plugin, task);
+            // CRITICAL: When already on the main thread (e.g., during onDisable),
+            // execute inline. Otherwise, the task is scheduled for the next tick,
+            // but the calling thread may be blocking on a future that this task
+            // must complete — a classic self-deadlock that causes shutdown saves
+            // to time out after 30s with zero players saved.
+            if (Bukkit.isPrimaryThread()) {
+                task.run();
+            } else {
+                Bukkit.getScheduler().runTask(plugin, task);
+            }
         }
     }
 

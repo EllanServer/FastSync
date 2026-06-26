@@ -96,6 +96,15 @@ java {
     }
 }
 
+// Replace ${project.version} in plugin.yml with the actual project version.
+// Without this, the plugin.yml version would show as the literal string
+// "${project.version}" instead of e.g. "1.0.0".
+tasks.processResources {
+    filesMatching("plugin.yml") {
+        expand("project" to mapOf("version" to project.version.toString()))
+    }
+}
+
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
     options.release.set(21)

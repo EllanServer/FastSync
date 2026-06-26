@@ -494,6 +494,32 @@ public class DatabaseManager {
     }
 
     /**
+     * Release a lock using a fencing token condition.
+     *
+     * <p>This is the safe variant of {@link #releaseLock(UUID, String)}: it only
+     * clears the lock if {@code locked_by = serverName AND fencing_token = fencingToken}.
+     * This prevents a misconfigured server (duplicate server-name) from releasing
+     * a newer lock acquired by a different server instance that happened to use
+     * the same name.
+     *
+     * @param uuid         player UUID
+     * @param serverName   server that holds the lock
+     * @param fencingToken fencing token assigned when the lock was acquired
+     * @return true if the lock was released, false if the lock is no longer ours
+     */
+    public boolean releaseLock(UUID uuid, String serverName, long fencingToken) throws SQLException {
+        try (Connection conn = dataSource.getConnection()) {
+            return dsl(conn).update(playerData)
+                .set(LOCKED_BY_FIELD, (String) null)
+                .set(LOCKED_AT_FIELD, (Long) null)
+                .where(UUID_FIELD.eq(uuid.toString())
+                    .and(LOCKED_BY_FIELD.eq(serverName))
+                    .and(FENCING_TOKEN_FIELD.eq(fencingToken)))
+                .execute() > 0;
+        }
+    }
+
+    /**
      * Refresh the lock timestamp for an online player (heartbeat).
      *
      * <p>This is called periodically by the heartbeat task to prevent the lock

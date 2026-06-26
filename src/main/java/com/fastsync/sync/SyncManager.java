@@ -205,7 +205,7 @@ public class SyncManager {
                 logger.info("Operation log enabled (file-based, retention=" +
                     config.getOperationLogRetention() + " per player).");
             } catch (Exception e) {
-                logger.log(Level.WARNING, "Failed to initialize operation log (Chronicle Queue)", e);
+                logger.log(Level.WARNING, "Failed to initialize operation log (file-based)", e);
             }
         }
 
@@ -771,7 +771,12 @@ public class SyncManager {
                 + " Skipping final save — data may be stale. Player should have been kicked.");
             pendingSaveCount.incrementAndGet();
             try {
-                databaseManager.releaseLock(uuid, config.getServerName());
+                Long ft = playerFencingTokens.get(uuid);
+                if (ft != null) {
+                    databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                } else {
+                    databaseManager.releaseLock(uuid, config.getServerName());
+                }
                 notifyLockReleased(uuid);
             } catch (SQLException e) {
                 logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
@@ -898,7 +903,12 @@ public class SyncManager {
         if (quarantinedPlayers.remove(uuid)) {
             logger.warning("[Quit-Sync] Player " + uuid + " was quarantined. Skipping save.");
             try {
-                databaseManager.releaseLock(uuid, config.getServerName());
+                Long ft = playerFencingTokens.get(uuid);
+                if (ft != null) {
+                    databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                } else {
+                    databaseManager.releaseLock(uuid, config.getServerName());
+                }
                 notifyLockReleased(uuid);
             } catch (SQLException e) {
                 logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
@@ -1330,23 +1340,21 @@ public class SyncManager {
     // ==================== Periodic Save ====================
 
     /**
-     * Save all online players' data (for periodic saves and shutdown).
-     *
-     * <p>Data collection happens on the calling thread because Bukkit's player API
-     * is not thread-safe (during shutdown this is the main thread). The expensive
-     * serialization and database write for each player is dispatched to the async
-     * executor and run in parallel, and we block on
-     * {@code CompletableFuture.allOf(...).join()} so that shutdown does not return
-     * until every save has completed. This avoids saving every player synchronously
-     * on the main thread, which would hang the server during shutdown.
-     */
-    /**
      * Save all online players' data synchronously (for shutdown / /fastsync saveall).
      *
      * <p><b>Folia-safe:</b> Data collection is dispatched per-player via
      * {@link SchedulerUtil#runAtEntity} to ensure it runs on the correct
      * region thread. Serialization + DB write happen async, and we wait
      * for all futures to complete (with a global deadline) before returning.
+     *
+     * <p><b>Dynamic deadline:</b> For SHUTDOWN saves, the deadline scales
+     * with the number of online players: max(30s, online * 500ms) so that
+     * large servers are not cut off prematurely. For BULK saves (/saveall),
+     * the deadline is fixed at 30s since this is an operator command.
+     *
+     * <p><b>Sync fallback:</b> For SHUTDOWN saves, if the async queue is
+     * full (RejectedExecutionException), the save runs synchronously on
+     * the calling thread instead of failing — shutdown must persist data.
      *
      * @param kind BULK for /saveall (keep lock), SHUTDOWN for onDisable (release lock)
      * @return result with total/success/failed counts and per-UUID failure reasons
@@ -1396,8 +1404,29 @@ public class SyncManager {
                         });
                     } catch (java.util.concurrent.RejectedExecutionException e) {
                         pendingSaveCount.decrementAndGet();
-                        logger.log(Level.WARNING, "Async queue full during " + kind + " save for " + uuid, e);
-                        future.complete(SaveResult.error("async queue full"));
+                        if (kind == SaveKind.SHUTDOWN) {
+                            // SHUTDOWN: synchronous fallback — must persist data.
+                            // The async queue is full, but shutdown cannot skip saves.
+                            logger.warning("[Shutdown] Async queue full for " + uuid
+                                + " — running synchronously as fallback");
+                            SaveResult result;
+                            try {
+                                saveLock.lock();
+                                try {
+                                    refreshVersionAndFencingToken(uuid, data);
+                                    result = persistCollectedData(uuid, data, kind);
+                                } finally {
+                                    saveLock.unlock();
+                                }
+                            } catch (Exception ex) {
+                                result = SaveResult.error(ex.getMessage());
+                            }
+                            future.complete(result);
+                        } else {
+                            // BULK (/saveall): queue full is acceptable — skip.
+                            logger.log(Level.WARNING, "Async queue full during " + kind + " save for " + uuid, e);
+                            future.complete(SaveResult.error("async queue full"));
+                        }
                     }
                 } catch (Exception e) {
                     logger.log(Level.SEVERE, "Failed to collect data for " + uuid + " during " + kind + " save", e);
@@ -1409,8 +1438,13 @@ public class SyncManager {
             futures.add(Map.entry(uuid, future));
         }
 
-        // Wait for all DB saves with a global deadline (30s total, not per-player).
-        long deadlineMs = 30_000;
+        // Wait for all DB saves with a dynamic deadline.
+        // SHUTDOWN: max(30s, online * 500ms) — scales for large servers.
+        // BULK: fixed 30s — operator command, can retry.
+        int onlineCount = futures.size();
+        long deadlineMs = (kind == SaveKind.SHUTDOWN)
+            ? Math.max(30_000L, onlineCount * 500L)
+            : 30_000L;
         long deadlineStart = System.currentTimeMillis();
         for (Map.Entry<UUID, CompletableFuture<SaveResult>> entry : futures) {
             UUID uuid = entry.getKey();
@@ -1947,9 +1981,11 @@ public class SyncManager {
                     if (saveLatency != null) saveLatency.recordError();
 
                     if (kind.releaseLock) {
-                        // Quit save: release lock even on conflict — player is leaving
+                        // Quit save: release lock even on conflict — player is leaving.
+                        // Use fencing token condition to avoid releasing another
+                        // server's lock in case of duplicate server-name config.
                         try {
-                            databaseManager.releaseLock(uuid, config.getServerName());
+                            databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
                         } catch (SQLException lockEx) {
                             logger.log(Level.WARNING, "Failed to release lock after " + kind + " conflict for " + uuid, lockEx);
                         }
@@ -2003,12 +2039,34 @@ public class SyncManager {
             logger.log(Level.SEVERE, kind + " save failed for " + uuid, e);
 
             if (kind.releaseLock) {
-                // Quit save: try to release lock even if save failed
-                try {
-                    databaseManager.releaseLock(uuid, config.getServerName());
-                    notifyLockReleased(uuid);
-                } catch (SQLException ex) {
-                    logger.log(Level.WARNING, "Failed to release lock after " + kind + " save error for " + uuid, ex);
+                // Final save (quit/shutdown) failed: DO NOT release the lock.
+                // Releasing the lock on failure allows other servers to read
+                // stale data and overwrite the player's final state.
+                // Instead, let the lock expire naturally (lock-timeout) so
+                // that the next server to acquire it will load the DB's
+                // current (potentially stale) version rather than a version
+                // that was never saved.
+                //
+                // The only exception is quarantined players — their lock is
+                // already lost (detected by heartbeat), so releasing is safe.
+                if (quarantinedPlayers.contains(uuid)) {
+                    logger.info("[Quit] Releasing lock for quarantined player " + uuid
+                        + " after save failure (lock already lost).");
+                    try {
+                        Long ft = playerFencingTokens.get(uuid);
+                        if (ft != null) {
+                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        } else {
+                            databaseManager.releaseLock(uuid, config.getServerName());
+                        }
+                        notifyLockReleased(uuid);
+                    } catch (SQLException ex) {
+                        logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, ex);
+                    }
+                } else {
+                    logger.warning("[Quit] NOT releasing lock for " + uuid + " after " + kind
+                        + " save failure — lock will expire after lock-timeout ("
+                        + config.getLockTimeout() + "s) to protect the player's data.");
                 }
             }
             // Online save: keep lock on error — will retry on next periodic save or quit
