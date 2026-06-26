@@ -1706,7 +1706,7 @@ public class SyncManager {
                                     saveLock.unlock();
                                 }
                             } catch (Exception e) {
-                                result = SaveResult.error(e.getMessage());
+                                result = SaveResult.error(e.getMessage(), SaveFailureReason.DB_UNAVAILABLE);
                             } finally {
                                 pendingSaveCount.decrementAndGet();
                             }
@@ -1729,21 +1729,21 @@ public class SyncManager {
                                     saveLock.unlock();
                                 }
                             } catch (Exception ex) {
-                                result = SaveResult.error(ex.getMessage());
+                                result = SaveResult.error(ex.getMessage(), SaveFailureReason.DB_UNAVAILABLE);
                             }
                             future.complete(result);
                         } else {
                             // BULK (/saveall): queue full is acceptable — skip.
                             logger.log(Level.WARNING, "Async queue full during " + kind + " save for " + uuid, e);
-                            future.complete(SaveResult.error("async queue full"));
+                            future.complete(SaveResult.error("async queue full", SaveFailureReason.QUEUE_FULL));
                         }
                     }
                 } catch (Exception e) {
                     logger.log(Level.SEVERE, "Failed to collect data for " + uuid + " during " + kind + " save", e);
-                    future.complete(SaveResult.error(e.getMessage()));
+                    future.complete(SaveResult.error(e.getMessage(), SaveFailureReason.DB_UNAVAILABLE));
                 }
             }, () -> {
-                future.complete(SaveResult.error("entity retired"));
+                future.complete(SaveResult.error("entity retired", SaveFailureReason.ENTITY_RETIRED));
             });
             futures.add(Map.entry(uuid, future));
         }
@@ -2227,19 +2227,75 @@ public class SyncManager {
         public boolean allSucceeded() { return failed == 0; }
     }
 
+    /**
+     * Structured failure reason for save operations.
+     *
+     * <p>Inspired by CockroachDB's retry error classification — conflicts are
+     * normal paths, not exceptions. Callers can {@code switch} on the reason
+     * to apply different retry strategies:
+     * <ul>
+     *   <li>{@link #SAME_FENCING_SELF_CONFLICT} — retry with actual DB version</li>
+     *   <li>{@link #FENCING_MISMATCH} — do not retry; lock was lost</li>
+     *   <li>{@link #VERSION_CONFLICT} — external write; trigger conflict recovery</li>
+     *   <li>{@link #DB_UNAVAILABLE} — retry with backoff</li>
+     *   <li>{@link #SERIALIZATION_ERROR} — do not retry; data is corrupt</li>
+     * </ul>
+     */
+    public enum SaveFailureReason {
+        /** Save succeeded. */
+        NONE,
+        /** Version CAS failed but fencing token matches — our own previous save advanced the version. Retryable. */
+        SAME_FENCING_SELF_CONFLICT,
+        /** Fencing token mismatch — we lost the lock to another server. NOT retryable. */
+        FENCING_MISMATCH,
+        /** Version conflict with an external writer. Triggers conflict recovery. */
+        VERSION_CONFLICT,
+        /** Lock was not held (locked_by mismatch). NOT retryable — must re-acquire lock. */
+        LOCK_NOT_HELD,
+        /** Component generation mismatch — stale component row tried to override. NOT retryable. */
+        COMPONENT_GENERATION_MISMATCH,
+        /** Database unreachable or SQL error. Retryable with backoff. */
+        DB_UNAVAILABLE,
+        /** Serialization/compression failed. NOT retryable — data is likely corrupt. */
+        SERIALIZATION_ERROR,
+        /** Async executor queue full. Retryable on next tick. */
+        QUEUE_FULL,
+        /** Entity retired (player offline). NOT retryable. */
+        ENTITY_RETIRED,
+        /** Component save rejected by fencing validation. Fall back to full Blob save. */
+        COMPONENT_SAVE_REJECTED,
+        /** Catch-all for unexpected errors. */
+        UNKNOWN
+    }
+
     /** Result of a save operation. */
-    public record SaveResult(boolean success, long expectedVersion, long actualVersion, int compressedSize, String errorMessage) {
+    public record SaveResult(boolean success, long expectedVersion, long actualVersion,
+                             int compressedSize, String errorMessage,
+                             SaveFailureReason failureReason) {
         public static SaveResult success(long version, int size) {
-            return new SaveResult(true, version, version + 1, size, null);
+            return new SaveResult(true, version, version + 1, size, null, SaveFailureReason.NONE);
         }
         public static SaveResult success(long oldVersion, long newVersion, int size) {
-            return new SaveResult(true, oldVersion, newVersion, size, null);
+            return new SaveResult(true, oldVersion, newVersion, size, null, SaveFailureReason.NONE);
         }
         public static SaveResult conflict(long expected, long actual, int size) {
-            return new SaveResult(false, expected, actual, size, "version conflict");
+            return new SaveResult(false, expected, actual, size, "version conflict", SaveFailureReason.VERSION_CONFLICT);
+        }
+        public static SaveResult conflict(long expected, long actual, int size, SaveFailureReason reason) {
+            return new SaveResult(false, expected, actual, size, reason.name().toLowerCase().replace('_', ' '), reason);
         }
         public static SaveResult error(String msg) {
-            return new SaveResult(false, 0, 0, 0, msg);
+            return new SaveResult(false, 0, 0, 0, msg, SaveFailureReason.UNKNOWN);
+        }
+        public static SaveResult error(String msg, SaveFailureReason reason) {
+            return new SaveResult(false, 0, 0, 0, msg, reason);
+        }
+        /** Convenience: returns true if this failure is retryable (same-fencing, DB, queue). */
+        public boolean isRetryable() {
+            return !success && switch (failureReason) {
+                case SAME_FENCING_SELF_CONFLICT, DB_UNAVAILABLE, QUEUE_FULL -> true;
+                default -> false;
+            };
         }
     }
 
@@ -2575,7 +2631,13 @@ public class SyncManager {
                             + ", actual v" + actualVersion + "/ft" + actualFencingToken);
                     }
 
-                    return SaveResult.conflict(expectedVersion, actualVersion, compressed.length);
+                    // Classify the conflict reason for structured retry handling.
+                    // If fencing tokens differ → FENCING_MISMATCH (lock was lost).
+                    // If fencing tokens match but version differs → VERSION_CONFLICT (external or same-fencing).
+                    SaveFailureReason reason = (actualFencingToken != fencingToken)
+                        ? SaveFailureReason.FENCING_MISMATCH
+                        : SaveFailureReason.VERSION_CONFLICT;
+                    return SaveResult.conflict(expectedVersion, actualVersion, compressed.length, reason);
                 }
             }
 
@@ -2653,7 +2715,7 @@ public class SyncManager {
                 }
             }
             // Online save: keep lock on error — will retry on next periodic save or quit
-            return SaveResult.error(e.getMessage());
+            return SaveResult.error(e.getMessage(), SaveFailureReason.DB_UNAVAILABLE);
         }
     }
 
