@@ -117,6 +117,10 @@ public class SyncManager {
     // when DB latency causes the previous cycle to exceed the interval.
     private final AtomicBoolean heartbeatRunning = new AtomicBoolean(false);
 
+    // Login backpressure: limits concurrent pre-login data loads to prevent
+    // login storms from exhausting the DB connection pool.
+    private java.util.concurrent.Semaphore loginLoadSemaphore;
+
     // Consecutive heartbeat failure counter. When the DB is unreachable,
     // the heartbeat cycle throws SQLException. If this persists beyond
     // HEARTBEAT_FAILURE_THRESHOLD consecutive cycles, the plugin enters
@@ -167,6 +171,10 @@ public class SyncManager {
         // Create dedicated thread pool (NOT ForkJoinPool.commonPool)
         int poolSize = Math.max(2, config.getPoolSize() / 2);
         asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize, config.getQueueCapacity());
+
+        // Login backpressure semaphore — limits concurrent pre-login loads
+        loginLoadSemaphore = new java.util.concurrent.Semaphore(config.getMaxConcurrentLoads(), true);
+        logger.info("Login load concurrency limit: " + config.getMaxConcurrentLoads());
 
         // Initialize snapshot system if enabled
         if (config.isSnapshotEnabled()) {
@@ -344,11 +352,20 @@ public class SyncManager {
         if (protectionMode) {
             return LoadResult.protection("FastSync protection mode is active");
         }
+        // Backpressure: if too many players are loading simultaneously, reject
+        // fast rather than queuing behind DB lock contention. This prevents
+        // login storms from exhausting the HikariCP connection pool.
+        if (loginLoadSemaphore != null && !loginLoadSemaphore.tryAcquire()) {
+            return LoadResult.busy("Too many concurrent data loads");
+        }
         pendingLoadCount.incrementAndGet();
         try {
             return loadPlayerDataInternal(uuid);
         } finally {
             pendingLoadCount.decrementAndGet();
+            if (loginLoadSemaphore != null) {
+                loginLoadSemaphore.release();
+            }
         }
     }
 
@@ -1137,42 +1154,64 @@ public class SyncManager {
 
         // Inventory - normalize empty/AIR slots to null so the serializer can treat
         // them uniformly and avoid storing meaningless AIR ItemStacks (sparse storage).
-        data.setInventory(sparseContents(player.getInventory().getContents()));
-        data.setArmor(sparseContents(player.getInventory().getArmorContents()));
-        org.bukkit.inventory.ItemStack offhand = player.getInventory().getItemInOffHand();
-        data.setOffhand(offhand != null && offhand.getType() == org.bukkit.Material.AIR ? null : offhand);
+        // All basic fields are now gated by config checks — disabling sync items
+        // genuinely reduces serialization cost, NBT size, and DB write size.
+        if (config.isSyncInventory()) {
+            data.setInventory(sparseContents(player.getInventory().getContents()));
+            data.setArmor(sparseContents(player.getInventory().getArmorContents()));
+            org.bukkit.inventory.ItemStack offhand = player.getInventory().getItemInOffHand();
+            data.setOffhand(offhand != null && offhand.getType() == org.bukkit.Material.AIR ? null : offhand);
+        }
 
         // Ender chest
-        data.setEnderChest(sparseContents(player.getEnderChest().getContents()));
+        if (config.isSyncEnderChest()) {
+            data.setEnderChest(sparseContents(player.getEnderChest().getContents()));
+        }
 
         // Vitals
-        data.setHealth(player.getHealth());
-        data.setMaxHealth(player.getMaxHealth());
-        data.setFoodLevel(player.getFoodLevel());
-        data.setSaturation(player.getSaturation());
-        data.setExhaustion(player.getExhaustion());
+        if (config.isSyncHealth()) {
+            data.setHealth(player.getHealth());
+            data.setMaxHealth(player.getMaxHealth());
+        }
+        if (config.isSyncFood()) {
+            data.setFoodLevel(player.getFoodLevel());
+            data.setSaturation(player.getSaturation());
+            data.setExhaustion(player.getExhaustion());
+        }
 
         // Experience
-        data.setExpLevel(player.getLevel());
-        data.setExpProgress(player.getExp());
-        data.setTotalExperience(player.getTotalExperience());
+        if (config.isSyncExperience()) {
+            data.setExpLevel(player.getLevel());
+            data.setExpProgress(player.getExp());
+            data.setTotalExperience(player.getTotalExperience());
+        }
 
         // Potion effects
-        List<PlayerData.PotionEffectData> effects = new ArrayList<>();
-        for (PotionEffect effect : player.getActivePotionEffects()) {
-            effects.add(PlayerDataSerializer.toPotionEffectData(effect));
+        if (config.isSyncPotionEffects()) {
+            List<PlayerData.PotionEffectData> effects = new ArrayList<>();
+            for (PotionEffect effect : player.getActivePotionEffects()) {
+                effects.add(PlayerDataSerializer.toPotionEffectData(effect));
+            }
+            data.setPotionEffects(effects);
         }
-        data.setPotionEffects(effects);
 
         // Extra
-        data.setGameMode(player.getGameMode());
-        data.setFireTicks(player.getFireTicks());
-        data.setRemainingAir(player.getRemainingAir());
-        data.setMaximumAir(player.getMaximumAir());
+        if (config.isSyncGameMode()) {
+            data.setGameMode(player.getGameMode());
+        }
+        if (config.isSyncFireTicks()) {
+            data.setFireTicks(player.getFireTicks());
+        }
+        if (config.isSyncAir()) {
+            data.setRemainingAir(player.getRemainingAir());
+            data.setMaximumAir(player.getMaximumAir());
+        }
 
         // Flight status
-        data.setFlying(player.isFlying());
-        data.setAllowFlight(player.getAllowFlight());
+        if (config.isSyncFlight()) {
+            data.setFlying(player.isFlying());
+            data.setAllowFlight(player.getAllowFlight());
+        }
 
         // Advancements (using Bukkit API - iterates all advancement criteria)
         if (config.isSyncAdvancements()) {
@@ -2588,7 +2627,7 @@ public class SyncManager {
     // ==================== LoadResult ====================
 
     public static class LoadResult {
-        public enum Status { SUCCESS, LOCKED, ERROR, PROTECTION }
+        public enum Status { SUCCESS, LOCKED, ERROR, PROTECTION, BUSY }
 
         private final Status status;
         private final String message;
@@ -2602,6 +2641,7 @@ public class SyncManager {
         public static LoadResult locked() { return new LoadResult(Status.LOCKED, null); }
         public static LoadResult error(String message) { return new LoadResult(Status.ERROR, message); }
     public static LoadResult protection(String message) { return new LoadResult(Status.PROTECTION, message); }
+    public static LoadResult busy(String message) { return new LoadResult(Status.BUSY, message); }
 
         public Status getStatus() { return status; }
         public String getMessage() { return message; }

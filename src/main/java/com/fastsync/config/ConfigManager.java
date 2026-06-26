@@ -78,6 +78,8 @@ public class ConfigManager {
     private int periodicSaveIntervalSeconds;
     private int periodicSaveBatchSize;
     private int heartbeatIntervalSeconds;
+    private int maxConcurrentLoads;
+    private String busyKickMessage;
 
     // Sync - new features
     private boolean syncAdvancements;
@@ -215,6 +217,11 @@ public class ConfigManager {
         dbUsername = source.getString("database.username", "root");
         dbPassword = source.getString("database.password", "password");
         tablePrefix = source.getString("database.table-prefix", "fastsync_");
+        if (tablePrefix != null && !tablePrefix.matches("[A-Za-z0-9_]*")) {
+            logger.warning("[Config] Invalid database.table-prefix '" + tablePrefix
+                + "'. Only letters, numbers and underscore are allowed. Falling back to 'fastsync_'.");
+            tablePrefix = "fastsync_";
+        }
         poolSize = source.getInt("database.pool-size", 10);
         queueCapacity = source.getInt("database.queue-capacity", 256);
         connectionTimeout = source.getLong("database.connection-timeout", 10000);
@@ -259,6 +266,18 @@ public class ConfigManager {
         periodicSaveIntervalSeconds = source.getInt("sync.periodic-save-interval-seconds", 300);
         periodicSaveBatchSize = source.getInt("sync.periodic-save-batch-size", 10);
         heartbeatIntervalSeconds = source.getInt("sync.heartbeat-interval-seconds", 10);
+
+        // Login backpressure: limit concurrent pre-login data loads to prevent
+        // login storms from exhausting the DB connection pool. Default leaves
+        // 2 connections for heartbeat/quit saves.
+        maxConcurrentLoads = source.getInt("sync.max-concurrent-loads",
+            Math.max(2, poolSize - 2));
+        if (maxConcurrentLoads < 1) {
+            logger.warning("[Config] sync.max-concurrent-loads must be >= 1. Using 1.");
+            maxConcurrentLoads = 1;
+        }
+        busyKickMessage = source.getString("sync.busy-kick-message",
+            "&c[FastSync] Data service is busy. Please reconnect in a few seconds.");
 
         // Validate: heartbeat must be <= lockTimeout / 3 to guarantee the lock
         // is refreshed well before it expires. If misconfigured, auto-correct
@@ -407,6 +426,8 @@ public class ConfigManager {
     public int getPeriodicSaveIntervalSeconds() { return periodicSaveIntervalSeconds; }
     public int getPeriodicSaveBatchSize() { return periodicSaveBatchSize; }
     public int getHeartbeatIntervalSeconds() { return heartbeatIntervalSeconds; }
+    public int getMaxConcurrentLoads() { return maxConcurrentLoads; }
+    public String getBusyKickMessage() { return busyKickMessage; }
 
     public boolean isSyncAdvancements() { return syncAdvancements; }
     public boolean isSyncStatistics() { return syncStatistics; }

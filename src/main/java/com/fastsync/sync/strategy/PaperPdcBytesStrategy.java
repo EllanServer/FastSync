@@ -132,22 +132,49 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
 
     @Override
     public void restore(Player player, byte[] data) {
-        if (data == null || data.length == 0) return;
+        if (data == null) return;
+        PersistentDataContainer pdc = player.getPersistentDataContainer();
+
+        // Empty payload means "source PDC is empty" — clear the target container
+        // to remove ghost keys that were deleted on the source server.
+        if (data.length == 0) {
+            if (clearBeforeRestore) {
+                clearContainer(pdc);
+            }
+            return;
+        }
+
         Method readMethod = readFromBytesMethod != null ? readFromBytesMethod : deserializeBytesMethod;
         if (readMethod == null) return;
         try {
-            PersistentDataContainer pdc = player.getPersistentDataContainer();
             if (readFromBytesMethod != null) {
                 // New public API: readFromBytes(byte[], boolean clear)
                 // clear=true wipes the container before reading (full sync).
                 // clear=false appends/overwrites existing keys (merge mode).
                 readMethod.invoke(pdc, data, clearBeforeRestore);
             } else {
-                // Legacy: deserializeBytes(byte[]) — overwrites existing keys (no clear param)
+                // Legacy: deserializeBytes(byte[]) — no clear param, so clear
+                // manually first if configured.
+                if (clearBeforeRestore) {
+                    clearContainer(pdc);
+                }
                 readMethod.invoke(pdc, data);
             }
         } catch (Exception e) {
             if (debug) logger.log(Level.FINE, "[PDC] readFromBytes/deserializeBytes failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Remove all keys from a PersistentDataContainer. Used when the source
+     * server's PDC is empty and clearBeforeRestore is enabled — ensures
+     * ghost keys don't persist on the target server.
+     */
+    @SuppressWarnings("unchecked")
+    private static void clearContainer(PersistentDataContainer pdc) {
+        if (pdc == null) return;
+        for (org.bukkit.NamespacedKey key : new java.util.HashSet<>(pdc.getKeys())) {
+            pdc.remove(key);
         }
     }
 

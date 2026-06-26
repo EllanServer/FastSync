@@ -51,6 +51,12 @@ public class PlayerListener implements Listener {
         SyncManager.LoadResult result = syncManager.loadPlayerData(uuid);
 
         if (!result.isSuccess()) {
+        if (result.getStatus() == SyncManager.LoadResult.Status.BUSY) {
+            String msg = ChatColor.translateAlternateColorCodes('&',
+                plugin.getConfigManager().getBusyKickMessage());
+            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, msg);
+            return;
+        }
         if (result.getStatus() == SyncManager.LoadResult.Status.PROTECTION) {
             event.disallow(
                 AsyncPlayerPreLoginEvent.Result.KICK_OTHER,

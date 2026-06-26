@@ -126,6 +126,12 @@ sync:
   # Lower this if the async executor pool is small; the async executor pool
   # size should be >= this value to avoid queue flooding with many players.
   periodic-save-batch-size: 10
+  # Maximum concurrent pre-login data loads. Prevents login storms from
+  # exhausting the DB connection pool. Default: pool-size - 2 (leaves 2
+  # connections for heartbeat/quit saves). When exceeded, players are
+  # kicked with busy-kick-message and can retry immediately.
+  max-concurrent-loads: 8
+  busy-kick-message: "&c[FastSync] Data service is busy. Please reconnect in a few seconds."
 
   # ------------------------------------------------------------
   # Additional Sync Settings
