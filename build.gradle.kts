@@ -192,12 +192,15 @@ tasks.shadowJar {
     archiveVersion.set(version.toString())
     archiveClassifier.set("")
 
-    // Only shade Sparrow libraries; exclude everything else.
-    // In Shadow 9.x, use include() with dependency specifiers.
-    include(project.sourceSets.main.get().output)
-    include(dependency("net.momirealms:sparrow-nbt:"))
-    include(dependency("net.momirealms:sparrow-yaml:"))
-    include(dependency("net.momirealms:sparrow-redis-message-broker:"))
+    // Only shade Sparrow libraries (net.momirealms group).
+    // All other runtimeClasspath deps (transitive deps of Sparrow, etc.)
+    // are excluded — they're either on Maven Central (auto-downloaded by
+    // Paper via plugin.yml libraries) or not needed at runtime.
+    dependencies {
+        exclude {
+            it.moduleGroup != "net.momirealms"
+        }
+    }
 
     // Strip META-INF signatures and duplicate metadata
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",
