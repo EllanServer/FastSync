@@ -51,7 +51,7 @@ dependencies {
     compileOnly("org.lz4:lz4-java:1.8.1")
     compileOnly("com.mysql:mysql-connector-j:9.0.0")
     compileOnly("io.lettuce:lettuce-core:7.6.0.RELEASE")
-    compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.3")
+    compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.4")
     compileOnly("org.reactivestreams:reactive-streams:1.0.4")
 
     // Sparrow libraries: shaded into the JAR (not on Maven Central, so Paper
@@ -83,7 +83,7 @@ dependencies {
     testImplementation("org.lz4:lz4-java:1.8.1")
     testImplementation("com.mysql:mysql-connector-j:9.0.0")
     testImplementation("io.lettuce:lettuce-core:7.6.0.RELEASE")
-    testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
+    testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
     testImplementation("org.reactivestreams:reactive-streams:1.0.4")
 }
 
