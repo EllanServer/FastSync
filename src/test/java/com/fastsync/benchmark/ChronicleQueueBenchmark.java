@@ -34,8 +34,13 @@ public class ChronicleQueueBenchmark {
     @Setup
     public void setup() throws Exception {
         tempDir = Files.createTempDirectory("cq-bench");
-        logManager = new ChronicleQueueLogManager(tempDir, 1000);
-        logManager.initialize();
+        try {
+            logManager = new ChronicleQueueLogManager(tempDir, 1000);
+            logManager.initialize();
+        } catch (Throwable e) {
+            // Skip if Chronicle Queue can't initialize (CI without --add-opens)
+            throw new IllegalStateException("CQ benchmark skipped: " + e.getMessage(), e);
+        }
         playerId = UUID.randomUUID();
         sampleLog = OperationLog.create(playerId, OperationType.SAVE, "bench-server",
             42L, 10L, 4096, "benchmark save");
