@@ -22,6 +22,7 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
 
     private final Logger logger;
     private final boolean debug;
+    private final boolean clearBeforeRestore;
 
     // Cached reflected methods — resolved once at construction time.
     // Null means the method was not found on this server version.
@@ -29,9 +30,10 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
     private final Method readFromBytesMethod; // New public API: readFromBytes(byte[], boolean)
     private final Method deserializeBytesMethod; // Legacy fallback: deserializeBytes(byte[])
 
-    public PaperPdcBytesStrategy(Logger logger, boolean debug) {
+    public PaperPdcBytesStrategy(Logger logger, boolean debug, boolean clearBeforeRestore) {
         this.logger = logger;
         this.debug = debug;
+        this.clearBeforeRestore = clearBeforeRestore;
 
         Method ser = null;
         Method readNew = null;
@@ -114,7 +116,10 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
         if (serializeMethod == null) return null;
         try {
             PersistentDataContainer pdc = player.getPersistentDataContainer();
-            if (pdc == null || pdc.isEmpty()) return null;
+            if (pdc == null) return null;
+            // Don't skip empty PDC — serializeToBytes() returns a valid empty
+            // container representation that, when restored with clear=true,
+            // wipes the target container. This prevents ghost keys.
             byte[] bytes = (byte[]) serializeMethod.invoke(pdc);
             return (bytes != null && bytes.length > 0) ? bytes : null;
         } catch (Exception e) {
@@ -132,8 +137,9 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
             PersistentDataContainer pdc = player.getPersistentDataContainer();
             if (readFromBytesMethod != null) {
                 // New public API: readFromBytes(byte[], boolean clear)
-                // clear=false means append/overwrite existing keys without wiping the container.
-                readMethod.invoke(pdc, data, false);
+                // clear=true wipes the container before reading (full sync).
+                // clear=false appends/overwrites existing keys (merge mode).
+                readMethod.invoke(pdc, data, clearBeforeRestore);
             } else {
                 // Legacy: deserializeBytes(byte[]) — overwrites existing keys (no clear param)
                 readMethod.invoke(pdc, data);

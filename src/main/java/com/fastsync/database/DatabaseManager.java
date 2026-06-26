@@ -482,6 +482,12 @@ public class DatabaseManager {
     /**
      * Release the lock without saving data (e.g., on error).
      */
+    /**
+     * @deprecated Use {@link #releaseLock(UUID, String, long)} instead.
+     *             This overload does not check the fencing token and can
+     *             release another server's lock if server-names are duplicated.
+     */
+    @Deprecated(since = "1.0.0", forRemoval = true)
     public void releaseLock(UUID uuid, String serverName) throws SQLException {
         try (Connection conn = dataSource.getConnection()) {
             dsl(conn).update(playerData)

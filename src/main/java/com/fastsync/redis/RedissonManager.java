@@ -149,7 +149,12 @@ public class RedissonManager {
 
         this.lockTopicName = prefix + ":" + ns + ":lock";
         this.streamKeyName = prefix + ":" + ns + ":stream:events";
-        this.consumerGroupName = prefix + ":" + ns + ":group";
+        // Per-server consumer group: each server gets its own group so that
+        // every server receives ALL stream events (broadcast semantics).
+        // A shared group would distribute events across servers (queue semantics),
+        // which is wrong for PLAYER_CHECKIN/CHECKOUT/SERVER_START events that
+        // every backend must see.
+        this.consumerGroupName = prefix + ":" + ns + ":group:" + serverName;
     }
 
     /**
@@ -569,7 +574,13 @@ public class RedissonManager {
             return false;
         }
         try {
-            return !c.isShutdown() && !c.isShuttingDown();
+            if (c.isShutdown() || c.isShuttingDown()) {
+                return false;
+            }
+            // Lightweight PING probe — verifies Redis is actually reachable,
+            // not just that the client object exists. Uses a short timeout
+            // to avoid blocking the caller (e.g., pre-login).
+            return c.getNodesGroup().pingAll();
         } catch (Exception e) {
             return false;
         }

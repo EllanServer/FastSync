@@ -243,6 +243,11 @@ public class FastSyncProxy {
     public void onPluginMessage(PluginMessageEvent event) {
         if (!event.getIdentifier().equals(HANDOFF_CHANNEL)) return;
 
+        // Mark as handled so Velocity does not forward the internal protocol
+        // message to the player's client. Without this, Velocity's default
+        // behavior is to forward plugin messages.
+        event.setResult(PluginMessageEvent.ForwardResult.handled());
+
         byte[] data = event.getData();
         int type = HandoffProtocol.getMessageType(data);
 
@@ -274,9 +279,7 @@ public class FastSyncProxy {
             }
         }
 
-        // Note: We don't forward the message to the player client.
-        // Velocity's default is to forward, but our messages are internal
-        // protocol messages not meant for the client.
+        // Message has been handled — not forwarded to the client.
     }
 
     // ==================== Utility ====================

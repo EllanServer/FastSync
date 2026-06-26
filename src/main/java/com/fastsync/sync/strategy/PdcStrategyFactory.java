@@ -20,7 +20,8 @@ public class PdcStrategyFactory {
         }
         
         if ("safe-all-paper".equalsIgnoreCase(mode)) {
-            return new PaperPdcBytesStrategy(logger, debug);
+            boolean clearBeforeRestore = config.isPdcClearBeforeRestore();
+            return new PaperPdcBytesStrategy(logger, debug, clearBeforeRestore);
         }
         
         if ("registered-only".equalsIgnoreCase(mode)) {

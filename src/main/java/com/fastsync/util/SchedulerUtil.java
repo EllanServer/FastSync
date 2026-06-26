@@ -162,21 +162,26 @@ public final class SchedulerUtil {
      * @param retired fallback if the player is not online
      */
     public static void runForPlayer(Plugin plugin, UUID uuid, Consumer<Player> task, Runnable retired) {
-        Player player = Bukkit.getPlayer(uuid);
-        if (player == null) {
-            if (retired != null) retired.run();
-            return;
-        }
-        runAtEntity(plugin, player, () -> {
-            // Re-check online status inside the task — player may have logged out
-            // between the Bukkit.getPlayer() call and the task execution.
-            Player p = Bukkit.getPlayer(uuid);
-            if (p != null && p.isOnline()) {
-                task.accept(p);
-            } else if (retired != null) {
-                retired.run();
+        // CRITICAL: Bukkit.getPlayer(uuid) must NOT be called from an async
+        // thread (Folia unsafe). Dispatch to the global/main thread first,
+        // then look up the player, then dispatch to the entity's region.
+        runGlobal(plugin, () -> {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player == null) {
+                if (retired != null) retired.run();
+                return;
             }
-        }, retired);
+            runAtEntity(plugin, player, () -> {
+                // Re-check online status inside the task — player may have logged out
+                // between the Bukkit.getPlayer() call and the task execution.
+                Player p = Bukkit.getPlayer(uuid);
+                if (p != null && p.isOnline()) {
+                    task.accept(p);
+                } else if (retired != null) {
+                    retired.run();
+                }
+            }, retired);
+        });
     }
 
     // ==================== Region Tasks (TimeUnit = ticks) ====================

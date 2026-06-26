@@ -76,22 +76,25 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public byte[] dump(Player player) {
         PersistentDataContainer pdc = player.getPersistentDataContainer();
-        if (pdc == null || pdc.isEmpty()) return null;
 
         try (var baos = new ByteArrayOutputStream();
              var out = new DataOutputStream(baos)) {
             // Collect non-null entries first (need count before writing)
             var entries = new ArrayList<Map.Entry<NamespacedKey, Object>>();
-            for (var entry : registeredKeys.entrySet()) {
-                if (pdc.has(entry.getKey(), (PersistentDataType) entry.getValue())) {
-                    Object val = pdc.get(entry.getKey(), (PersistentDataType) entry.getValue());
-                    if (val != null) {
-                        entries.add(Map.entry(entry.getKey(), val));
+            if (pdc != null) {
+                for (var entry : registeredKeys.entrySet()) {
+                    if (pdc.has(entry.getKey(), (PersistentDataType) entry.getValue())) {
+                        Object val = pdc.get(entry.getKey(), (PersistentDataType) entry.getValue());
+                        if (val != null) {
+                            entries.add(Map.entry(entry.getKey(), val));
+                        }
                     }
                 }
             }
-            if (entries.isEmpty()) return null;
-
+            // IMPORTANT: Even when entries is empty, return a valid "0 entries"
+            // payload (not null). This ensures restore() is called, which clears
+            // all registered keys on the target server — preventing ghost keys
+            // that were deleted on the source server from persisting.
             out.writeInt(entries.size());
             for (var entry : entries) {
                 out.writeUTF(entry.getKey().toString());

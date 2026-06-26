@@ -90,6 +90,7 @@ public class ConfigManager {
 
     // PDC strategy config
     private String pdcMode;                    // off | safe-all-paper | registered-only | unsafe-reflection
+    private boolean pdcClearBeforeRestore;     // safe-all-paper: clear PDC before restore (full sync vs merge)
     private boolean unsafePdcConfirmed;        // explicit confirmation for unsafe-reflection
     private java.util.List<String> registeredPdcKeys;  // list of "namespace:key=TYPE" strings
 
@@ -284,6 +285,7 @@ public class ConfigManager {
         // PDC strategy
         pdcMode = source.getString("pdc.mode",
             syncPDC ? "safe-all-paper" : "off");
+        pdcClearBeforeRestore = source.getBoolean("pdc.clear-before-restore", true);
         unsafePdcConfirmed = source.getBoolean("pdc.unsafe-reflection.enabled", false);
         registeredPdcKeys = source.getStringList("pdc.registered-keys");
 
@@ -411,6 +413,7 @@ public class ConfigManager {
     public boolean isSyncLockedMaps() { return syncLockedMaps; }
 
     public String getPdcMode() { return pdcMode; }
+    public boolean isPdcClearBeforeRestore() { return pdcClearBeforeRestore; }
     public boolean isUnsafePdcConfirmed() { return unsafePdcConfirmed; }
     public java.util.List<String> getRegisteredPdcKeys() { return registeredPdcKeys; }
 

@@ -566,7 +566,7 @@ public class SyncManager {
     }
 
         long startTime = config.isLogTiming() ? System.nanoTime() : 0;
-
+        try {
         // Clear current state to prevent duplication
         if (config.isClearBeforeApply()) {
             player.getInventory().clear();
@@ -705,6 +705,44 @@ public class SyncManager {
 
         if (config.isDebug()) {
             logger.info("Applied data for " + uuid);
+        }
+        } catch (Throwable t) {
+            // Apply failed midway — player may be in a partially-applied state.
+            // Mark as failed-join so quit handler skips save, release the lock,
+            // and kick the player to prevent playing with corrupted state.
+            failedJoinPlayers.add(uuid);
+            activePlayers.remove(uuid);
+            playerVersions.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
+            if (ft != null && ft > 0) {
+                final long fencingToken = ft;
+                pendingSaveCount.incrementAndGet();
+                try {
+                    asyncExecutor.execute(() -> {
+                        try {
+                            databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                            notifyLockReleased(uuid);
+                        } catch (SQLException e) {
+                            logger.log(Level.WARNING, "Failed to release lock after apply failure for " + uuid, e);
+                        } finally {
+                            pendingSaveCount.decrementAndGet();
+                        }
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException e) {
+                    pendingSaveCount.decrementAndGet();
+                    try {
+                        databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                        notifyLockReleased(uuid);
+                    } catch (SQLException ex) {
+                        logger.log(Level.WARNING, "Failed to release lock after apply failure for " + uuid, ex);
+                    }
+                }
+            }
+            player.kick(net.kyori.adventure.text.Component.text(
+                "[FastSync] Failed to apply your data. Please reconnect.",
+                net.kyori.adventure.text.format.NamedTextColor.RED));
+            logger.log(Level.SEVERE, "Failed to apply data for " + uuid
+                + " — player kicked, lock released, state not saved.", t);
         }
     }
 
@@ -1461,7 +1499,31 @@ public class SyncManager {
      * @param kind BULK for /saveall (keep lock), SHUTDOWN for onDisable (release lock)
      * @return result with total/success/failed counts and per-UUID failure reasons
      */
+    /**
+     * Save all online players' data synchronously (for shutdown).
+     * This method calls Bukkit.getOnlinePlayers() and MUST be called on the
+     * main thread or global region thread.
+     *
+     * @see #savePlayersSnapshot(List, SaveKind) for the thread-safe variant
+     *       that accepts a pre-collected player list.
+     */
     public SaveAllResult saveAllOnlinePlayers(SaveKind kind) {
+        return savePlayersSnapshot(new ArrayList<>(Bukkit.getOnlinePlayers()), kind);
+    }
+
+    /**
+     * Save a snapshot of players' data. The player list must have been
+     * collected on the main thread or global region thread (Folia-safe).
+     *
+     * <p>This method is safe to call from an async thread because it does NOT
+     * call Bukkit.getOnlinePlayers() — it uses the pre-collected list and
+     * dispatches per-player data collection via SchedulerUtil.runAtEntity().
+     *
+     * @param players pre-collected player list (from main/global thread)
+     * @param kind    BULK for /saveall (keep lock), SHUTDOWN for onDisable (release lock)
+     * @return result with total/success/failed counts
+     */
+    public SaveAllResult savePlayersSnapshot(List<Player> players, SaveKind kind) {
         int total = 0;
         int success = 0;
         int failed = 0;
@@ -1469,7 +1531,7 @@ public class SyncManager {
         List<Map.Entry<UUID, CompletableFuture<SaveResult>>> futures = new ArrayList<>();
         Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
 
-        for (Player player : Bukkit.getOnlinePlayers()) {
+        for (Player player : players) {
             if (!activePlayers.containsKey(player.getUniqueId())) {
                 continue;
             }
@@ -1857,7 +1919,11 @@ public class SyncManager {
             pendingData.remove(uuid);
             pendingEmptyData.remove(uuid);
             pendingLoadTimes.remove(uuid);
-            Long ft = playerFencingTokens.get(uuid);
+            // Clean up ALL tracking maps to prevent memory leaks during login storms
+            playerVersions.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
+            failedJoinPlayers.remove(uuid);
+            quarantinedPlayers.remove(uuid);
             asyncExecutor.execute(() -> {
                 try {
                     if (ft != null && ft > 0) {

@@ -248,28 +248,34 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             }
             case "saveall" -> {
                 sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saving all online players...");
-                SchedulerUtil.runAsync(this, () -> {
-                    try {
-                        SyncManager.SaveAllResult result = syncManager.saveAllOnlinePlayers(SyncManager.SaveKind.BULK);
-                        SchedulerUtil.runGlobal(this, () -> {
-                            if (result.allSucceeded()) {
-                                sender.sendMessage(ChatColor.GREEN + "[FastSync] All " + result.total() + " players saved!");
-                            } else {
-                                sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saved " + result.success()
-                                    + "/" + result.total() + " players. " + ChatColor.RED + result.failed() + " failed.");
-                                if (!result.failures().isEmpty()) {
-                                    sender.sendMessage(ChatColor.GRAY + "Failed players:");
-                                    result.failures().forEach((uuid, reason) ->
-                                        sender.sendMessage(ChatColor.GRAY + "  " + uuid + ": " + ChatColor.RED + reason));
+                // CRITICAL: Bukkit.getOnlinePlayers() must be called on the main
+                // thread (or global region for Folia). Collect the player list
+                // on a safe thread first, then dispatch the async save.
+                SchedulerUtil.runGlobal(this, () -> {
+                    List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
+                    SchedulerUtil.runAsync(this, () -> {
+                        try {
+                            SyncManager.SaveAllResult result = syncManager.savePlayersSnapshot(players, SyncManager.SaveKind.BULK);
+                            SchedulerUtil.runGlobal(this, () -> {
+                                if (result.allSucceeded()) {
+                                    sender.sendMessage(ChatColor.GREEN + "[FastSync] All " + result.total() + " players saved!");
+                                } else {
+                                    sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saved " + result.success()
+                                        + "/" + result.total() + " players. " + ChatColor.RED + result.failed() + " failed.");
+                                    if (!result.failures().isEmpty()) {
+                                        sender.sendMessage(ChatColor.GRAY + "Failed players:");
+                                        result.failures().forEach((uuid, reason) ->
+                                            sender.sendMessage(ChatColor.GRAY + "  " + uuid + ": " + ChatColor.RED + reason));
+                                    }
                                 }
-                            }
-                        });
-                    } catch (Exception e) {
-                        getLogger().log(Level.SEVERE, "Saveall failed", e);
-                        SchedulerUtil.runGlobal(this, () ->
-                            sender.sendMessage(ChatColor.RED + "[FastSync] Saveall failed: " + e.getMessage())
-                        );
-                    }
+                            });
+                        } catch (Exception e) {
+                            getLogger().log(Level.SEVERE, "Saveall failed", e);
+                            SchedulerUtil.runGlobal(this, () ->
+                                sender.sendMessage(ChatColor.RED + "[FastSync] Saveall failed: " + e.getMessage())
+                            );
+                        }
+                    });
                 });
             }
             case "log" -> {

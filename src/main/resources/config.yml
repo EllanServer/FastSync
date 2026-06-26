@@ -136,7 +136,7 @@ sync:
     require-same-world-name: true   # World name must match (avoid cross-world teleport)
     require-same-world-uuid: true   # World UUID must match (prevent same-name different-world)
     fallback-to-spawn: true         # If validation fails, teleport to spawn instead
-  sync-locked-maps: true
+  sync-locked-maps: false          # Reserved / not implemented. Map item and map view data sync is not yet wired into collectPlayerData/applyPlayerData.
 
   # Save on death
   save-on-death: false
@@ -166,6 +166,9 @@ sync:
 #                      confirmation (unsafe-reflection.enabled: true).
 pdc:
   mode: "registered-only"
+  # When mode=safe-all-paper, clear the target PDC before restoring (true = full sync, false = merge/append).
+  # registered-only always clears registered keys before restore regardless of this setting.
+  clear-before-restore: true
   # When mode=registered-only, list keys to sync as "namespace:key=TYPE"
   # e.g. "myplugin:progress=INTEGER", "myplugin:rank=STRING"
   registered-keys: []
