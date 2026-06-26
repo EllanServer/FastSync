@@ -144,6 +144,8 @@ public class ConfigManager {
 
     // Redis Streams (critical event delivery)
     private boolean streamsEnabled;
+    private int redisStreamMaxLen;
+    private boolean redisStreamTrimApprox;
 
     public ConfigManager(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -220,7 +222,7 @@ public class ConfigManager {
         maxLifetime = source.getLong("database.max-lifetime", 1800000);
         leakDetectionThreshold = source.getLong("database.leak-detection-threshold", 60000);
         dbParameters = source.getString("database.parameters",
-            "useSSL=false&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true");
+            "useSSL=false&useUnicode=true&characterEncoding=UTF-8");
 
         // Redis
         redisEnabled = source.getBoolean("redis.enabled", false);
@@ -351,6 +353,8 @@ public class ConfigManager {
         operationLogEnabled = source.getBoolean("operation-log.enabled", true);
         operationLogRetention = source.getInt("operation-log.retention", 100);
         streamsEnabled = source.getBoolean("redis.streams-enabled", true);
+        redisStreamMaxLen = source.getInt("redis.stream-maxlen", 100000);
+        redisStreamTrimApprox = source.getBoolean("redis.stream-trim-approx", true);
     }
 
     // ==================== Getters ====================
@@ -454,6 +458,8 @@ public class ConfigManager {
     public boolean isOperationLogEnabled() { return operationLogEnabled; }
     public int getOperationLogRetention() { return operationLogRetention; }
     public boolean isStreamsEnabled() { return streamsEnabled; }
+    public int getRedisStreamMaxLen() { return redisStreamMaxLen; }
+    public boolean isRedisStreamTrimApprox() { return redisStreamTrimApprox; }
 
     // ==================== Internal config access abstraction ====================
 

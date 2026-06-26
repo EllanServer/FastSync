@@ -182,7 +182,8 @@ public class SyncManager {
                     config.getRedisHost(), config.getRedisPort(),
                     config.getRedisPassword(), config.getRedisDatabase(),
                     config.getServerName(), config.getClusterId(), config.getRedisChannelPrefix(),
-                    config.isRedisSsl(), config.getRedisTimeout(), config.isStreamsEnabled());
+                    config.isRedisSsl(), config.getRedisTimeout(), config.isStreamsEnabled(),
+                    config.getRedisStreamMaxLen(), config.isRedisStreamTrimApprox());
                 // Register listener BEFORE initialize() — initialize() starts the
                 // consumer loop and recovers pending entries, which can dispatch
                 // stream events immediately. If the listener isn't registered yet,
@@ -678,6 +679,8 @@ public class SyncManager {
                 && data.getPersistentDataContainer() != null
                 && !data.getPersistentDataContainer().isEmpty()) {
             byte[] pdcBytes = data.getPersistentDataContainer().get("__pdc_bytes__");
+            // Call restore even if pdcBytes is empty (length==0) — this is the
+            // signal to clear the target PDC and remove ghost keys.
             if (pdcBytes != null) {
                 pdcStrategy.restore(player, pdcBytes);
             }
@@ -905,21 +908,35 @@ public class SyncManager {
         if (quarantinedPlayers.remove(uuid)) {
             logger.warning("[Quit] Player " + uuid + " was quarantined (lock lost during session)."
                 + " Skipping final save — data may be stale. Player should have been kicked.");
+            final Long ft = playerFencingTokens.get(uuid);
+            playerVersions.remove(uuid);
+            playerFencingTokens.remove(uuid);
             pendingSaveCount.incrementAndGet();
+            // Release lock asynchronously — do NOT do JDBC on the entity/region thread.
             try {
-                Long ft = playerFencingTokens.get(uuid);
-                if (ft != null) {
-                    databaseManager.releaseLock(uuid, config.getServerName(), ft);
-                } else {
-                    databaseManager.releaseLock(uuid, config.getServerName());
-                }
-                notifyLockReleased(uuid);
-            } catch (SQLException e) {
-                logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
-            } finally {
-                playerVersions.remove(uuid);
-                playerFencingTokens.remove(uuid);
+                asyncExecutor.execute(() -> {
+                    try {
+                        if (ft != null && ft > 0) {
+                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        }
+                        notifyLockReleased(uuid);
+                    } catch (SQLException e) {
+                        logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
+                    } finally {
+                        pendingSaveCount.decrementAndGet();
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                // Executor shut down — synchronous fallback (acceptable during shutdown)
                 pendingSaveCount.decrementAndGet();
+                try {
+                    if (ft != null && ft > 0) {
+                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                    }
+                    notifyLockReleased(uuid);
+                } catch (SQLException ex) {
+                    logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, ex);
+                }
             }
             return;
         }
@@ -1042,19 +1059,35 @@ public class SyncManager {
         // Check quarantine — skip save if lock was lost
         if (quarantinedPlayers.remove(uuid)) {
             logger.warning("[Quit-Sync] Player " + uuid + " was quarantined. Skipping save.");
-            try {
-                Long ft = playerFencingTokens.get(uuid);
-                if (ft != null) {
-                    databaseManager.releaseLock(uuid, config.getServerName(), ft);
-                } else {
-                    databaseManager.releaseLock(uuid, config.getServerName());
-                }
-                notifyLockReleased(uuid);
-            } catch (SQLException e) {
-                logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
-            }
+            final Long ft = playerFencingTokens.get(uuid);
             playerVersions.remove(uuid);
             playerFencingTokens.remove(uuid);
+            // Release lock asynchronously — do NOT do JDBC on the entity/region thread.
+            pendingSaveCount.incrementAndGet();
+            try {
+                asyncExecutor.execute(() -> {
+                    try {
+                        if (ft != null && ft > 0) {
+                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        }
+                        notifyLockReleased(uuid);
+                    } catch (SQLException e) {
+                        logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, e);
+                    } finally {
+                        pendingSaveCount.decrementAndGet();
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                pendingSaveCount.decrementAndGet();
+                try {
+                    if (ft != null && ft > 0) {
+                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                    }
+                    notifyLockReleased(uuid);
+                } catch (SQLException ex) {
+                    logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, ex);
+                }
+            }
             return;
         }
 
@@ -1159,7 +1192,9 @@ public class SyncManager {
         // Persistent Data Container (via strategy)
         if (pdcStrategy != null && !"off".equals(pdcStrategy.strategyName())) {
             byte[] pdcBytes = pdcStrategy.dump(player);
-            if (pdcBytes != null && pdcBytes.length > 0) {
+            if (pdcBytes != null) {
+                // Even if pdcBytes.length == 0 (empty PDC), store it so
+                // restore() is called on the target server to clear ghost keys.
                 Map<String, byte[]> pdcMap = new HashMap<>();
                 pdcMap.put("__pdc_bytes__", pdcBytes);
                 data.setPersistentDataContainer(pdcMap);
@@ -1696,6 +1731,11 @@ public class SyncManager {
                         return;
                     }
                     try {
+                        // CRITICAL: refresh version/fencingToken after acquiring the lock.
+                        // Without this, if a previous periodic/death save completed first
+                        // and advanced the DB version, this save will CAS-fail with a stale
+                        // version and be treated as a serious lock-infringement conflict.
+                        refreshVersionAndFencingToken(uuid, data);
                         persistCollectedData(uuid, data, finalKind);
                     } catch (Exception e) {
                         logger.log(Level.WARNING, finalKind + " save failed for " + uuid, e);
@@ -1927,12 +1967,14 @@ public class SyncManager {
             asyncExecutor.execute(() -> {
                 try {
                     if (ft != null && ft > 0) {
-                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        boolean released = databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        if (released) {
+                            notifyLockReleased(uuid);
+                        }
                     } else {
                         logger.warning("Stale pending data for " + uuid
-                            + " has no fencing token; refusing unsafe lock release.");
+                            + " has no fencing token; not releasing lock or notifying release.");
                     }
-                    notifyLockReleased(uuid);
                     logger.warning("Cleaned up stale pending data for " + uuid);
                 } catch (SQLException e) {
                     logger.log(Level.WARNING, "Failed to release stale lock for " + uuid, e);
@@ -2118,7 +2160,10 @@ public class SyncManager {
                 // version is higher, our own previous save (periodic/death/etc.)
                 // advanced the version while we waited for the saveLock. This is
                 // NOT an external conflict — retry with the actual version.
-                if (kind.releaseLock && !retried
+                // Applies to BOTH online saves (releaseLock=false) and final saves
+                // (releaseLock=true), since multiple online saves can queue up
+                // and the earlier one advances the version.
+                if (!retried
                     && actualFencingToken == fencingToken
                     && actualVersion > expectedVersion) {
 

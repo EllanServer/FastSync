@@ -2,6 +2,7 @@ package com.fastsync.listeners;
 
 import com.fastsync.config.ConfigManager;
 import com.fastsync.sync.SyncManager;
+import com.fastsync.util.SchedulerUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -10,9 +11,12 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.world.WorldSaveEvent;
+import org.bukkit.plugin.Plugin;
 
 import java.util.UUID;
 import java.util.logging.Logger;
+
+import com.fastsync.FastSync;
 
 /**
  * Listener for data-related events: death saves, world-save saves, and
@@ -28,11 +32,13 @@ public class DataListener implements Listener {
     private final SyncManager syncManager;
     private final ConfigManager config;
     private final Logger logger;
+    private final Plugin plugin;
 
     public DataListener(SyncManager syncManager, ConfigManager config) {
         this.syncManager = syncManager;
         this.config = config;
         this.logger = Bukkit.getLogger();
+        this.plugin = Bukkit.getPluginManager().getPlugin("FastSync");
     }
 
     /**
@@ -65,9 +71,15 @@ public class DataListener implements Listener {
             return;
         }
 
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            syncManager.savePlayerAsync(player, SyncManager.SaveKind.WORLD_SAVE);
-        }
+        // On Folia, WorldSaveEvent fires on a region thread, not the global
+        // thread. Bukkit.getOnlinePlayers() must be called from the global/main
+        // thread. Snapshot the player list there, then dispatch saves.
+        // On Paper, this is already the main thread, so runGlobal() executes inline.
+        SchedulerUtil.runGlobal(plugin, () -> {
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                syncManager.savePlayerAsync(player, SyncManager.SaveKind.WORLD_SAVE);
+            }
+        });
 
         if (config.isDebug()) {
             logger.info("[FastSync] Saved data for all online players on world save.");

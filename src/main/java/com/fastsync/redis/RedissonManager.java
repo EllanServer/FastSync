@@ -111,6 +111,10 @@ public class RedissonManager {
     private ExecutorService consumerExecutor;
     private ExecutorService messageDispatcher;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    // Max stream length for XADD MAXLEN trimming. 0 = no trimming.
+    private final int streamMaxLen;
+    // Whether to use approximate trimming (~) for better performance.
+    private final boolean streamTrimApprox;
 
     /**
      * @param host          Redis host
@@ -126,13 +130,16 @@ public class RedissonManager {
      */
     public RedissonManager(String host, int port, String password, int database,
                            String serverName, String clusterId, String channelPrefix,
-                           boolean ssl, int timeout, boolean streamsEnabled) {
+                           boolean ssl, int timeout, boolean streamsEnabled,
+                           int streamMaxLen, boolean streamTrimApprox) {
         this.host = host;
         this.port = port;
         this.password = password;
         this.database = database;
         this.serverName = serverName;
         this.ssl = ssl;
+        this.streamMaxLen = streamMaxLen;
+        this.streamTrimApprox = streamTrimApprox;
         this.timeout = timeout;
         this.streamsEnabled = streamsEnabled;
 
@@ -161,7 +168,7 @@ public class RedissonManager {
      * Legacy constructor without namespace isolation or SSL/timeout (uses "default" cluster, no TLS).
      */
     public RedissonManager(String host, int port, String password, int database, String serverName) {
-        this(host, port, password, database, serverName, "", "", false, 5000, true);
+        this(host, port, password, database, serverName, "", "", false, 5000, true, 100000, true);
     }
 
     /**
@@ -361,7 +368,15 @@ public class RedissonManager {
             return;
         }
         try {
-            StreamMessageId id = s.add(StreamAddArgs.<String, String>entries(event.toMap()));
+            StreamAddArgs<String, String> args = StreamAddArgs.<String, String>entries(event.toMap());
+            // Trim the stream to prevent unbounded growth. Uses approximate
+            // MAXLEN (~) for better performance when streamTrimApprox is true.
+            // The stream keeps at most streamMaxLen entries; older entries are
+            // evicted automatically by Redis during XADD.
+            if (streamMaxLen > 0) {
+                args.maxlen(streamTrimApprox, streamMaxLen);
+            }
+            StreamMessageId id = s.add(args);
             if (debug) {
                 LOGGER.info("[Redisson] Published " + event.type() + " (id=" + id
                     + ", uuid=" + event.uuid() + ")");
@@ -568,20 +583,35 @@ public class RedissonManager {
      *
      * @return true if the client is initialized and not shut down
      */
+    // Cached health check result — pingAll() is called at most once per 2 seconds
+    // to avoid excessive Redis round-trips during login bursts.
+    private volatile boolean cachedHealthy = true;
+    private volatile long lastHealthCheckMs = 0;
+    private static final long HEALTH_CHECK_CACHE_MS = 2000;
+
     public boolean isHealthy() {
         RedissonClient c = client;
         if (c == null) {
             return false;
         }
+        // Return cached result if recent enough
+        long now = System.currentTimeMillis();
+        if (now - lastHealthCheckMs < HEALTH_CHECK_CACHE_MS) {
+            return cachedHealthy;
+        }
         try {
             if (c.isShutdown() || c.isShuttingDown()) {
+                cachedHealthy = false;
+                lastHealthCheckMs = now;
                 return false;
             }
-            // Lightweight PING probe — verifies Redis is actually reachable,
-            // not just that the client object exists. Uses a short timeout
-            // to avoid blocking the caller (e.g., pre-login).
-            return c.getNodesGroup().pingAll();
+            // Lightweight PING probe — verifies Redis is actually reachable.
+            cachedHealthy = c.getNodesGroup().pingAll();
+            lastHealthCheckMs = now;
+            return cachedHealthy;
         } catch (Exception e) {
+            cachedHealthy = false;
+            lastHealthCheckMs = now;
             return false;
         }
     }

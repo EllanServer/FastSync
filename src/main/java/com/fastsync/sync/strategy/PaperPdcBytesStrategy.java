@@ -120,8 +120,10 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
             // Don't skip empty PDC — serializeToBytes() returns a valid empty
             // container representation that, when restored with clear=true,
             // wipes the target container. This prevents ghost keys.
+            // Even if bytes.length == 0, return it so the caller knows PDC
+            // sync was attempted and should call restore() to clear the target.
             byte[] bytes = (byte[]) serializeMethod.invoke(pdc);
-            return (bytes != null && bytes.length > 0) ? bytes : null;
+            return bytes;  // may be empty but not null — signals "PDC present, clear target"
         } catch (Exception e) {
             if (debug) logger.log(Level.FINE, "[PDC] serializeToBytes failed: " + e.getMessage(), e);
             return null;

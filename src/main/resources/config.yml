@@ -70,6 +70,12 @@ redis:
   # consumer crashes and can be recovered via XAUTOCLAIM.
   # Used for: player checkout/checkin handoff, server lifecycle events.
   streams-enabled: true
+  # Maximum number of entries to keep in the Redis stream. Older entries are
+  # trimmed automatically by XADD MAXLEN. Set to 0 to disable trimming (not recommended).
+  stream-maxlen: 100000
+  # Use approximate trimming (~ MAXLEN) for better performance. Slightly less precise
+  # but significantly faster — recommended for production.
+  stream-trim-approx: true
 
 # ------------------------------------------------------------
 # Synchronization Settings

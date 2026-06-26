@@ -77,6 +77,14 @@ public class DatabaseManager {
      * Initialize the database connection pool and create tables.
      */
     public void initialize() throws SQLException {
+        // Validate table prefix — only alphanumeric + underscore allowed to
+        // prevent SQL injection via config (e.g. backticks, spaces, semicolons).
+        String prefix = config.getTablePrefix();
+        if (prefix != null && !prefix.matches("[A-Za-z0-9_]*")) {
+            throw new IllegalArgumentException(
+                "Invalid database.table-prefix: '" + prefix
+                + "' — only alphanumeric characters and underscores are allowed.");
+        }
         dataTable = config.getTablePrefix() + "player_data";
         playerData = table(name(dataTable));
 
