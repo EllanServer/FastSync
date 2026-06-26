@@ -51,7 +51,7 @@ dependencies {
     compileOnly("com.zaxxer:HikariCP:5.1.0")
     compileOnly("org.lz4:lz4-java:1.8.0")
     compileOnly("com.mysql:mysql-connector-j:9.0.0")
-    compileOnly("io.lettuce:lettuce-core:6.4.0.RELEASE")
+    compileOnly("io.lettuce:lettuce-core:7.6.0.RELEASE")
     compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.3")
     compileOnly("org.reactivestreams:reactive-streams:1.0.4")
 
@@ -77,7 +77,7 @@ dependencies {
     testImplementation("com.zaxxer:HikariCP:5.1.0")
     testImplementation("org.lz4:lz4-java:1.8.0")
     testImplementation("com.mysql:mysql-connector-j:9.0.0")
-    testImplementation("io.lettuce:lettuce-core:6.4.0.RELEASE")
+    testImplementation("io.lettuce:lettuce-core:7.6.0.RELEASE")
     testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
     testImplementation("org.reactivestreams:reactive-streams:1.0.4")
 }
