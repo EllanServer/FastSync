@@ -33,13 +33,6 @@ updates:
         patterns:
           - "org.junit.jupiter:*"
           - "org.junit:*"
-        # JUnit 5.12+ and 6.x require Gradle 8.14+ for platform jar alignment.
-        # Stay on 5.11.x until we upgrade Gradle wrapper.
-        ignore:
-          - dependency-name: "org.junit:junit-bom"
-            update-types: ["version-update:semver-major", "version-update:semver-minor"]
-          - dependency-name: "org.junit.jupiter:junit-jupiter"
-            update-types: ["version-update:semver-major", "version-update:semver-minor"]
       testcontainers:
         patterns:
           - "org.testcontainers:*"

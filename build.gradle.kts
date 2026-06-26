@@ -1,9 +1,9 @@
 import org.gradle.api.file.DuplicatesStrategy
-import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import com.gradleup.shadow.tasks.ShadowJar
 
 plugins {
     java
-    id("com.gradleup.shadow") version "8.3.5"
+    id("com.gradleup.shadow") version "9.4.2"
 }
 
 repositories {
@@ -62,13 +62,11 @@ dependencies {
     implementation("net.momirealms:sparrow-redis-message-broker:0.0.7")
 
     // Test
-    // Note: JUnit 5.12+ and 6.x require Gradle 8.14+ for platform jar alignment.
-    // Stay on 5.11.0 until we upgrade Gradle wrapper.
-    testImplementation(platform("org.junit:junit-bom:5.11.0"))
+    testImplementation(platform("org.junit:junit-bom:6.1.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     // Note: testcontainers sub-modules (mysql, junit-jupiter) don't have 2.0.x
-    // releases yet. Keep all testcontainers on 1.21.4 for version alignment.
-    testImplementation("org.testcontainers:testcontainers:1.21.4")
+    // releases yet. Keep sub-modules on 1.21.4 until they catch up.
+    testImplementation("org.testcontainers:testcontainers:2.0.5")
     testImplementation("org.testcontainers:mysql:1.21.4")
     testImplementation("org.testcontainers:junit-jupiter:1.21.4")
     testImplementation("org.slf4j:slf4j-simple:2.0.13")

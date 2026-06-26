@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GRADLE_VERSION: 8.10
+  GRADLE_VERSION: 9.5.1
   JAVA_VERSION: 21
 
 jobs:
