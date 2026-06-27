@@ -306,6 +306,22 @@ public class ConfigManager {
         componentBatchSize = source.getInt("sync.component-storage.batch-size", 15);
         if (componentBatchSize < 1) componentBatchSize = 15;
 
+        // Validate: lock-timeout must have a sane lower bound. A lock-timeout
+        // of 0 or negative would make acquireLock's expiredTime computation
+        // (now - lockTimeout*1000) produce a value >= now, causing the lock
+        // to appear expired immediately — anyone could steal it. A lock-timeout
+        // of 1-2s is also unsafe because heartbeat refresh + DB latency can
+        // easily exceed that, causing spurious lock loss and player kicks.
+        // Enforce a minimum of 15s, which is comfortably above any reasonable
+        // heartbeat interval (heartbeat is also clamped below to <= lockTimeout/3).
+        if (lockTimeout < 15) {
+            logger.warning("[Config] lock-timeout (" + lockTimeout
+                + ") is too small (must be >= 15s). Auto-correcting to 15s. "
+                + "A smaller value would cause the lock to expire during normal "
+                + "DB latency, leading to spurious lock loss and player kicks.");
+            lockTimeout = 15;
+        }
+
         // Validate: heartbeat must be <= lockTimeout / 3 to guarantee the lock
         // is refreshed well before it expires. If misconfigured, auto-correct
         // and warn so the server still starts safely.

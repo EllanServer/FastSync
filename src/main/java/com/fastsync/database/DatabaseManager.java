@@ -341,18 +341,43 @@ public class DatabaseManager {
         // INSERT ... ON DUPLICATE KEY UPDATE merges row creation and conditional
         // lock acquisition into one statement. The INSERT arm seeds a new player
         // row (fencing_token = 1, locked_by = us); the UPDATE arm bumps the token
-        // and takes the lock only when it is free, expired, or already ours.
+        // and takes the lock only when it is free OR expired.
+        //
+        // CRITICAL: we do NOT allow `locked_by = serverName` re-acquisition.
+        // The previous `OR locked_by = ?` clause let a player quit server A
+        // (queuing an async quit save that still holds the DB lock) and
+        // immediately reconnect to the SAME server A. The reconnect would
+        // see `locked_by = "server-A"`, match the OR clause, bump the fencing
+        // token, and let the new login read stale DB data. The pending quit
+        // save would then CAS-fail against the new fencing token and the
+        // player's final state would be lost.
+        //
+        // Without the OR clause, a quick reconnect to the same backend must
+        // wait until either:
+        //   (a) the quit save completes and calls releaseLock()/saveDataAndReleaseLock*
+        //       which clears `locked_by` to NULL, OR
+        //   (b) the lock naturally expires after lock-timeout seconds.
+        //
+        // (a) is the normal fast path — quit saves finish in milliseconds, so
+        // the reconnect sees `locked_by IS NULL` on the first acquireLock
+        // retry and proceeds immediately. (b) is the safety net for crashes.
+        //
+        // Note: if you genuinely need same-process lock re-entry (e.g. for a
+        // debug command), introduce a session_id / boot_id column and gate on
+        // that, NOT on serverName. serverName alone is ambiguous because
+        // multiple server instances can share a name (misconfiguration) and
+        // because quit-save-vs-login races happen within the same name.
         String sql = String.format("""
             INSERT INTO `%s` (uuid, data, version, checksum, fencing_token, locked_by, locked_at, last_server, last_updated)
             VALUES (?, '', 0, 0, 1, ?, ?, NULL, 0)
             ON DUPLICATE KEY UPDATE
-                fencing_token = IF(locked_by IS NULL OR locked_at < ? OR locked_by = ?,
+                fencing_token = IF(locked_by IS NULL OR locked_at < ?,
                                    LAST_INSERT_ID(fencing_token + 1),
                                    fencing_token),
-                locked_by = IF(locked_by IS NULL OR locked_at < ? OR locked_by = ?,
+                locked_by = IF(locked_by IS NULL OR locked_at < ?,
                                ?,
                                locked_by),
-                locked_at = IF(locked_by IS NULL OR locked_at < ? OR locked_by = ?,
+                locked_at = IF(locked_by IS NULL OR locked_at < ?,
                                ?,
                                locked_at)
             """, dataTable);
@@ -365,12 +390,9 @@ public class DatabaseManager {
                 serverName,       // INSERT: locked_by
                 now,              // INSERT: locked_at
                 expiredTime,      // fencing_token IF predicate
-                serverName,       // fencing_token IF predicate
                 expiredTime,      // locked_by IF predicate
-                serverName,       // locked_by IF predicate
                 serverName,       // locked_by new value
                 expiredTime,      // locked_at IF predicate
-                serverName,       // locked_at IF predicate
                 now               // locked_at new value
             );
 
@@ -404,8 +426,11 @@ public class DatabaseManager {
 
             if (record != null) {
                 byte[] data = record.get(DATA_FIELD);
-                // version/checksum/fencing_token are NOT NULL columns, so the
-                // boxed Long values are never null here (auto-unboxing is safe).
+                // Return real version/checksum/fencing_token even when data is
+                // empty — see loadPlayerDataRow() for the full rationale.
+                // Callers that depend on hasData() (which checks data.length>0)
+                // still treat empty data as "no data", but the version is
+                // preserved so the next save CAS-succeeds.
                 if (data != null && data.length > 0) {
                     return new VersionedData(
                         data,
@@ -413,6 +438,15 @@ public class DatabaseManager {
                         record.get(CHECKSUM_FIELD),
                         record.get(FENCING_TOKEN_FIELD));
                 }
+                // Empty data but row exists — return a VersionedData with the
+                // real version/fencing_token but empty data. hasData() returns
+                // false, so callers treat this as "new player" for apply
+                // purposes, but the version is correct for save CAS.
+                return new VersionedData(
+                    new byte[0],
+                    record.get(VERSION_FIELD) != null ? record.get(VERSION_FIELD) : 0L,
+                    record.get(CHECKSUM_FIELD) != null ? record.get(CHECKSUM_FIELD) : 0L,
+                    record.get(FENCING_TOKEN_FIELD) != null ? record.get(FENCING_TOKEN_FIELD) : 0L);
             }
         }
         return VersionedData.EMPTY;
@@ -1077,18 +1111,52 @@ public class DatabaseManager {
                 .fetchOne();
 
             if (record != null) {
+                // CRITICAL: return the row's real metadata even when the data
+                // Blob is empty. The previous code fell through to
+                // PlayerDataRow.EMPTY (all zeros) when data was null/empty,
+                // which lost the row's actual version/checksum/fencing_token/
+                // bitmap/generation.
+                //
+                // This matters for several real scenarios:
+                //   - Migration residue: a row exists with empty data but
+                //     version=5 from a previous plugin version. Returning
+                //     version=0 would cause the next save to CAS-fail.
+                //   - Manual clear: an operator cleared the data column but
+                //     left version intact. Same CAS-fail risk.
+                //   - Conflict recovery: a recovery script may have nulled
+                //     the Blob but kept the version/fencing_token for audit.
+                //   - Empty Blob after acquireLock INSERT: the INSERT arm of
+                //     acquireLock seeds a row with data='' and version=0,
+                //     which is correct here (version IS 0). But if a prior
+                //     save had bumped version and then a full Blob save with
+                //     empty data happened (shouldn't, but defensive), we'd
+                //     want the real version.
+                //
+                // hasData() still returns false for empty data, so the load
+                // path treats the player as "new" — but playerVersions gets
+                // the REAL version, so the first save CAS-succeeds.
                 byte[] data = record.get(DATA_FIELD);
-                if (data != null && data.length > 0) {
-                    return new PlayerDataRow(
-                        data,
-                        record.get(VERSION_FIELD),
-                        record.get(CHECKSUM_FIELD),
-                        record.get(FENCING_TOKEN_FIELD),
-                        record.get(COMPONENT_BITMAP_FIELD),
-                        record.get(COMPONENT_GENERATION_FIELD));
-                }
+                long realVersion = record.get(VERSION_FIELD) != null
+                    ? record.get(VERSION_FIELD) : 0L;
+                long realChecksum = record.get(CHECKSUM_FIELD) != null
+                    ? record.get(CHECKSUM_FIELD) : 0L;
+                long realFencing = record.get(FENCING_TOKEN_FIELD) != null
+                    ? record.get(FENCING_TOKEN_FIELD) : 0L;
+                long realBitmap = record.get(COMPONENT_BITMAP_FIELD) != null
+                    ? record.get(COMPONENT_BITMAP_FIELD) : 0L;
+                long realGen = record.get(COMPONENT_GENERATION_FIELD) != null
+                    ? record.get(COMPONENT_GENERATION_FIELD) : 0L;
+                return new PlayerDataRow(
+                    data != null ? data : new byte[0],
+                    realVersion,
+                    realChecksum,
+                    realFencing,
+                    realBitmap,
+                    realGen);
             }
         }
+        // Row does not exist at all — genuinely new player. EMPTY is correct
+        // here (version=0, fencing=0, etc.).
         return PlayerDataRow.EMPTY;
     }
 

@@ -2,6 +2,7 @@ package com.fastsync.listeners;
 
 import com.fastsync.config.ConfigManager;
 import com.fastsync.sync.SyncManager;
+import com.fastsync.util.SchedulerUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -10,7 +11,10 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.world.WorldSaveEvent;
+import org.bukkit.plugin.Plugin;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.logging.Logger;
 
@@ -28,11 +32,13 @@ public class DataListener implements Listener {
     private final SyncManager syncManager;
     private final ConfigManager config;
     private final Logger logger;
+    private final Plugin plugin;
 
     public DataListener(SyncManager syncManager, ConfigManager config) {
         this.syncManager = syncManager;
         this.config = config;
         this.logger = Bukkit.getLogger();
+        this.plugin = org.bukkit.plugin.java.JavaPlugin.getPlugin(com.fastsync.FastSync.class);
     }
 
     /**
@@ -57,6 +63,20 @@ public class DataListener implements Listener {
 
     /**
      * Save all online players' data when the world is saved (save cause: "world_save").
+     *
+     * <p><b>Folia-safety:</b> WorldSaveEvent fires on the region thread that
+     * owns the world being saved. On Folia, that is NOT the global region and
+     * is NOT necessarily the region that owns each online player. Calling
+     * {@link Bukkit#getOnlinePlayers()} from a world region is unsafe, and
+     * calling {@link SyncManager#savePlayerAsync(Player, SyncManager.SaveKind)}
+     * touches the Player object (reads getUniqueId, dispatches via entity
+     * scheduler) which must happen on the global region.
+     *
+     * <p>So we dispatch to the global region first, snapshot the player list
+     * there, then call savePlayerAsync for each. savePlayerAsync itself
+     * dispatches per-player to the entity scheduler for the actual collect,
+     * so the global region is only used for the brief list-snapshot + dispatch
+     * loop, not for any DB wait.
      */
     @EventHandler
     public void onWorldSave(WorldSaveEvent event) {
@@ -64,15 +84,22 @@ public class DataListener implements Listener {
             return;
         }
 
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            // Pass SaveKind.WORLD_SAVE so that snapshot.save-trigger: "world_save"
-            // works and operation logs record the correct cause.
-            syncManager.savePlayerAsync(player, SyncManager.SaveKind.WORLD_SAVE);
-        }
+        // Dispatch to global region for the player-list snapshot + per-player
+        // save dispatch. This is safe on both Paper (runTask) and Folia
+        // (GlobalRegionScheduler.run).
+        SchedulerUtil.runGlobal(plugin, () -> {
+            List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
+            for (Player player : players) {
+                // Pass SaveKind.WORLD_SAVE so that snapshot.save-trigger:
+                // "world_save" works and operation logs record the correct cause.
+                syncManager.savePlayerAsync(player, SyncManager.SaveKind.WORLD_SAVE);
+            }
 
-        if (config.isDebug()) {
-            logger.info("[FastSync] Saved data for all online players on world save.");
-        }
+            if (config.isDebug()) {
+                logger.info("[FastSync] Saved data for " + players.size()
+                    + " online players on world save.");
+            }
+        });
     }
 
     /**

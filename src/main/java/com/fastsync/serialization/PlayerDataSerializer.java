@@ -80,7 +80,24 @@ public class PlayerDataSerializer {
         root.putBoolean("allowFlight", data.isAllowFlight());
 
         // Potion effects (list of compounds)
-        if (data.getPotionEffects() != null && !data.getPotionEffects().isEmpty()) {
+        // CRITICAL: write a presence flag AND always write the list tag, even
+        // when the list is empty. The apply path distinguishes:
+        //   null           = "not collected / unknown" → do not touch target
+        //   empty list     = "explicitly no effects" → clear all target effects
+        // If we only write the tag when non-empty (old behavior), a player who
+        // cleared all effects on server A produces no tag in the Blob; server B
+        // sees no tag, leaves data.potionEffects = null, and the apply path
+        // (correctly) does NOT clear target effects — so the old effects
+        // silently persist on server B.
+        //
+        // potionEffectsPresent=true  → data.potionEffects is meaningful
+        //                               (may be empty list = "no effects")
+        // potionEffectsPresent=false → data.potionEffects was null at serialize
+        //                               time (not collected)
+        // field absent               → legacy payload, preserve null (do not
+        //                               touch target effects for backward compat)
+        if (data.getPotionEffects() != null) {
+            root.putBoolean("potionEffectsPresent", true);
             ListTag effectList = NBT.createList();
             for (PlayerData.PotionEffectData effect : data.getPotionEffects()) {
                 CompoundTag effectTag = NBT.createCompound();
@@ -95,6 +112,8 @@ public class PlayerDataSerializer {
                 effectList.add(effectTag);
             }
             root.put("potionEffects", effectList);
+        } else {
+            root.putBoolean("potionEffectsPresent", false);
         }
 
         // Advancements (compound of compounds: key -> {criterion -> timestamp})
@@ -265,20 +284,37 @@ public class PlayerDataSerializer {
         playerData.setAllowFlight(root.getBoolean("allowFlight"));
 
         // Potion effects
-        if (root.get("potionEffects") instanceof ListTag effectList) {
-            List<PlayerData.PotionEffectData> effects = new ArrayList<>();
-            for (int i = 0; i < effectList.size(); i++) {
-                if (effectList.get(i) instanceof CompoundTag effectTag) {
-                    String typeKey = effectTag.getString("type");
-                    int duration = effectTag.getInt("duration");
-                    int amplifier = effectTag.getInt("amplifier");
-                    byte flags = effectTag.getByte("flags");
-                    effects.add(new PlayerData.PotionEffectData(typeKey, duration, amplifier,
-                        (flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0));
+        // See serialize() for the presence-flag rationale:
+        //   potionEffectsPresent=true  → set effects (may be empty list = "no effects")
+        //   potionEffectsPresent=false → set null (not collected)
+        //   field absent               → legacy payload, leave whatever the
+        //                                default is (null) — do not touch target
+        if (root.get("potionEffectsPresent") != null) {
+            if (root.getBoolean("potionEffectsPresent")) {
+                List<PlayerData.PotionEffectData> effects = new ArrayList<>();
+                if (root.get("potionEffects") instanceof ListTag effectList) {
+                    for (int i = 0; i < effectList.size(); i++) {
+                        if (effectList.get(i) instanceof CompoundTag effectTag) {
+                            String typeKey = effectTag.getString("type");
+                            int duration = effectTag.getInt("duration");
+                            int amplifier = effectTag.getInt("amplifier");
+                            byte flags = effectTag.getByte("flags");
+                            effects.add(new PlayerData.PotionEffectData(typeKey, duration, amplifier,
+                                (flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0));
+                        }
+                    }
                 }
+                // Explicitly set, even if effects is empty — empty means
+                // "clear all target effects" on apply.
+                playerData.setPotionEffects(effects);
+            } else {
+                // potionEffectsPresent=false: data was null at serialize time
+                playerData.setPotionEffects(null);
             }
-            playerData.setPotionEffects(effects);
         }
+        // else: legacy payload without potionEffectsPresent. Leave
+        // playerData.potionEffects at its default (null) — preserves
+        // backward compat with Blobs written before this flag existed.
 
         // Advancements
         if (root.get("advancements") instanceof CompoundTag advancementsTag) {
