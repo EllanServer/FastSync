@@ -165,6 +165,21 @@ sync:
   max-concurrent-loads: 6
   busy-kick-message: "&c[FastSync] Data service is busy. Please reconnect in a few seconds."
 
+# ------------------------------------------------------------
+# Shutdown Settings
+# ------------------------------------------------------------
+# Timeouts for graceful shutdown. The pending-save wait happens BEFORE
+# executors are shut down, so it must be long enough for in-flight saves
+# (including same-fencing retries) to drain. Increase for large servers
+# or slow DBs.
+shutdown:
+  # How long to wait for pending saves before closing Redis/executors (ms).
+  # Default 30s; minimum 5s.
+  pending-save-timeout-ms: 30000
+  # How long to wait for the final-save executor to shut down (seconds).
+  # Default 30s; minimum 5s.
+  final-save-executor-timeout-seconds: 30
+
   # ------------------------------------------------------------
   # Dirty Tracking (component-level change detection)
   # ------------------------------------------------------------

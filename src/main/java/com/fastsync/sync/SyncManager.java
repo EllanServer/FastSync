@@ -2660,8 +2660,10 @@ public class SyncManager {
         // Log final latency stats before shutdown
         logLatencyStats();
 
-        // Wait for pending saves first
-        waitForPendingSaves(5000);
+        // Wait for pending saves first. Timeout is configurable for large
+        // servers or slow DBs (default 30s, min 5s).
+        long pendingTimeout = config.getShutdownPendingSaveTimeoutMs();
+        waitForPendingSaves(pendingTimeout);
 
         // Close Redis (Redisson: Pub/Sub + Streams unified, publishes SERVER_STOP)
         if (redissonManager != null) {
@@ -2689,7 +2691,7 @@ public class SyncManager {
         // still be retrying under a same-fencing self-conflict (up to 3
         // attempts).
         if (finalSaveExecutor != null) {
-            finalSaveExecutor.shutdown(15);
+            finalSaveExecutor.shutdown(config.getShutdownFinalSaveExecutorTimeoutSeconds());
             finalSaveExecutor = null;
         }
     }

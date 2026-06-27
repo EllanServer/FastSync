@@ -83,6 +83,8 @@ public class ConfigManager {
     private int heartbeatIntervalSeconds;
     private int maxConcurrentLoads;
     private String busyKickMessage;
+    private long shutdownPendingSaveTimeoutMs;
+    private int shutdownFinalSaveExecutorTimeoutSeconds;
 
     // Dirty tracking — skip serialization for unchanged components
     private boolean dirtyTrackingEnabled;
@@ -398,6 +400,21 @@ public class ConfigManager {
         busyKickMessage = source.getString("sync.busy-kick-message",
             "&c[FastSync] Data service is busy. Please reconnect in a few seconds.");
 
+        // Shutdown timeouts — configurable for large servers or slow DBs.
+        // The pending-save wait happens BEFORE executors are shut down, so it
+        // must be long enough for in-flight saves to drain. The final-save
+        // executor timeout is for the finalSaveExecutor.shutdown() call.
+        shutdownPendingSaveTimeoutMs = source.getLong("shutdown.pending-save-timeout-ms", 30_000L);
+        if (shutdownPendingSaveTimeoutMs < 5_000L) {
+            logger.warning("[Config] shutdown.pending-save-timeout-ms must be >= 5000. Using 5000.");
+            shutdownPendingSaveTimeoutMs = 5_000L;
+        }
+        shutdownFinalSaveExecutorTimeoutSeconds = source.getInt("shutdown.final-save-executor-timeout-seconds", 30);
+        if (shutdownFinalSaveExecutorTimeoutSeconds < 5) {
+            logger.warning("[Config] shutdown.final-save-executor-timeout-seconds must be >= 5. Using 5.");
+            shutdownFinalSaveExecutorTimeoutSeconds = 5;
+        }
+
         // Dirty tracking — skip serialization + DB writes for unchanged
         // components. Event listeners mark components dirty; periodic saves
         // only serialize + write the dirty ones. Every Nth save forces a
@@ -573,6 +590,8 @@ public class ConfigManager {
     public int getHeartbeatIntervalSeconds() { return heartbeatIntervalSeconds; }
     public int getMaxConcurrentLoads() { return maxConcurrentLoads; }
     public String getBusyKickMessage() { return busyKickMessage; }
+    public long getShutdownPendingSaveTimeoutMs() { return shutdownPendingSaveTimeoutMs; }
+    public int getShutdownFinalSaveExecutorTimeoutSeconds() { return shutdownFinalSaveExecutorTimeoutSeconds; }
 
     /** Whether dirty-tracking-based skip is enabled for periodic saves. */
     public boolean isDirtyTrackingEnabled() { return dirtyTrackingEnabled; }
