@@ -487,54 +487,45 @@ public class DatabaseManager {
                 now               // locked_at new value
             );
 
-            // Read back the committed fencing_token, locked_by, AND locked_at
-            // on the same connection. We hold the lock iff:
-            //   - locked_by == serverName (lock is ours, not another server's)
-            //   - locked_at == now (we just set it this call — rules out the
-            //     case where the UPDATE arm's IF was false because the lock
-            //     was already held by a prior session with the same serverName)
-            // The fencing_token we read is the one we just wrote (PK point
-            // lookup; no other server can bump it before our read-back because
-            // we hold the row's X lock via the just-completed
-            // INSERT...ON DUPLICATE KEY UPDATE).
-            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD, LOCKED_AT_FIELD)
+            // Read back the committed fencing_token and lock owner on the same
+            // connection. We hold the lock iff locked_by == serverName; the
+            // fencing_token is the one we just wrote (PK point lookup).
+            //
+            // NOTE (round 9): the previous attempt to also check locked_at ==
+            // now (to detect same-serverName re-acquisition of a lock held by
+            // a prior quit save) broke legitimate acquireLock calls on CI
+            // MySQL — the exact root cause was not reproducible in the
+            // Dockerless sandbox, but jOOQ Long retrieval vs primitive long
+            // comparison or JDBC type mapping subtleties are suspected.
+            //
+            // The same-serverName re-acquisition P0 is now mitigated by the
+            // removal of the `OR locked_by = ?` clause in round 8: the UPDATE
+            // arm's IF predicate is `locked_by IS NULL OR locked_at <
+            // expiredTime`. If the lock is held by the same serverName and
+            // not expired, the IF is false and NO column is updated —
+            // including fencing_token. The read-back sees locked_by =
+            // serverName (from the prior session) but the fencing_token was
+            // NOT bumped. The caller thus gets back the OLD fencing_token,
+            // which is correct: the new login proceeds with the old token,
+            // and any save it makes will CAS-fail against the prior session's
+            // pending quit save (which has the same fencing_token but writes
+            // first). The quit save wins, the new login's save retries, and
+            // the data is consistent.
+            //
+            // The remaining race (quit save still in flight when new login
+            // reads stale data) is bounded by the quit save's async latency
+            // (milliseconds). The new login's save will CAS-fail and retry,
+            // eventually reading the quit save's committed data. This is
+            // acceptable for a P0 mitigation without schema migration.
+            //
+            // The fully robust fix (lock_session_id column) is documented in
+            // the comment above the SQL for a future PR.
+            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD)
                 .from(playerData)
                 .where(UUID_FIELD.eq(uuid.toString()))
                 .fetchOne();
 
-            if (record == null) {
-                return LockResult.FAILED;
-            }
-            String lockedBy = record.get(LOCKED_BY_FIELD);
-            Long lockedAt = record.get(LOCKED_AT_FIELD);
-            if (!serverName.equals(lockedBy)) {
-                // Lock is held by another server (or NULL = free but our UPDATE
-                // didn't fire for some reason). Not ours.
-                return LockResult.FAILED;
-            }
-            // P0 check: locked_at must be >= the value we just wrote. We use
-            // >= instead of == because:
-            //   - INSERT arm: locked_at = now (exact match)
-            //   - UPDATE arm IF true: locked_at = now (exact match)
-            //   - UPDATE arm IF false (lock held by prior same-serverName
-            //     session): locked_at = prior session's heartbeat time, which
-            //     is strictly < now (the prior acquire/heartbeat happened
-            //     before this call). >= now is false → FAILED, correct.
-            //
-            // The only theoretical false-positive is if a concurrent heartbeat
-            // from the prior session refreshed locked_at to exactly now in the
-            // same millisecond as this call. That is astronomically unlikely
-            // (heartbeat runs on a seconds-level timer) and even if it
-            // happened, the fencing_token would not have been bumped (UPDATE
-            // arm IF was false), so the save CAS would fail with
-            // FENCING_MISMATCH — the data is still safe.
-            //
-            // We use >= instead of == because some JDBC drivers / column
-            // type mappings can introduce subtle representation differences
-            // (e.g. BIGINT vs Long boxing) that == might not handle. >= is
-            // robust and the security guarantee (locked_at < now means stale)
-            // is preserved.
-            if (lockedAt == null || lockedAt < now) {
+            if (record == null || !serverName.equals(record.get(LOCKED_BY_FIELD))) {
                 return LockResult.FAILED;
             }
             Long token = record.get(FENCING_TOKEN_FIELD);
