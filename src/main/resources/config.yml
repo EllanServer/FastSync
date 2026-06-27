@@ -19,7 +19,12 @@ database:
   username: "root"
   password: "password"
 
-  # Table prefix
+  # Table prefix. Each logical FastSync cluster sharing the same MySQL
+  # database MUST use a distinct table-prefix — cluster-id (below) only
+  # isolates Redis pub/sub streams, NOT database rows. The player_data /
+  # player_component primary key is (uuid) [or (uuid, component)], with no
+  # cluster_id column. Two clusters pointing at the same database + prefix
+  # would silently overwrite each other's player blobs.
   table-prefix: "fastsync_"
 
   # Connection pool (HikariCP) settings
@@ -110,6 +115,12 @@ sync:
   sync-extra-data: true
 
   # Lock timeout in seconds (how long before a lock from another server is considered stale)
+  #
+  # CLOCK REQUIREMENT: lock expiry uses System.currentTimeMillis() on each
+  # backend. All Paper/Folia nodes MUST run NTP/chrony with max clock drift
+  # < 100ms. A fast clock may prematurely steal another server's lock; a
+  # slow clock may hold a lock past expiry. If you cannot guarantee clock
+  # sync, raise lock-timeout to absorb the drift (e.g. 120s for ±30s drift).
   lock-timeout: 60
 
   # Heartbeat interval for online lock refresh (seconds).
@@ -118,9 +129,13 @@ sync:
   # Rule: heartbeat-interval <= lock-timeout / 3 (auto-corrected if violated).
   heartbeat-interval-seconds: 10
 
-  # Lock retry settings (when data is locked by another server)
-  lock-retry-interval-ms: 1000
-  lock-max-retries: 30
+  # Lock retry settings (when data is locked by another server).
+  # Round 16 (P1 #5): defaults tightened from 1000ms x 30 (30s worst-case
+  # login wait) to 300ms x 15 (4.5s worst-case). A 30s pre-login block on
+  # every retry slot causes severe UX under login storms and DB hiccups.
+  # Velocity handoff path is faster and does not wait the full window.
+  lock-retry-interval-ms: 300
+  lock-max-retries: 15
 
   # Save delay on quit in ticks (0 = immediate, 20 = 1 second delay)
   save-delay: 0
@@ -143,10 +158,11 @@ sync:
   # size should be >= this value to avoid queue flooding with many players.
   periodic-save-batch-size: 10
   # Maximum concurrent pre-login data loads. Prevents login storms from
-  # exhausting the DB connection pool. Default: pool-size - 2 (leaves 2
-  # connections for heartbeat/quit saves). When exceeded, players are
-  # kicked with busy-kick-message and can retry immediately.
-  max-concurrent-loads: 8
+  # exhausting the DB connection pool. Round 16 (P1 #5): default now
+  # min(pool-size - 3, 6) — leaves 3 connections for heartbeat/quit/final-
+  # save threads and caps at 6 so a login burst cannot starve save traffic.
+  # When exceeded, players are kicked with busy-kick-message and can retry.
+  max-concurrent-loads: 6
   busy-kick-message: "&c[FastSync] Data service is busy. Please reconnect in a few seconds."
 
   # ------------------------------------------------------------
@@ -266,7 +282,20 @@ statistics:
 # Cluster Settings
 # ------------------------------------------------------------
 # Cluster ID for multi-cluster isolation. Servers with the same cluster ID
-# share player data. Leave empty for single cluster.
+# share player data via Redis pub/sub streams.
+#
+# IMPORTANT: cluster-id only isolates REDIS messaging (topics, streams,
+# consumer groups). It does NOT isolate database rows. The DB tables
+# (player_data, player_component) key on uuid only — there is no
+# cluster_id column. If two logical clusters share the same MySQL
+# database + table-prefix, they will silently overwrite each other's
+# player blobs even if cluster-id differs.
+#
+# To run multiple FastSync clusters against one MySQL instance, give each
+# cluster a distinct database.table-prefix (e.g. "survival_", "creative_")
+# OR a distinct database.database. validateProductionSafety() will refuse
+# to start if a non-empty cluster-id is paired with the default
+# table-prefix, since that combination is almost always a misconfiguration.
 cluster-id: ""
 
 # ------------------------------------------------------------

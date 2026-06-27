@@ -12,8 +12,13 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -79,6 +84,26 @@ public class FileOperationLogManager {
     private final Path playerLogRoot;
     private final int retention;
 
+    /**
+     * Dedicated single-thread bounded executor for log appends.
+     *
+     * <p>Round 16 (P0 #2): previously {@code append()} used
+     * {@code CompletableFuture.runAsync(task)} with no executor, which
+     * dispatches to {@code ForkJoinPool.commonPool()}. That conflicts with
+     * the project's thread-governance goal (bounded, named, manageable
+     * pools) and lets log writes escape FastSync's shutdown ordering — a
+     * plugin disabled callback could fire while commonPool still has pending
+     * log tasks, producing writes to a partially-closed manager.
+     *
+     * <p>This executor is single-threaded (log writes are sequential per
+     * process; per-UUID locks handle ordering across threads) with a large
+     * bounded queue (4096) and {@code DiscardOldestPolicy} — under extreme
+     * load we prefer to drop the oldest queued log entry rather than block
+     * the save/load path or throw. The SQL DB remains the source of truth;
+     * the operation log is an audit aid.
+     */
+    private final ExecutorService appendExecutor;
+
     /** Per-UUID locks to serialize appends and ensure ordering. */
     private final ConcurrentHashMap<UUID, Object> appendLocks = new ConcurrentHashMap<>();
 
@@ -92,6 +117,23 @@ public class FileOperationLogManager {
         this.dataDir = dataDir;
         this.playerLogRoot = dataDir.resolve(PLAYER_LOG_DIR);
         this.retention = retention;
+        this.appendExecutor = createAppendExecutor();
+    }
+
+    private static ExecutorService createAppendExecutor() {
+        AtomicInteger counter = new AtomicInteger(0);
+        java.util.concurrent.ThreadFactory factory = r -> {
+            Thread t = new Thread(r, "FastSync-OpLog-" + counter.getAndIncrement());
+            t.setDaemon(true);
+            t.setPriority(Thread.NORM_PRIORITY - 1);  // log writes should yield to save/load
+            return t;
+        };
+        return new ThreadPoolExecutor(
+            1, 1,
+            30L, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(4096),
+            factory,
+            new ThreadPoolExecutor.DiscardOldestPolicy());
     }
 
     public void initialize() {
@@ -103,7 +145,7 @@ public class FileOperationLogManager {
         }
         initialized = true;
         logger.info("[OpLog] File operation log enabled (dir=" + playerLogRoot
-            + ", retention=" + retention + ").");
+            + ", retention=" + retention + ", executor=dedicated single-thread bounded).");
     }
 
     public boolean isEnabled() {
@@ -127,14 +169,20 @@ public class FileOperationLogManager {
         if (!isEnabled()) {
             return CompletableFuture.completedFuture(null);
         }
+        // Round 16 (P0 #2): use the dedicated bounded appendExecutor instead
+        // of ForkJoinPool.commonPool(). This keeps log writes under FastSync's
+        // thread-governance and shutdown ordering. DiscardOldestPolicy ensures
+        // this never blocks the save/load path — under extreme load the oldest
+        // queued log entry is silently dropped (the DB remains the source of
+        // truth; this log is an audit aid only).
         return CompletableFuture.runAsync(() -> {
             try {
                 appendSync(entry);
-            } catch (Exception e) {
+            } catch (Throwable t) {
                 logger.log(Level.WARNING,
-                    "[OpLog] Failed to append operation log for " + entry.uuid(), e);
+                    "[OpLog] Failed to append operation log for " + entry.uuid(), t);
             }
-        });
+        }, appendExecutor);
     }
 
     private void appendSync(OperationLog entry) throws IOException {
@@ -310,7 +358,33 @@ public class FileOperationLogManager {
     }
 
     public void close() {
+        // Mark closed first so new append() calls short-circuit to a completed
+        // future instead of submitting to a shutting-down executor (which
+        // would throw RejectedExecutionException).
         closed = true;
+
+        // Round 16 (P0 #2): explicitly drain the dedicated appendExecutor.
+        // Previously append() ran on commonPool, so pending log writes could
+        // outlive the plugin — writes to a closed manager, files left half-
+        // flushed, etc. Now we own the executor and wait for in-flight appends
+        // to finish (bounded wait so a stuck flush can't hang shutdown).
+        appendExecutor.shutdown();
+        try {
+            if (!appendExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                int remaining = appendExecutor.shutdownNow().size();
+                if (remaining > 0) {
+                    logger.warning("[OpLog] Forced shutdown of append executor; "
+                        + remaining + " pending log entries were discarded.");
+                }
+                if (!appendExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+                    logger.severe("[OpLog] Append executor did not terminate!");
+                }
+            }
+        } catch (InterruptedException e) {
+            appendExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+
         appendLocks.clear();
         seqCounters.clear();
         logger.info("[OpLog] File operation log closed.");

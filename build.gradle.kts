@@ -117,6 +117,24 @@ tasks.withType<JavaCompile>().configureEach {
 
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+    // Round 16: exclude `stress` tag from the default test task — these tests
+    // need Docker + several minutes and are run by the dedicated stress.yml
+    // workflow. The `stressTest` task below re-includes them.
+    excludeTags("stress")
+    testLogging {
+        events("passed", "skipped", "failed")
+        showStandardStreams = true
+    }
+}
+
+// Dedicated task to run only the stress tests (invoked by .github/workflows/stress.yml).
+val stressTest = tasks.register<Test>("stressTest") {
+    group = "verification"
+    description = "Runs the @Tag(\"stress\") tests (requires Docker)."
+    useJUnitPlatform()
+    includeTags("stress")
+    // Stress tests are slow + need Docker; give them room.
+    timeout.set(java.time.Duration.ofMinutes(30))
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = true

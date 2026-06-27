@@ -68,6 +68,23 @@ public class SyncManager {
     private final Logger logger;
 
     private AsyncExecutor asyncExecutor;
+    /**
+     * Dedicated executor for final saves (QUIT / SHUTDOWN). Round 16 (P0 #3):
+     * previously, when the main asyncExecutor's bounded queue was full, a QUIT
+     * save fell back to running {@code persistCollectedData} synchronously on
+     * the PlayerQuitEvent thread — i.e. the Paper main thread or a Folia
+     * region/entity thread. Under DB latency spikes this blocks the game tick
+     * loop and amplifies the failure (DB slow → queue full → more synchronous
+     * fallbacks → more blocked threads).
+     *
+     * <p>This dedicated executor has a small thread count (2) and its own
+     * bounded queue sized generously (4x the main queue) so that QUIT saves
+     * — which MUST persist the player's final state — get their own lane and
+     * do not compete with periodic/death/world_save traffic. Only if THIS
+     * executor is also saturated do we fall back to synchronous execution,
+     * and that fallback now logs at SEVERE so operators see it.
+     */
+    private AsyncExecutor finalSaveExecutor;
     private RedissonManager redissonManager;
     private SnapshotManager snapshotManager;
     private ConflictManager conflictManager;
@@ -255,6 +272,13 @@ public class SyncManager {
         int poolSize = Math.max(2, config.getPoolSize() / 2);
         int queueCapacity = Math.max(1, config.getQueueCapacity());
         asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize, queueCapacity);
+
+        // Round 16 (P0 #3): dedicated final-save executor. 2 threads so a
+        // stuck save on one thread does not head-of-line block the next QUIT
+        // save; queue is 4x the main queue so QUIT saves rarely fall back to
+        // synchronous execution on the event thread.
+        int finalSaveQueueCapacity = Math.max(8, queueCapacity * 4);
+        finalSaveExecutor = new AsyncExecutor(logger, "FastSync-FinalSave", 2, finalSaveQueueCapacity);
 
         // Login backpressure semaphore — limits concurrent pre-login loads
         loginLoadSemaphore = new java.util.concurrent.Semaphore(config.getMaxConcurrentLoads(), true);
@@ -1110,35 +1134,47 @@ public class SyncManager {
         pendingSaveCount.incrementAndGet();
         java.util.concurrent.locks.ReentrantLock saveLock =
             playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+
+        // Round 16 (P0 #3): QUIT saves go to the dedicated finalSaveExecutor,
+        // NOT the main asyncExecutor. This isolates final saves from periodic
+        // / death / world_save traffic and gives them their own bounded queue,
+        // so a saturated main pool does not force QUIT saves onto the event
+        // thread. Only if the finalSaveExecutor is ALSO saturated do we fall
+        // back to synchronous execution on the current thread — and that
+        // fallback is now logged at SEVERE so operators see it.
+        java.util.Runnable quitSaveTask = () -> {
+            saveLock.lock(); // must wait — quit save must persist final state
+            try {
+                // CRITICAL: refresh version/fencingToken after acquiring the lock.
+                // A periodic/death/world_save save may have completed while we
+                // waited, advancing the DB version. Without this refresh, the
+                // QUIT save would use the stale version collected before the
+                // lock was acquired, fail the CAS, and release the lock
+                // without saving — losing the player's final state.
+                refreshVersionAndFencingToken(uuid, data);
+                persistCollectedData(uuid, data, SaveKind.QUIT, com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
+            } finally {
+                saveLock.unlock();
+                // Do NOT remove lock from map — prevents lock-object split if
+                // another thread is waiting on the same lock instance.
+                // Locks are cleaned up lazily by cleanupStaleEntries().
+                playerVersions.remove(uuid);
+                playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
+                playersWithBaseline.remove(uuid);
+                pendingSaveCount.decrementAndGet();
+            }
+        };
         try {
-            asyncExecutor.execute(() -> {
-                saveLock.lock(); // must wait — quit save must persist final state
-                try {
-                    // CRITICAL: refresh version/fencingToken after acquiring the lock.
-                    // A periodic/death/world_save save may have completed while we
-                    // waited, advancing the DB version. Without this refresh, the
-                    // QUIT save would use the stale version collected before the
-                    // lock was acquired, fail the CAS, and release the lock
-                    // without saving — losing the player's final state.
-                    refreshVersionAndFencingToken(uuid, data);
-                    persistCollectedData(uuid, data, SaveKind.QUIT, com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
-                } finally {
-                    saveLock.unlock();
-                    // Do NOT remove lock from map — prevents lock-object split if
-                    // another thread is waiting on the same lock instance.
-                    // Locks are cleaned up lazily by cleanupStaleEntries().
-                    playerVersions.remove(uuid);
-                    playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
-                    playersWithBaseline.remove(uuid);
-                    pendingSaveCount.decrementAndGet();
-                }
-            });
+            finalSaveExecutor.execute(quitSaveTask);
         } catch (java.util.concurrent.RejectedExecutionException e) {
-            // Queue full — quit save MUST NOT be lost.
-            // Fallback: run synchronously on the current thread (PlayerQuitEvent
-            // is on main/region thread, but this is better than losing data).
-            logger.log(Level.SEVERE, "Async executor rejected quit save for " + uuid
-                + " — running synchronously as fallback", e);
+            // Final-save executor also saturated. Last resort: run
+            // synchronously on the current thread (PlayerQuitEvent is on
+            // main/region thread). This blocks the tick loop, but losing the
+            // player's final state is worse. Log at SEVERE so this is visible.
+            logger.log(Level.SEVERE, "[FinalSave] Final-save executor rejected QUIT save for "
+                + uuid + " — running synchronously on event thread as last-resort fallback. "
+                + "This blocks the game tick; investigate DB latency or raise "
+                + "database.queue-capacity.", e);
             saveLock.lock();
             try {
                 refreshVersionAndFencingToken(uuid, data);
@@ -1902,8 +1938,15 @@ public class SyncManager {
                     pendingSaveCount.incrementAndGet();
                     java.util.concurrent.locks.ReentrantLock saveLock =
                         playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+                    // Round 16 (P0 #3): final saves (SHUTDOWN, releaseLock=true)
+                    // go to the dedicated finalSaveExecutor so they are not
+                    // blocked behind periodic traffic and do not fall back to
+                    // synchronous execution on the entity/global thread when
+                    // the main pool is saturated. BULK (/saveall) is an online
+                    // save and stays on the main asyncExecutor.
+                    AsyncExecutor targetExecutor = kind.releaseLock ? finalSaveExecutor : asyncExecutor;
                     try {
-                        asyncExecutor.execute(() -> {
+                        targetExecutor.execute(() -> {
                             SaveResult result;
                             try {
                                 saveLock.lock();
@@ -1934,9 +1977,12 @@ public class SyncManager {
                         pendingSaveCount.decrementAndGet();
                         if (kind == SaveKind.SHUTDOWN) {
                             // SHUTDOWN: synchronous fallback — must persist data.
-                            // The async queue is full, but shutdown cannot skip saves.
-                            logger.warning("[Shutdown] Async queue full for " + uuid
-                                + " — running synchronously as fallback");
+                            // The final-save queue is full, but shutdown cannot
+                            // skip saves. Log at SEVERE: this runs DB I/O on the
+                            // entity/global thread and blocks the tick loop.
+                            logger.log(Level.SEVERE, "[Shutdown] Final-save executor queue full for " + uuid
+                                + " — running synchronously on event thread as fallback. "
+                                + "Investigate DB latency or raise database.queue-capacity.", e);
                             SaveResult result;
                             try {
                                 saveLock.lock();
@@ -2620,6 +2666,18 @@ public class SyncManager {
         if (asyncExecutor != null) {
             asyncExecutor.shutdown(10);
             asyncExecutor = null;
+        }
+
+        // Round 16 (P0 #3): shut down the final-save executor AFTER the main
+        // pool. waitForPendingSaves() above waits on pendingSaveCount, which
+        // is incremented by QUIT saves submitted to either executor, so by
+        // the time we reach here all final saves have completed. The shutdown
+        // timeout is longer than the main pool's because final saves may
+        // still be retrying under a same-fencing self-conflict (up to 3
+        // attempts).
+        if (finalSaveExecutor != null) {
+            finalSaveExecutor.shutdown(15);
+            finalSaveExecutor = null;
         }
     }
 

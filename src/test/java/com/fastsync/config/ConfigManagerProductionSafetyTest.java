@@ -97,6 +97,63 @@ class ConfigManagerProductionSafetyTest {
             "sslMode=REQUIRED to a remote host is allowed");
     }
 
+    // ==================== Round 16: cluster-id DB isolation ====================
+
+    /**
+     * Round 16 (P0 #1): a non-empty cluster-id paired with the default
+     * table-prefix must refuse startup. cluster-id only isolates Redis
+     * messaging, NOT database rows — two clusters sharing the same MySQL
+     * database + table-prefix would silently overwrite each other's data.
+     */
+    @Test
+    void rejectsClusterIdWithDefaultTablePrefix() throws Exception {
+        ConfigManager config = base();
+        set(config, "clusterId", "production");
+        set(config, "tablePrefix", "fastsync_");  // the default
+        assertThrows(RuntimeException.class,
+            config::validateProductionSafety,
+            "cluster-id + default table-prefix must refuse startup (DB row collision risk)");
+    }
+
+    /**
+     * Round 16 (P0 #1): a non-empty cluster-id with a DISTINCT table-prefix
+     * is allowed — the operator has explicitly isolated DB rows per cluster.
+     */
+    @Test
+    void allowsClusterIdWithDistinctTablePrefix() throws Exception {
+        ConfigManager config = base();
+        set(config, "clusterId", "production");
+        set(config, "tablePrefix", "prod_");  // distinct, not the default
+        assertDoesNotThrow(config::validateProductionSafety,
+            "cluster-id + distinct table-prefix is allowed");
+    }
+
+    /**
+     * Round 16 (P0 #1): empty cluster-id (single-cluster deploy) with the
+     * default table-prefix is allowed — no multi-cluster collision risk.
+     */
+    @Test
+    void allowsEmptyClusterIdWithDefaultTablePrefix() throws Exception {
+        ConfigManager config = base();
+        set(config, "clusterId", "");  // single cluster
+        set(config, "tablePrefix", "fastsync_");  // default is fine for single cluster
+        assertDoesNotThrow(config::validateProductionSafety,
+            "empty cluster-id + default table-prefix is allowed for single-cluster deploys");
+    }
+
+    /**
+     * Round 16 (P0 #1): blank cluster-id (whitespace only) is treated as
+     * empty — must NOT trigger the rejection.
+     */
+    @Test
+    void allowsBlankClusterIdWithDefaultTablePrefix() throws Exception {
+        ConfigManager config = base();
+        set(config, "clusterId", "   ");
+        set(config, "tablePrefix", "fastsync_");
+        assertDoesNotThrow(config::validateProductionSafety,
+            "blank cluster-id must be treated as empty (no multi-cluster intent)");
+    }
+
     /** Start from TestConfigBuilder defaults (which pass validation) and override per-test. */
     private static ConfigManager base() throws Exception {
         return new TestConfigBuilder().defaults().build();
