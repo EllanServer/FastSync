@@ -10,7 +10,6 @@ import org.bukkit.entity.Player;
  *   <li>{@code off} — no PDC sync at all</li>
  *   <li>{@code safe-all-paper} — use Paper's public serializeToBytes() API (default)</li>
  *   <li>{@code registered-only} — only sync explicitly registered keys (production recommended)</li>
- *   <li>{@code unsafe-reflection} — reflection fallback for older Paper versions</li>
  * </ul>
  */
 public interface PdcSyncStrategy {
