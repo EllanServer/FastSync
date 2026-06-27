@@ -45,7 +45,17 @@ jobs:
             ${{ runner.os }}-gradle-
 
       - name: Run gradle build
-        run: ./gradlew build --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          ./gradlew build --no-daemon --stacktrace 2>&1 | tee build-output.log
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-output-log
+          path: build-output.log
+          retention-days: 7
 
       - name: Print test results on failure
         if: failure()

@@ -138,7 +138,7 @@ val stressTest = tasks.register<Test>("stressTest") {
         includeTestsMatching("com.fastsync.stress.*")
     }
     // Stress tests are slow + need Docker; give them room.
-    timeout = java.time.Duration.ofMinutes(30)
+    timeout.set(java.time.Duration.ofMinutes(30))
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = true
