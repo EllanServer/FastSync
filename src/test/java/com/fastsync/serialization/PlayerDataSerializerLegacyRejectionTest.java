@@ -36,7 +36,7 @@ class PlayerDataSerializerLegacyRejectionTest {
      * path to skip clearing target effects — a stale-effect rollback.
      */
     @Test
-    void deserializeRejectsPayloadMissingPotionEffectsPresent() {
+    void deserializeRejectsPayloadMissingPotionEffectsPresent() throws IOException {
         // Empty root compound: every field defaults, no ItemStack tags, and
         // critically no potionEffectsPresent flag.
         CompoundTag root = NBT.createCompound();
@@ -60,7 +60,7 @@ class PlayerDataSerializerLegacyRejectionTest {
      * no ItemStack deserialization runs — only the offhandPresent guard fires.
      */
     @Test
-    void deserializeComponentRejectsInventoryMissingOffhandPresent() {
+    void deserializeComponentRejectsInventoryMissingOffhandPresent() throws IOException {
         // Root: { "INVENTORY": { } } — empty component with no offhandPresent.
         CompoundTag root = NBT.createCompound();
         CompoundTag inventoryComponent = NBT.createCompound();
