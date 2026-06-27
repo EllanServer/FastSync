@@ -579,16 +579,19 @@ public class DatabaseManager {
      */
     public boolean releaseLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
         requireLockSession(lockSessionId, "releaseLock");
-        try (Connection conn = dataSource.getConnection()) {
-            return dsl(conn).update(playerData)
-                .set(LOCKED_BY_FIELD, (String) null)
-                .set(LOCKED_AT_FIELD, (Long) null)
-                .set(LOCK_SESSION_ID_FIELD, (String) null)
-                .where(UUID_FIELD.eq(uuid.toString())
-                    .and(LOCKED_BY_FIELD.eq(serverName))
-                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                    .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
-                .execute() > 0;
+        // Use raw JDBC to avoid jOOQ Field type resolution issues with
+        // lock_session_id column on CI MySQL.
+        String sql = String.format(
+            "UPDATE `%s` SET `locked_by` = NULL, `locked_at` = NULL, `lock_session_id` = NULL " +
+            "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
+            dataTable);
+        try (Connection conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(sql)) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, serverName);
+            ps.setLong(3, fencingToken);
+            ps.setString(4, lockSessionId);
+            return ps.executeUpdate() > 0;
         }
     }
 
