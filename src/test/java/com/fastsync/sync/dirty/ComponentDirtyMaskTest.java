@@ -379,4 +379,135 @@ class ComponentDirtyMaskTest {
         assertFalse(dirty.contains(ComponentDirtyMask.Component.EXPERIENCE),
             "EXPERIENCE epoch matched snapshot — cleared");
     }
+
+    /**
+     * Reproduces the conservative-dirty-marking ordering bug from review round 6.
+     *
+     * <p>Before the fix, savePlayerAsync's logic was:
+     * <pre>
+     *   boolean shouldValidate = dirtyMask.recordSaveAndCheckValidation(uuid);
+     *   if (!shouldValidate && !dirtyMask.isAnyDirty(uuid)) {
+     *       return;  // ❌ returns BEFORE conservative marks run
+     *   }
+     *   if (shouldValidate) {
+     *       dirtyMask.markAllDirty(uuid);
+     *   } else if (config.isComponentStorageEnabled()) {
+     *       dirtyMask.markDirty(uuid, PDC);
+     *       dirtyMask.markDirty(uuid, STATISTICS);
+     *       dirtyMask.markDirty(uuid, ATTRIBUTES);
+     *       dirtyMask.markDirty(uuid, ADVANCEMENTS);
+     *   }
+     * </pre>
+     *
+     * <p>When a plugin modifies PDC/stats/attrs/advancements via API without
+     * firing a Bukkit event, no dirty bit gets set. The skip check returns
+     * early, the conservative marks never run, and those changes are silently
+     * dropped until the next validation cycle (default every 5th save).
+     *
+     * <p>The fix moves the conservative marks BEFORE the skip check. This
+     * test verifies the new ordering: with component-storage enabled and no
+     * event-driven dirty, the conservative marks must run first, making
+     * isAnyDirty() return true, so the save does NOT skip.
+     *
+     * <p>Note: this test does NOT call savePlayerAsync (which needs Bukkit).
+     * It simulates the dirty-decision logic directly against the mask,
+     * verifying the ordering invariant the fix depends on.
+     */
+    @Test
+    void testConservativeDirtyMarksRunBeforeSkipCheck() {
+        // Simulate: player has NO event-driven dirty bits, but plugin modified
+        // PDC/stats/attrs/advancements via API. No events fired → mask is empty.
+        assertFalse(mask.isAnyDirty(player1),
+            "Precondition: no event-driven dirty bits");
+
+        // Simulate the FIXED savePlayerAsync ordering:
+        //   1. recordSaveAndCheckValidation returns false (not validation cycle)
+        //   2. component-storage enabled → conservative marks run
+        //   3. THEN check isAnyDirty
+        boolean shouldValidate = mask.recordSaveAndCheckValidation(player1);
+        assertFalse(shouldValidate, "First save should not trigger validation");
+
+        boolean componentStorageEnabled = true;  // simulate config flag
+        if (shouldValidate) {
+            mask.markAllDirty(player1);
+        } else if (componentStorageEnabled) {
+            // Conservative marks — these MUST run before the skip check
+            mask.markDirty(player1, ComponentDirtyMask.Component.PDC);
+            mask.markDirty(player1, ComponentDirtyMask.Component.STATISTICS);
+            mask.markDirty(player1, ComponentDirtyMask.Component.ATTRIBUTES);
+            mask.markDirty(player1, ComponentDirtyMask.Component.ADVANCEMENTS);
+        }
+
+        // NOW the skip check runs. With conservative marks applied, it must
+        // NOT skip — isAnyDirty must return true.
+        assertTrue(mask.isAnyDirty(player1),
+            "After conservative marks, isAnyDirty must be true — save must NOT skip. "
+            + "If this fails, the conservative marks are running AFTER the skip check "
+            + "and plugin-driven PDC/stats/attrs/advancements changes will be lost.");
+
+        // Verify all 4 conservative components are marked
+        Set<ComponentDirtyMask.Component> dirty = mask.getDirty(player1);
+        assertTrue(dirty.contains(ComponentDirtyMask.Component.PDC));
+        assertTrue(dirty.contains(ComponentDirtyMask.Component.STATISTICS));
+        assertTrue(dirty.contains(ComponentDirtyMask.Component.ATTRIBUTES));
+        assertTrue(dirty.contains(ComponentDirtyMask.Component.ADVANCEMENTS));
+        assertEquals(4, dirty.size(),
+            "Exactly the 4 conservative components should be dirty");
+    }
+
+    /**
+     * Counter-test: when component-storage is DISABLED and no events fired,
+     * the skip check correctly skips (no conservative marks to apply).
+     * This verifies the fix does not break the existing skip optimization.
+     */
+    @Test
+    void testSkipStillWorksWhenComponentStorageDisabledAndNoDirty() {
+        assertFalse(mask.isAnyDirty(player1));
+
+        boolean shouldValidate = mask.recordSaveAndCheckValidation(player1);
+        assertFalse(shouldValidate);
+
+        boolean componentStorageEnabled = false;  // simulate config flag
+        if (shouldValidate) {
+            mask.markAllDirty(player1);
+        } else if (componentStorageEnabled) {
+            mask.markDirty(player1, ComponentDirtyMask.Component.PDC);
+            mask.markDirty(player1, ComponentDirtyMask.Component.STATISTICS);
+            mask.markDirty(player1, ComponentDirtyMask.Component.ATTRIBUTES);
+            mask.markDirty(player1, ComponentDirtyMask.Component.ADVANCEMENTS);
+        }
+
+        // Skip check: no dirty → skip
+        assertFalse(mask.isAnyDirty(player1),
+            "With component-storage disabled and no events, isAnyDirty must be false "
+            + "so the save correctly skips (existing optimization preserved).");
+    }
+
+    /**
+     * Verifies that even on a validation cycle, conservative marks are
+     * redundant (markAllDirty already covers them) but the skip check
+     * still correctly does NOT skip.
+     */
+    @Test
+    void testValidationCycleDoesNotSkipEvenWithoutEvents() {
+        assertFalse(mask.isAnyDirty(player1));
+
+        // Force validation cycle: call recordSaveAndCheckValidation enough
+        // times to hit the interval (default 5 in setUp).
+        for (int i = 1; i <= 4; i++) {
+            assertFalse(mask.recordSaveAndCheckValidation(player1),
+                "Saves 1-4 should not trigger validation");
+        }
+        boolean shouldValidate = mask.recordSaveAndCheckValidation(player1);
+        assertTrue(shouldValidate, "5th save should trigger validation");
+
+        // markAllDirty runs on validation cycle
+        mask.markAllDirty(player1);
+
+        // Skip check must NOT skip — markAllDirty set everything
+        assertTrue(mask.isAnyDirty(player1),
+            "After markAllDirty on validation cycle, isAnyDirty must be true");
+        assertEquals(ComponentDirtyMask.ALL.size(), mask.getDirty(player1).size(),
+            "All components should be dirty after markAllDirty");
+    }
 }

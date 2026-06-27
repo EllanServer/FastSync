@@ -1932,14 +1932,17 @@ public class SyncManager {
         // do a full collect + checksum to catch any changes that slipped
         // through events. recordSaveAndCheckValidation() returns true when
         // validation is due.
+        //
+        // CRITICAL ORDERING: the conservative dirty marking for components
+        // without event coverage (PDC, STATISTICS, ATTRIBUTES, ADVANCEMENTS)
+        // MUST happen BEFORE the "no dirty → skip" check. Otherwise, when a
+        // plugin modifies PDC/stats/attrs/advancements via API without firing
+        // a Bukkit event, no dirty bit gets set, the skip check returns early,
+        // and those changes are silently dropped until the next validation
+        // cycle (default every 5th save). If the server crashes in that
+        // window, the changes are lost.
         if (dirtyMask != null && finalKind == SaveKind.PERIODIC) {
             boolean shouldValidate = dirtyMask.recordSaveAndCheckValidation(uuid);
-            if (!shouldValidate && !dirtyMask.isAnyDirty(uuid)) {
-                if (config.isDebug()) {
-                    logger.fine("Skipping periodic save for " + uuid + " — no dirty components");
-                }
-                return;
-            }
             if (shouldValidate) {
                 // Force full collect + dirty-mark everything to ensure checksum
                 // comparison happens in persistCollectedData.
@@ -1947,15 +1950,36 @@ public class SyncManager {
             } else if (config.isComponentStorageEnabled()) {
                 // Conservative dirty strategy for components without event coverage.
                 // DirtyTrackingListener does NOT cover: PDC changes (no events),
-                // Statistics changes (no granular events), Attribute changes (rare).
+                // Statistics changes (no granular events), Attribute changes (rare),
+                // Advancements (criteria granted via API without event).
                 // When component-storage is enabled, these components would only
-                // be written during validation saves (every Nth cycle). To avoid
-                // losing changes between validations, conservatively mark them
-                // dirty on every periodic save when component-storage is on.
+                // be written during validation saves (every Nth cycle) if we did
+                // not conservatively mark them here. To avoid losing changes
+                // between validations, mark them dirty on every periodic save
+                // when component-storage is on. This is a small cost (4 extra
+                // component serializations + DB writes per periodic save) but
+                // prevents silent data loss for plugin-driven state changes.
+                //
+                // NOTE: This MUST run before the "no dirty → skip" check below.
+                // If it ran after, a player with no event-driven dirty bits
+                // would skip the save entirely and never pick up the
+                // conservative marks until the next validation cycle.
                 dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
                 dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
                 dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
                 dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
+            }
+            // Now check if there's anything to save. After the conservative
+            // marks above (when component-storage is on) or markAllDirty (when
+            // validating), there will usually be dirty bits. The only case
+            // where we still skip is: component-storage OFF + no validation
+            // due + no event-driven dirty. In that case the next periodic
+            // save will try again.
+            if (!shouldValidate && !dirtyMask.isAnyDirty(uuid)) {
+                if (config.isDebug()) {
+                    logger.fine("Skipping periodic save for " + uuid + " — no dirty components");
+                }
+                return;
             }
         }
 

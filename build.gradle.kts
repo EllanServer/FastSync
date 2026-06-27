@@ -38,7 +38,14 @@ dependencies {
     // Velocity proxy API
     compileOnly("com.velocitypowered:velocity-api:3.5.0-SNAPSHOT")
     compileOnly("org.slf4j:slf4j-api:2.0.18")
-    compileOnly("io.netty:netty-bom:4.2.15.Final")
+    // Netty BOM must be declared with platform(...) so Gradle treats it as a
+    // BOM (dependency constraints) rather than a regular dependency. Without
+    // platform(), the BOM artifact itself gets added to the classpath as a
+    // no-op jar, and version alignment of netty-* modules relies on the
+    // explicit versions below rather than the BOM. Using platform() also
+    // future-proofs: if we later drop the explicit versions, the BOM will
+    // supply them correctly.
+    compileOnly(platform("io.netty:netty-bom:4.2.15.Final"))
     compileOnly("io.netty:netty-transport:4.2.15.Final")
     compileOnly("io.netty:netty-buffer:4.2.15.Final")
     compileOnly("io.netty:netty-codec:4.2.15.Final")
@@ -160,7 +167,8 @@ val velocityOnly by configurations.creating
 dependencies {
     add("velocityOnly", "com.velocitypowered:velocity-api:3.5.0-SNAPSHOT")
     add("velocityOnly", "org.slf4j:slf4j-api:2.0.18")
-    add("velocityOnly", "io.netty:netty-bom:4.2.15.Final")
+    // Netty BOM as platform (see main dependencies block for rationale)
+    add("velocityOnly", platform("io.netty:netty-bom:4.2.15.Final"))
     add("velocityOnly", "io.netty:netty-transport:4.2.15.Final")
     add("velocityOnly", "io.netty:netty-buffer:4.2.15.Final")
     add("velocityOnly", "io.netty:netty-codec:4.2.15.Final")
