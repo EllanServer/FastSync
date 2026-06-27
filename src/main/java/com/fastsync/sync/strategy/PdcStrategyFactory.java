@@ -81,7 +81,9 @@ public class PdcStrategyFactory {
             case "BYTE" -> PersistentDataType.BYTE;
             case "BOOLEAN" -> PersistentDataType.BOOLEAN;
             case "BYTE_ARRAY" -> PersistentDataType.BYTE_ARRAY;
-            // List types are Paper 1.20.6+ only — use reflection if needed
+            // List-typed PersistentDataTypes are intentionally not exposed
+            // here: the registered-keys path targets stable scalar/array
+            // types only. Add new scalar types explicitly when needed.
             default -> null;
         };
     }

@@ -249,29 +249,19 @@ public class PlayerDataSerializer {
         playerData.setTotalExperience(root.getInt("totalExperience"));
 
         // Extra
-        // Try name-based deserialization first (current format: gameMode stored as STRING)
+        // gameMode is stored as a STRING (e.g. "SURVIVAL", "CREATIVE"). The
+        // legacy ordinal-byte format written by very old builds was removed
+        // when the project dropped old-version compatibility; data still
+        // carrying a byte tag here is treated as corrupt rather than silently
+        // reinterpreted, so a future migration tool can find it.
         GameMode gameMode = GameMode.SURVIVAL;
-        try {
-            String gmName = root.getString("gameMode");
-            if (gmName != null && !gmName.isEmpty()) {
-                gameMode = GameMode.valueOf(gmName);
-            }
-        } catch (Exception nameEx) {
-            // Fallback: legacy ordinal-based format (for data saved by older versions).
-            // The old format stored gameMode as a BYTE (ordinal). We need to check
-            // the tag type before reading as byte to avoid exceptions when the tag
-            // is actually a STRING (current format).
+        String gmName = root.getString("gameMode");
+        if (gmName != null && !gmName.isEmpty()) {
             try {
-                Tag gmTag = root.get("gameMode");
-                if (gmTag instanceof net.momirealms.sparrow.nbt.ByteTag byteTag) {
-                    int gmOrdinal = byteTag.getAsByte() & 0xFF;
-                    GameMode[] gameModes = GameMode.values();
-                    if (gmOrdinal >= 0 && gmOrdinal < gameModes.length) {
-                        gameMode = gameModes[gmOrdinal];
-                    }
-                }
-            } catch (Exception ordEx) {
-                // Keep SURVIVAL default
+                gameMode = GameMode.valueOf(gmName);
+            } catch (IllegalArgumentException e) {
+                throw new IOException("Unknown gameMode value '" + gmName
+                    + "' (expected a GameMode name)", e);
             }
         }
         playerData.setGameMode(gameMode);
@@ -434,17 +424,22 @@ public class PlayerDataSerializer {
 
     /**
      * Convert ListTag of ByteArrayTag back to ItemStack[].
+     *
+     * <p>A deserialization failure for a non-empty slot is propagated as an
+     * {@link ItemSerializationException} rather than silently turned into a
+     * {@code null} slot. Silently dropping a corrupted item would delete the
+     * player's item on the next save; surfacing the failure lets the caller
+     * (load path) refuse the whole Blob / record a conflict snapshot.
      */
     private static ItemStack[] fromItemStackList(ListTag list) {
         ItemStack[] items = new ItemStack[list.size()];
         for (int i = 0; i < list.size(); i++) {
             Tag element = list.get(i);
             if (element instanceof net.momirealms.sparrow.nbt.ByteArrayTag baTag) {
-                try {
-                    items[i] = ItemStackCompat.deserialize(baTag.getAsByteArray());
-                } catch (Exception e) {
-                    items[i] = null;
-                }
+                // ItemStackCompat.deserialize returns null for an empty payload
+                // (a real air slot) and throws ItemSerializationException on
+                // genuine corruption. Both behaviors are correct here.
+                items[i] = ItemStackCompat.deserialize(baTag.getAsByteArray());
             }
         }
         return items;
@@ -575,7 +570,8 @@ public class PlayerDataSerializer {
                     c.put("potionEffects", effectList);
                 }
             }
-            case "GAME_MODE" -> c.putByte("gameMode", (byte)(data.getGameMode() != null ? data.getGameMode().ordinal() : 0));
+            case "GAME_MODE" -> c.putString("gameMode",
+                data.getGameMode() != null ? data.getGameMode().name() : "SURVIVAL");
             case "FIRE_TICKS" -> c.putInt("fireTicks", data.getFireTicks());
             case "AIR" -> {
                 c.putInt("remainingAir", data.getRemainingAir());
@@ -731,9 +727,22 @@ public class PlayerDataSerializer {
                 data.setPotionEffects(effects);
             }
             case "GAME_MODE" -> {
-                int ord = c.getByte("gameMode") & 0xFF;
-                GameMode[] modes = GameMode.values();
-                data.setGameMode(ord < modes.length ? modes[ord] : GameMode.SURVIVAL);
+                // Stored as a GameMode name string. Matches the full-Blob path
+                // (both write String now); the legacy ordinal-byte form is no
+                // longer read on the hot path. An unknown value is surfaced as
+                // an exception so a corrupt component is rejected rather than
+                // silently falling back to SURVIVAL.
+                String gmName = c.getString("gameMode");
+                if (gmName == null || gmName.isEmpty()) {
+                    data.setGameMode(GameMode.SURVIVAL);
+                } else {
+                    try {
+                        data.setGameMode(GameMode.valueOf(gmName));
+                    } catch (IllegalArgumentException e) {
+                        throw new IOException("Unknown gameMode value '" + gmName
+                            + "' in GAME_MODE component (expected a GameMode name)", e);
+                    }
+                }
             }
             case "FIRE_TICKS" -> data.setFireTicks(c.getInt("fireTicks"));
             case "AIR" -> {

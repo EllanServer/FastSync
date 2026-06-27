@@ -219,4 +219,65 @@ class DatabaseManagerTest {
         assertFalse(saveSql.toUpperCase().contains("FOR UPDATE"),
                 "saveData SQL must not use FOR UPDATE (single-row PK CAS)");
     }
+
+    @Test
+    void testRefreshLockBatchFailsPlayersWithMissingSessionId() throws SQLException {
+        // refreshLockBatch requires a non-null, non-blank lock_session_id for
+        // each player. A missing session means we have no in-memory record of
+        // owning the lock, so the batch must treat that player as failed
+        // (fail-closed → heartbeat will quarantine them) instead of sending a
+        // NULL bind that silently updates 0 rows.
+        UUID uuidWithSession = UUID.randomUUID();
+        UUID uuidWithoutSession = UUID.randomUUID();
+
+        // Acquire real locks for both players.
+        LockResult lockA = databaseManager.acquireLock(uuidWithSession, "server-a", "session-a");
+        assertTrue(lockA.acquired());
+        LockResult lockB = databaseManager.acquireLock(uuidWithoutSession, "server-a", "session-b");
+        assertTrue(lockB.acquired());
+
+        java.util.Map<UUID, Long> toRefresh = new java.util.HashMap<>();
+        toRefresh.put(uuidWithSession, lockA.fencingToken());
+        toRefresh.put(uuidWithoutSession, lockB.fencingToken());
+
+        // Only one player has a recorded session; the other's map entry is
+        // deliberately absent.
+        java.util.Map<UUID, String> sessions = new java.util.HashMap<>();
+        sessions.put(uuidWithSession, "session-a");
+
+        java.util.Set<UUID> failed = new java.util.HashSet<>();
+        databaseManager.refreshLockBatch(toRefresh, sessions, "server-a", failed);
+
+        assertTrue(failed.contains(uuidWithoutSession),
+            "Player with no recorded session id must be reported failed (fail-closed)");
+        assertFalse(failed.contains(uuidWithSession),
+            "Player with a valid session id should refresh successfully");
+
+        // The player whose session WAS present should still hold the lock
+        // (refreshed_at advanced). Verify a fresh acquire from another server
+        // still fails — i.e. the refresh did not release it.
+        LockResult steal = databaseManager.acquireLock(uuidWithSession, "server-b", "session-b2");
+        assertFalse(steal.acquired(),
+            "Lock for the refreshed player should still be held by server-a");
+    }
+
+    @Test
+    void testRefreshLockBatchFailsPlayersWithBlankSessionId() throws SQLException {
+        // A blank (whitespace-only) session id must be treated the same as a
+        // missing one — fail-closed, not silently bound as NULL.
+        UUID uuid = UUID.randomUUID();
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "session-a");
+        assertTrue(lock.acquired());
+
+        java.util.Map<UUID, Long> toRefresh = new java.util.HashMap<>();
+        toRefresh.put(uuid, lock.fencingToken());
+        java.util.Map<UUID, String> sessions = new java.util.HashMap<>();
+        sessions.put(uuid, "   "); // blank
+
+        java.util.Set<UUID> failed = new java.util.HashSet<>();
+        databaseManager.refreshLockBatch(toRefresh, sessions, "server-a", failed);
+
+        assertTrue(failed.contains(uuid),
+            "Player with a blank session id must be reported failed (fail-closed)");
+    }
 }

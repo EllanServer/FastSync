@@ -33,8 +33,15 @@ database:
   max-lifetime: 1800000
   leak-detection-threshold: 60000
 
-  # Extra JDBC parameters
-  parameters: "useSSL=false&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&failOverReadOnly=false&maxReconnects=10"
+  # Extra JDBC parameters.
+  # NOTE: do NOT use autoReconnect / failOverReadOnly / maxReconnects here.
+  # Those make connection state opaque after a reconnect and hide failures
+  # from HikariCP + the plugin's protection mode. HikariCP handles reconnects
+  # itself; let it (and the plugin's DB-unhealthy protection mode) own failover.
+  # For TLS, prefer sslMode=DISABLED (same-machine/internal), REQUIRED (cross-
+  # machine, encrypted, no identity check), or VERIFY_IDENTITY (cross-machine,
+  # encrypted + verified). Avoid bare useSSL= which is deprecated.
+  parameters: "sslMode=DISABLED&useUnicode=true&characterEncoding=UTF-8"
 
 # ------------------------------------------------------------
 # Redis Settings (for cross-server lock coordination via pub/sub)
@@ -204,10 +211,10 @@ sync:
 # ------------------------------------------------------------
 # Controls how custom PersistentDataContainer data is synchronized.
 #   off              - No PDC sync
-#   safe-all-paper   - Use Paper's serializeToBytes() API via reflection.
-#                      Safe, no reflection of internal classes. Works on
-#                      Paper 1.21.11+ (public API) and older versions (package-
-#                      private methods via reflection, still safe).
+#   safe-all-paper   - Use Paper 1.21.11+ public PDC byte API
+#                      (PersistentDataContainerView.serializeToBytes /
+#                       readFromBytes). No reflection. Older Paper versions
+#                      are not supported and will fail at class-load time.
 #   registered-only  - (default) Only sync keys explicitly listed in registered-keys below.
 #                      Production recommended: avoids syncing plugin-internal data.
 #                      Uses stable Bukkit API, compatible with all Paper versions.
@@ -296,6 +303,15 @@ serialization:
   # Format version (stored in the first byte of serialized data)
   # Used for future migration support
   format-version: 1
+
+  # Decompression bounds — guard against corrupted / poisoned DB blobs
+  # triggering OOM (or NegativeArraySize) on the login thread. The unwrap
+  # path reads the declared original length straight out of the blob header;
+  # these caps are enforced BEFORE the destination array is allocated.
+  # Raise only if you have legitimately huge player data and have verified
+  # memory headroom. A value <= 0 falls back to the default.
+  max-raw-bytes: 1048576      # 1 MiB — cap on declared decompressed length
+  max-wrapped-bytes: 2621440  # 2.5 MiB — cap on the on-disk wrapped payload
 
 # ------------------------------------------------------------
 # Debug Settings

@@ -1,6 +1,7 @@
 package com.fastsync.serialization;
 
 import net.jpountz.lz4.LZ4Compressor;
+import net.jpountz.lz4.LZ4Exception;
 import net.jpountz.lz4.LZ4Factory;
 import net.jpountz.lz4.LZ4FastDecompressor;
 
@@ -21,17 +22,19 @@ import net.jpountz.lz4.LZ4FastDecompressor;
  * <p>This avoids the base64 string encoding overhead that plagues other sync plugins.
  * LZ4 provides ~3-5x compression on NBT data with extremely fast decompression.
  *
- * <h2>Performance (rewritten)</h2>
- * <ul>
- *   <li>{@link #wrap}: previously allocated a temp {@code byte[maxCompressedLen]}
- *       buffer, compressed into it, then {@code System.arraycopy} into a final
- *       result buffer — two large allocations per save. Now writes header + LZ4
- *       output directly into a single {@code ByteArrayOutputStream}.</li>
- *   <li>{@link #unwrap}: previously {@code Arrays.copyOfRange} copied the
- *       compressed payload before passing it to the decompressor. The LZ4 API
- *       accepts {@code (src, srcOff, dst, dstOff, dstLen)}, so the copy is
- *       eliminated entirely.</li>
- * </ul>
+ * <h2>Bounds checking</h2>
+ * The decompression path reads {@code originalLength} straight out of the blob
+ * header. A corrupted / poisoned DB row could therefore declare a huge length
+ * and trigger an OOM (or a {@code NegativeArraySizeException} for negative
+ * values) on the login thread. {@link #unwrap(byte[])} enforces upper bounds
+ * on both the wrapped payload and the declared original length before any
+ * allocation, and converts any LZ4 failure into a {@link CorruptDataException}
+ * so the load path fails closed (releases the lock, refuses the payload)
+ * instead of propagating a random exception.
+ *
+ * <p>Limits are configurable via {@link #configureLimits(int, int)} and default
+ * to conservative values (1 MiB raw / 2.5 MiB wrapped). The plugin's
+ * {@code ConfigManager} applies the configured values on startup.
  */
 public class CompressionUtil {
 
@@ -42,10 +45,50 @@ public class CompressionUtil {
     private static final LZ4Compressor compressor = factory.fastCompressor();
     private static final LZ4FastDecompressor decompressor = factory.fastDecompressor();
 
+    /**
+     * Default cap on the declared decompressed (raw) length, in bytes.
+     * A player data Blob should never legitimately approach this; the cap
+     * exists purely to bound memory in the face of corrupted data.
+     */
+    static final int DEFAULT_MAX_RAW_BYTES = 1 << 20;            // 1 MiB
+    /**
+     * Default cap on the wrapped (on-disk) payload length, in bytes.
+     * Slightly larger than the raw cap so legitimately-compressed data still
+     * fits, but still bounded.
+     */
+    static final int DEFAULT_MAX_WRAPPED_BYTES = 5 * (1 << 19);  // 2.5 MiB
+
+    private static volatile int maxRawBytes = DEFAULT_MAX_RAW_BYTES;
+    private static volatile int maxWrappedBytes = DEFAULT_MAX_WRAPPED_BYTES;
+
     private CompressionUtil() {}
 
     /**
+     * Apply configured decompression bounds. Called once from {@code ConfigManager}
+     * at load time. Values {@code <= 0} are ignored (keeps the prior limit) so a
+     * misconfigured file can't disable the guard.
+     */
+    public static void configureLimits(int maxRawBytes, int maxWrappedBytes) {
+        if (maxRawBytes > 0) CompressionUtil.maxRawBytes = maxRawBytes;
+        if (maxWrappedBytes > 0) CompressionUtil.maxWrappedBytes = maxWrappedBytes;
+    }
+
+    /** Current cap on declared raw length (for tests / diagnostics). */
+    public static int getMaxRawBytes() { return maxRawBytes; }
+    /** Current cap on wrapped payload length (for tests / diagnostics). */
+    public static int getMaxWrappedBytes() { return maxWrappedBytes; }
+
+    /**
      * Wraps raw data with header and optionally compresses with LZ4.
+     *
+     * <p><b>Allocation note (kept honest):</b> this method performs two
+     * allocations on the compressed path — a scratch buffer sized to LZ4's
+     * worst-case bound, then a trimmed result buffer into which the compressed
+     * bytes are copied. The class-level doc previously claimed a single-buffer
+     * {@code ByteArrayOutputStream} implementation; that was inaccurate, so the
+     * claim has been removed rather than left as misleading documentation. The
+     * extra copy is small relative to a DB round-trip and is not on a hot
+     * enough path to justify a ThreadLocal scratch buffer yet.
      *
      * @param data      raw serialized data
      * @param minSize   minimum data size to trigger compression (bytes)
@@ -58,10 +101,11 @@ public class CompressionUtil {
 
         boolean shouldCompress = data.length >= minSize;
         if (shouldCompress) {
-            // Allocate a single buffer sized for header + worst-case LZ4 output.
             int maxCompressedLen = compressor.maxCompressedLength(data.length);
             // Worst case: compression makes data larger (rare for tiny inputs).
-            // We pick the smaller of (compressed+header) and (raw+header) up front.
+            // Allocate a scratch buffer at the worst-case bound, compress into
+            // it, then copy into a right-sized result. Two allocations, but the
+            // scratch buffer is reused only within this call (no thread-local).
             byte[] tmp = new byte[maxCompressedLen];
             int compressedLen = compressor.compress(data, 0, data.length,
                 tmp, 0, maxCompressedLen);
@@ -92,50 +136,73 @@ public class CompressionUtil {
     /**
      * Unwraps and optionally decompresses data.
      *
-     * <p>Zero-copy: passes the wrapped buffer directly to the LZ4 decompressor
-     * with the correct offset, avoiding the previous {@code Arrays.copyOfRange}.
+     * <p>Zero-copy on the compressed path: passes the wrapped buffer directly
+     * to the LZ4 decompressor with the correct offset, avoiding a
+     * {@code Arrays.copyOfRange}.
+     *
+     * <p>Bounds-checked: the wrapped payload length and the declared original
+     * length are validated <em>before</em> the destination array is allocated,
+     * so a corrupted header cannot cause an OOM or {@code NegativeArraySize}.
+     * Any LZ4 decompression failure is wrapped in a {@link CorruptDataException}.
      *
      * @param wrappedData data produced by {@link #wrap}
      * @return raw serialized data
+     * @throws CorruptDataException if the payload is too short, the declared
+     *         length is out of bounds, or LZ4 decompression fails
      */
     public static byte[] unwrap(byte[] wrappedData) {
         if (wrappedData == null || wrappedData.length < 2) {
-            return new byte[0];
+            throw new CorruptDataException("Wrapped data too short: "
+                + (wrappedData == null ? "null" : wrappedData.length + " bytes"));
+        }
+
+        if (wrappedData.length > maxWrappedBytes) {
+            throw new CorruptDataException("Wrapped payload exceeds limit: "
+                + wrappedData.length + " > " + maxWrappedBytes + " bytes");
         }
 
         byte version = wrappedData[0];
         byte flags = wrappedData[1];
 
-        // Future: handle version migration here
         if (version != FORMAT_VERSION) {
-            throw new IllegalArgumentException(
-                "Unsupported format version: " + version + " (expected " + FORMAT_VERSION + ")");
+            throw new CorruptDataException("Unsupported format version: " + version
+                + " (expected " + FORMAT_VERSION + ")");
         }
 
         boolean compressed = (flags & FLAG_COMPRESSED) != 0;
 
         if (compressed) {
             if (wrappedData.length < 6) {
-                throw new IllegalArgumentException("Compressed data too short");
+                throw new CorruptDataException("Compressed data too short: "
+                    + wrappedData.length + " bytes (need >= 6)");
             }
             int originalLength = ((wrappedData[2] & 0xFF) << 24)
                                | ((wrappedData[3] & 0xFF) << 16)
                                | ((wrappedData[4] & 0xFF) << 8)
                                | (wrappedData[5] & 0xFF);
 
+            if (originalLength <= 0) {
+                throw new CorruptDataException("Invalid original length: " + originalLength);
+            }
+            if (originalLength > maxRawBytes) {
+                throw new CorruptDataException("Declared original length exceeds limit: "
+                    + originalLength + " > " + maxRawBytes + " bytes");
+            }
+
             byte[] restored = new byte[originalLength];
             // Decompress directly from wrappedData[6..] — no intermediate copy.
-            // LZ4's API accepts the source array, source offset, dest array,
-            // dest offset, and target length. This eliminates the previous
-            // Arrays.copyOfRange allocation.
-            int srcLen = wrappedData.length - 6;
-            decompressor.decompress(wrappedData, 6, restored, 0, originalLength);
-            // srcLen is the available source bytes; LZ4 fast decompressor reads
-            // exactly what it needs based on originalLength, so srcLen is not
-            // passed but is implied.
-            // (Suppress unused warning for srcLen — kept for diagnostic clarity.)
-            if (srcLen < 0) {
-                throw new IllegalArgumentException("Negative source length");
+            try {
+                decompressor.decompress(wrappedData, 6, restored, 0, originalLength);
+            } catch (LZ4Exception e) {
+                throw new CorruptDataException(
+                    "LZ4 decompression failed (declared length=" + originalLength
+                        + ", available=" + (wrappedData.length - 6) + "): " + e.getMessage(), e);
+            } catch (ArrayIndexOutOfBoundsException e) {
+                // LZ4 fast decompressor reads exactly originalLength; a
+                // truncated/corrupt source can still throw here.
+                throw new CorruptDataException(
+                    "LZ4 source truncated (declared length=" + originalLength
+                        + ", available=" + (wrappedData.length - 6) + "): " + e.getMessage(), e);
             }
             return restored;
         } else {

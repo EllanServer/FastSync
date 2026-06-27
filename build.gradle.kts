@@ -8,9 +8,11 @@ plugins {
 repositories {
     mavenCentral()
     maven("https://repo.papermc.io/repository/maven-public/")
+    // Velocity 3.5.0-SNAPSHOT + paper-api snapshots resolve from here. Note
+    // this is a development snapshot; if you pin Velocity to a stable release
+    // you can likely drop this repository.
     maven("https://oss.sonatype.org/content/repositories/snapshots/")
-    maven("https://jitpack.io")
-    // Sparrow 系列库（sparrow-nbt / sparrow-yaml / sparrow-redis-message-broker）
+    // Sparrow 系列库（sparrow-nbt / sparrow-yaml）
     // 由 Xiao-MoMi 维护并发布到此仓库。
     maven("https://repo.momirealms.net/releases/")
 }
@@ -26,7 +28,7 @@ val paperVersion: String = property("paper.version") as String
 // Strategy:
 //   - Sparrow-NBT / Sparrow-YAML (not on Maven Central) → implementation,
 //     shaded into the JAR by the shadowJar task.
-//   - Maven Central libraries (Redisson, Chronicle Queue, jOOQ, HikariCP, etc.)
+//   - Maven Central libraries (Redisson, jOOQ, HikariCP, etc.)
 //     → compileOnly for compilation; declared in plugin.yml `libraries:` so
 //     Paper downloads them automatically at startup.
 //   - Paper API → compileOnly (provided by the server).
@@ -226,7 +228,6 @@ tasks.shadowJar {
         attributes(
             "Implementation-Title" to "FastSync",
             "Implementation-Version" to project.version.toString(),
-            "Multi-Release" to "true",
             "paperweight-mappings-namespace" to "mojang"
         )
     }

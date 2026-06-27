@@ -11,6 +11,16 @@ import java.util.logging.Logger;
  * <p>Uses {@code ItemStack.serializeAsBytes()} / {@code ItemStack.deserializeBytes()}
  * directly — no reflection, no Bukkit object serialization fallback, no NMS detection.
  * Target: Paper 1.21.11 (api-version in plugin.yml).
+ *
+ * <p><b>Failure handling:</b> serialization / deserialization failures do
+ * <em>not</em> return an empty array or {@code null}. Doing so would silently
+ * turn an unserializable item into an air slot — a slot that fails to save
+ * would be loaded back as empty on the next server, silently deleting the
+ * player's item. Instead these methods throw {@link ItemSerializationException}
+ * so the caller can fail the whole save or record a conflict snapshot.
+ *
+ * <p>The only legitimate "empty" result is for an actual air / null item, which
+ * is a real inventory state and must round-trip as a zero-length byte array.
  */
 public class ItemStackCompat {
 
@@ -19,8 +29,14 @@ public class ItemStackCompat {
     private ItemStackCompat() {}
 
     /**
-     * Check if the Paper native NBT byte[] serialization API is available.
-     * On Paper 1.21.11+ this is always true.
+     * Whether the Paper native NBT byte[] serialization API is available.
+     *
+     * <p>Always {@code true} on the supported target (Paper 1.21.11+). Retained
+     * as a constant internal flag rather than a runtime probe, since the plugin
+     * no longer carries a Bukkit fallback path — if the API is missing the
+     * class will fail to load with a {@link NoSuchMethodError} at startup, by
+     * design. The {@link FastSync} startup / status code no longer branches on
+     * this value.
      */
     public static boolean isPaperNativeAvailable() {
         return true;
@@ -29,8 +45,12 @@ public class ItemStackCompat {
     /**
      * Serialize an ItemStack to byte[].
      *
-     * @param item the ItemStack to serialize (null returns empty array)
-     * @return serialized byte[]
+     * @param item the ItemStack to serialize ({@code null} or air returns an
+     *             empty array — a real, round-trippable air-slot representation)
+     * @return serialized byte[] (empty for air / null)
+     * @throws ItemSerializationException if {@code serializeAsBytes()} throws.
+     *         The exception is propagated instead of being swallowed so the
+     *         caller can fail the save rather than silently storing an air slot.
      */
     public static byte[] serialize(ItemStack item) {
         if (item == null || item.getType().isAir()) {
@@ -39,13 +59,22 @@ public class ItemStackCompat {
         try {
             return item.serializeAsBytes();
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "[ItemStackCompat] serializeAsBytes failed: " + e.getMessage(), e);
-            return new byte[0];
+            logger.log(Level.SEVERE, "[ItemStackCompat] serializeAsBytes failed for "
+                + item.getType() + ": " + e.getMessage(), e);
+            throw new ItemSerializationException(
+                "Failed to serialize ItemStack (" + item.getType() + "): " + e.getMessage(), e);
         }
     }
 
     /**
      * Deserialize an ItemStack from byte[].
+     *
+     * @param bytes serialized bytes (empty / null returns {@code null} — an
+     *              air slot; this is a real round-tripped state, not an error)
+     * @return the deserialized ItemStack, or {@code null} for an empty payload
+     * @throws ItemSerializationException if {@code deserializeBytes()} throws.
+     *         Propagated so the caller can refuse to apply the corrupted
+     *         component instead of silently dropping the item.
      */
     public static ItemStack deserialize(byte[] bytes) {
         if (bytes == null || bytes.length == 0) {
@@ -55,7 +84,8 @@ public class ItemStackCompat {
             return ItemStack.deserializeBytes(bytes);
         } catch (Exception e) {
             logger.log(Level.SEVERE, "[ItemStackCompat] deserializeBytes failed: " + e.getMessage(), e);
-            return null;
+            throw new ItemSerializationException(
+                "Failed to deserialize ItemStack: " + e.getMessage(), e);
         }
     }
 }

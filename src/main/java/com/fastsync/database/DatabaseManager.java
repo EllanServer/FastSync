@@ -679,9 +679,13 @@ public class DatabaseManager {
         long now = System.currentTimeMillis();
 
         // Use raw JDBC for batch — jOOQ's batch API is more verbose for this use case.
-        // P0 (round 10): WHERE now includes lock_session_id when available, so a
-        // stale session's heartbeat cannot refresh a lock that a new session has
-        // already acquired.
+        // P0 (round 10): WHERE includes lock_session_id, so a stale session's
+        // heartbeat cannot refresh a lock that a new session has already
+        // acquired. The session id is REQUIRED (not optional): a missing id
+        // means we have no in-memory record of owning this lock, so refreshing
+        // would be unsound. Such players are added to failedPlayers up front
+        // and skipped, which is fail-closed (heartbeat treats them as lost and
+        // quarantines them) rather than silently no-op'ing.
         String sql = "UPDATE `" + dataTable + "`"
             + " SET locked_at = ?"
             + " WHERE uuid = ? AND locked_by = ? AND fencing_token = ?"
@@ -693,17 +697,33 @@ public class DatabaseManager {
             for (java.util.Map.Entry<UUID, Long> entry : playersToRefresh.entrySet()) {
                 UUID uuid = entry.getKey();
                 String sessionId = playerLockSessions != null ? playerLockSessions.get(uuid) : null;
+                if (sessionId == null || sessionId.isBlank()) {
+                    // No recorded session for this player — we cannot safely
+                    // refresh the lock. Mark failed (fail-closed) and skip the
+                    // batch entry so we don't send a NULL bind that would
+                    // update 0 rows and look like an ordinary heartbeat miss.
+                    failedPlayers.add(uuid);
+                    continue;
+                }
                 ps.setLong(1, now);
                 ps.setString(2, uuid.toString());
                 ps.setString(3, serverName);
                 ps.setLong(4, entry.getValue());
-                ps.setString(5, sessionId);  // null matches the OR ... IS NULL arm
+                ps.setString(5, sessionId);
                 ps.addBatch();
             }
 
             int[] results = ps.executeBatch();
             int i = 0;
             for (UUID uuid : playersToRefresh.keySet()) {
+                // Players skipped above (missing session id) are already in
+                // failedPlayers; skip them here so we don't index into results
+                // at the wrong position (the batch only contains entries we
+                // actually added).
+                String sessionId = playerLockSessions != null ? playerLockSessions.get(uuid) : null;
+                if (sessionId == null || sessionId.isBlank()) {
+                    continue;
+                }
                 // EXECUTE_FAILED (-3) means the driver couldn't execute this
                 // particular statement in the batch. Treat it as a failure.
                 // SUCCESS_NO_INFO (-2) means the driver executed the statement
@@ -718,7 +738,7 @@ public class DatabaseManager {
                     // Conservative path: verify with a single conditional refresh.
                     Long token = playersToRefresh.get(uuid);
                     try {
-                        if (token == null || !refreshLock(uuid, serverName, token, playerLockSessions != null ? playerLockSessions.get(uuid) : null)) {
+                        if (token == null || !refreshLock(uuid, serverName, token, sessionId)) {
                             failedPlayers.add(uuid);
                         }
                     } catch (SQLException verifyEx) {

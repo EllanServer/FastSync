@@ -4,7 +4,6 @@ import com.fastsync.config.ConfigManager;
 import com.fastsync.database.DatabaseManager;
 import com.fastsync.listeners.PlayerListener;
 import com.fastsync.log.OperationLog;
-import com.fastsync.serialization.ItemStackCompat;
 import com.fastsync.sync.SyncManager;
 import com.fastsync.util.SchedulerUtil;
 import org.bukkit.Bukkit;
@@ -30,8 +29,7 @@ import java.util.logging.Level;
  *
  * Design principles (based on community discussion):
  *   1. NBT byte[] serialization - NO base64 string encoding, NO Kryo, NO Gson
- *      Primary: ItemStack.serializeAsBytes() (Paper 1.20.5+)
- *      Fallback: Bukkit object serialization (still byte[], NOT string)
+ *      ItemStack.serializeAsBytes() (Paper 1.21.11+ native API; no fallback)
  *   2. LZ4 compression to reduce database storage and network transfer
  *   3. Data loaded during login phase (AsyncPlayerPreLoginEvent) - not after joining
  *      Prevents item duplication bugs from "enter server then load" approach
@@ -77,16 +75,6 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
     @Override
     public void onEnable() {
-        // Check ItemStack serialization compatibility (graceful, not hard fail)
-        boolean nativeNbt = ItemStackCompat.isPaperNativeAvailable();
-        if (!nativeNbt) {
-            getLogger().warning("============================================");
-            getLogger().warning(" Paper native NBT API not found (need 1.20.5+).");
-            getLogger().warning(" Using Bukkit fallback serialization (still byte[],");
-            getLogger().warning(" NOT base64 string). Upgrade Paper for best performance.");
-            getLogger().warning("============================================");
-        }
-
         // Initialize config
         saveDefaultConfig();
         configManager = new ConfigManager(this);
@@ -184,7 +172,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
         getLogger().info("FastSync v" + getPluginMeta().getVersion() + " enabled!");
         getLogger().info("Server ID: " + configManager.getServerName());
-        getLogger().info("Serialization: " + (nativeNbt ? "Native NBT (Paper)" : "Bukkit fallback"));
+        getLogger().info("Serialization: Paper native ItemStack byte serialization");
         getLogger().info("Compression: " + (configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
         getLogger().info("Redis: " + (configManager.isRedisEnabled() ? "Enabled" : "Disabled (DB polling)"));
     }
@@ -408,7 +396,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             (syncManager.isRedisEnabled() ? ChatColor.GREEN + "Connected" :
              (configManager.isRedisEnabled() ? ChatColor.RED + "Failed" : ChatColor.GRAY + "Disabled")));
         sender.sendMessage(ChatColor.YELLOW + "Serialization: " + ChatColor.WHITE +
-            (ItemStackCompat.isPaperNativeAvailable() ? "Native NBT" : "Bukkit fallback"));
+            "Paper native ItemStack byte serialization");
         sender.sendMessage(ChatColor.YELLOW + "Active players: " + ChatColor.WHITE + syncManager.getActiveCount());
         sender.sendMessage(ChatColor.YELLOW + "Pending loads: " + ChatColor.WHITE + syncManager.getPendingCount());
         sender.sendMessage(ChatColor.YELLOW + "Pending saves: " + ChatColor.WHITE + syncManager.getPendingSaveCount());

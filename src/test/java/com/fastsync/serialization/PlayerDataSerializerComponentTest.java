@@ -94,6 +94,72 @@ class PlayerDataSerializerComponentTest {
     }
 
     @Test
+    void testGameModeComponentStoredAsStringNotOrdinalByte() throws IOException {
+        // The component path previously wrote gameMode as a BYTE (ordinal). It
+        // now writes a STRING (GameMode.name()) so the full-Blob and component
+        // paths use the same representation. Verify the on-disk tag type.
+        PlayerData original = new PlayerData();
+        original.setGameMode(GameMode.SPECTATOR);
+
+        byte[] bytes = PlayerDataSerializer.serializeComponent("GAME_MODE", original);
+        assertNotNull(bytes);
+
+        net.momirealms.sparrow.nbt.CompoundTag root =
+            net.momirealms.sparrow.nbt.NBT.fromBytes(bytes);
+        net.momirealms.sparrow.nbt.Tag gmTag = root.get("GAME_MODE");
+        assertNotNull(gmTag, "Component root should contain the GAME_MODE subtree");
+        net.momirealms.sparrow.nbt.Tag inner =
+            ((net.momirealms.sparrow.nbt.CompoundTag) gmTag).get("gameMode");
+        assertTrue(inner instanceof net.momirealms.sparrow.nbt.StringTag,
+            "gameMode must be a StringTag, not a ByteTag (was: "
+                + (inner == null ? "null" : inner.getClass().getSimpleName()) + ")");
+        // Cross-check the value via the typed getter.
+        assertEquals("SPECTATOR",
+            ((net.momirealms.sparrow.nbt.CompoundTag) gmTag).getString("gameMode"));
+    }
+
+    @Test
+    void testGameModeComponentRoundTripsAllModes() throws IOException {
+        for (GameMode mode : GameMode.values()) {
+            PlayerData original = new PlayerData();
+            original.setGameMode(mode);
+            byte[] bytes = PlayerDataSerializer.serializeComponent("GAME_MODE", original);
+            PlayerData target = new PlayerData();
+            PlayerDataSerializer.deserializeComponent("GAME_MODE", bytes, target);
+            assertEquals(mode, target.getGameMode(),
+                "Round-trip failed for " + mode);
+        }
+    }
+
+    @Test
+    void testFullBlobRejectsUnknownGameModeString() throws IOException {
+        // Build a full Blob whose gameMode is a string but not a valid
+        // GameMode name. The legacy ordinal fallback was removed; an unknown
+        // value must surface as an IOException rather than silently falling
+        // back to SURVIVAL.
+        net.momirealms.sparrow.nbt.CompoundTag root = net.momirealms.sparrow.nbt.NBT.createCompound();
+        root.putString("gameMode", "NOT_A_REAL_GAMEMODE");
+        root.putLong("version", 1L);
+        byte[] bytes = net.momirealms.sparrow.nbt.NBT.toBytes(root);
+
+        assertThrows(IOException.class, () -> PlayerDataSerializer.deserialize(bytes));
+    }
+
+    @Test
+    void testGameModeComponentRejectsUnknownGameModeString() throws IOException {
+        net.momirealms.sparrow.nbt.CompoundTag wrapper = net.momirealms.sparrow.nbt.NBT.createCompound();
+        net.momirealms.sparrow.nbt.CompoundTag inner = net.momirealms.sparrow.nbt.NBT.createCompound();
+        inner.putString("gameMode", "BOGUS");
+        inner.putBoolean("_present", true);
+        wrapper.put("GAME_MODE", inner);
+        byte[] bytes = net.momirealms.sparrow.nbt.NBT.toBytes(wrapper);
+
+        PlayerData target = new PlayerData();
+        assertThrows(IOException.class,
+            () -> PlayerDataSerializer.deserializeComponent("GAME_MODE", bytes, target));
+    }
+
+    @Test
     void testFireTicksRoundTrip() throws IOException {
         PlayerData original = new PlayerData();
         original.setFireTicks(100);

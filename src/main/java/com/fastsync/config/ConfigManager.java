@@ -136,6 +136,10 @@ public class ConfigManager {
 
     // Serialization
     private byte formatVersion;
+    // Bounds enforced by CompressionUtil.unwrap() to prevent OOM on corrupted
+    // blobs. Defaults are conservative (1 MiB raw / 2.5 MiB wrapped).
+    private int serializationMaxRawBytes;
+    private int serializationMaxWrappedBytes;
 
     // Debug
     private boolean debug;
@@ -236,7 +240,7 @@ public class ConfigManager {
         maxLifetime = source.getLong("database.max-lifetime", 1800000);
         leakDetectionThreshold = source.getLong("database.leak-detection-threshold", 60000);
         dbParameters = source.getString("database.parameters",
-            "useSSL=false&useUnicode=true&characterEncoding=UTF-8");
+            "useUnicode=true&characterEncoding=UTF-8");
 
         // Redis
         redisEnabled = source.getBoolean("redis.enabled", false);
@@ -387,6 +391,14 @@ public class ConfigManager {
 
         // Serialization
         formatVersion = (byte) source.getInt("serialization.format-version", 1);
+        // Decompression bounds — guard against corrupted / poisoned blobs
+        // triggering OOM on the login thread. Defaults match CompressionUtil.
+        serializationMaxRawBytes = source.getInt("serialization.max-raw-bytes", 1 << 20);          // 1 MiB
+        serializationMaxWrappedBytes = source.getInt("serialization.max-wrapped-bytes", 5 * (1 << 19)); // 2.5 MiB
+        if (serializationMaxRawBytes <= 0) serializationMaxRawBytes = 1 << 20;
+        if (serializationMaxWrappedBytes <= 0) serializationMaxWrappedBytes = 5 * (1 << 19);
+        com.fastsync.serialization.CompressionUtil.configureLimits(
+            serializationMaxRawBytes, serializationMaxWrappedBytes);
 
         // Debug
         debug = source.getBoolean("debug", false);
@@ -507,6 +519,8 @@ public class ConfigManager {
     public int getCompressionMinSize() { return compressionMinSize; }
 
     public byte getFormatVersion() { return formatVersion; }
+    public int getSerializationMaxRawBytes() { return serializationMaxRawBytes; }
+    public int getSerializationMaxWrappedBytes() { return serializationMaxWrappedBytes; }
 
     public boolean isDebug() { return debug; }
     public boolean isLogTiming() { return logTiming; }
