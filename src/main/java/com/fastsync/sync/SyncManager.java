@@ -3328,9 +3328,15 @@ public class SyncManager {
                 }
 
                 // Classify the conflict reason for structured retry handling.
-                // If fencing tokens differ → FENCING_MISMATCH (lock was lost).
-                // If fencing tokens match but version differs → VERSION_CONFLICT (external or same-fencing).
-                SaveFailureReason reason = (actualFencingToken != fencingToken)
+                // Any of these means the lock was lost/stolen → FENCING_MISMATCH:
+                //   - fencing tokens differ (another server took the lock)
+                //   - locked_by differs (lock stolen by another server)
+                //   - session differs (same server, different acquire — stale session)
+                // Only when all three match (same-fencing self-conflict) is it
+                // a benign VERSION_CONFLICT (our own previous save won the race).
+                SaveFailureReason reason = (actualFencingToken != fencingToken
+                        || !serverName.equals(actualLockedBy)
+                        || !session.equals(actualSession))
                     ? SaveFailureReason.FENCING_MISMATCH
                     : SaveFailureReason.VERSION_CONFLICT;
                 return SaveResult.conflict(expectedVersion, actualVersion, compressed.length, reason);

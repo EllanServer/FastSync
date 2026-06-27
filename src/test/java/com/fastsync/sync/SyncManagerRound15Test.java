@@ -79,19 +79,29 @@ class SyncManagerRound15Test {
      * sets the {@code shuttingDown} flag before dispatching saves (belt-and-
      * suspenders guard). The flag is set at the start of the method, so any
      * periodic task that fires during the shutdown window is rejected.
+     *
+     * <p>Uses a Mockito spy to stub {@code dispatchPlayerSaves} (which would
+     * otherwise call {@code JavaPlugin.getPlugin(FastSync.class)} and require a
+     * real Paper classloader). The spy intercepts the internal call and returns
+     * an empty future list, so {@code waitForPlayerSaves} completes with 0/0/0.
      */
     @Test
     void shutdownSetsShuttingDownBeforeSaveAll() throws Exception {
         // Reset shuttingDown to false (default)
         setShuttingDown(false);
 
+        // Spy on syncManager to stub dispatchPlayerSaves (avoids Paper classloader).
+        SyncManager spy = spy(syncManager);
+        doReturn(new java.util.ArrayList<>())
+            .when(spy).dispatchPlayerSaves(anyList(), any());
+
         // Simulate an empty player list — we only care about the flag.
-        var result = syncManager.savePlayersSnapshot(
+        var result = spy.savePlayersSnapshot(
             new java.util.ArrayList<>(),
             SyncManager.SaveKind.SHUTDOWN);
 
-        // The flag must now be true.
-        boolean flag = getShuttingDown();
+        // The flag must now be true (set BEFORE dispatchPlayerSaves was called).
+        boolean flag = getShuttingDownFrom(spy);
         assertTrue(flag, "savePlayersSnapshot(SHUTDOWN) must set shuttingDown=true before dispatch");
 
         // The result should be 0/0/0 for empty list.
@@ -165,23 +175,37 @@ class SyncManagerRound15Test {
         // Stub databaseManager:
         // - First 2 save attempts fail (CAS conflict), 3rd succeeds.
         // - getLockState returns a LockState indicating lock is still ours
-        //   and version advanced from 5 → 6 → 7.
+        //   and version advanced from 5 → 6 → 7 (each call returns next value).
         when(databaseManager.saveDataAndReleaseLockClearComponents(
                 any(UUID.class), any(byte[].class), anyLong(), anyLong(), anyLong(), any(String.class), any(String.class)))
             .thenReturn(false)   // attempt 1
             .thenReturn(false)   // attempt 2
             .thenReturn(true);   // attempt 3
 
-        // LockState that matches server/fencing/session and has version > expected.
-        DatabaseManager.LockState lockState = mock(DatabaseManager.LockState.class);
-        when(lockState.version()).thenReturn(7L);  // > expected 5, then 6
-        when(lockState.fencingToken()).thenReturn(10L);
-        when(lockState.lockedBy()).thenReturn("test-server");
-        when(lockState.lockSessionId()).thenReturn(sessionId);
-        when(lockState.rowExists()).thenReturn(true);
-        when(lockState.isHeldBy("test-server", 10L, sessionId)).thenReturn(true);
+        // After attempt 1 fails: version advanced 5→6 (retry with 6).
+        // After attempt 2 fails: version advanced 6→7 (retry with 7).
+        // Each getLockState call must return a version STRICTLY GREATER than
+        // the current expectedVersion, otherwise the retry loop breaks on
+        // `actualVersion <= expectedVersion`.
+        DatabaseManager.LockState lockState1 = mock(DatabaseManager.LockState.class);
+        when(lockState1.version()).thenReturn(6L);  // > expected 5
+        when(lockState1.fencingToken()).thenReturn(10L);
+        when(lockState1.lockedBy()).thenReturn("test-server");
+        when(lockState1.lockSessionId()).thenReturn(sessionId);
+        when(lockState1.rowExists()).thenReturn(true);
+        when(lockState1.isHeldBy("test-server", 10L, sessionId)).thenReturn(true);
 
-        when(databaseManager.getLockState(any(UUID.class))).thenReturn(lockState);
+        DatabaseManager.LockState lockState2 = mock(DatabaseManager.LockState.class);
+        when(lockState2.version()).thenReturn(7L);  // > expected 6
+        when(lockState2.fencingToken()).thenReturn(10L);
+        when(lockState2.lockedBy()).thenReturn("test-server");
+        when(lockState2.lockSessionId()).thenReturn(sessionId);
+        when(lockState2.rowExists()).thenReturn(true);
+        when(lockState2.isHeldBy("test-server", 10L, sessionId)).thenReturn(true);
+
+        when(databaseManager.getLockState(any(UUID.class)))
+            .thenReturn(lockState1)   // after attempt 1 fails
+            .thenReturn(lockState2);  // after attempt 2 fails
 
         // Invoke persistCollectedData via reflection (private method).
         SyncManager.SaveResult result = invokePersistCollectedData(
@@ -418,6 +442,12 @@ class SyncManagerRound15Test {
         Field f = SyncManager.class.getDeclaredField("shuttingDown");
         f.setAccessible(true);
         return f.getBoolean(syncManager);
+    }
+
+    private boolean getShuttingDownFrom(SyncManager target) throws Exception {
+        Field f = SyncManager.class.getDeclaredField("shuttingDown");
+        f.setAccessible(true);
+        return f.getBoolean(target);
     }
 
     private <T> T getField(String name) throws Exception {
