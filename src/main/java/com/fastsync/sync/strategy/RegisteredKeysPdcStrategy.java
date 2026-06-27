@@ -124,13 +124,12 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public void restore(Player player, byte[] data) {
         if (data == null || data.length == 0) return;
-        PersistentDataContainer pdc = player.getPersistentDataContainer();
 
-        // Validate the entry count BEFORE clearing the target container. A
+        // Validate the entry count BEFORE touching the player's PDC. A
         // corrupted payload with an out-of-bounds count is rejected without
-        // touching the existing PDC state, so a bad sync cannot wipe good
-        // local data. (The legitimate empty-payload case — count == 0 — is
-        // still allowed through and clears all registered keys below.)
+        // even reading the container, so a bad sync cannot wipe good local
+        // data. (The legitimate empty-payload case — count == 0 — is still
+        // allowed through and clears all registered keys below.)
         int count;
         try (var bais = new ByteArrayInputStream(data);
              var in = new DataInputStream(bais)) {
@@ -144,6 +143,9 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
                 + count + " out of bounds (max " + MAX_PDC_ENTRIES + ")");
             return;
         }
+
+        // Count validated — now safe to touch the player's container.
+        PersistentDataContainer pdc = player.getPersistentDataContainer();
 
         // Clear all registered keys before restore to prevent "ghost keys" —
         // keys that exist on the target server but were removed on the source
