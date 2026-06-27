@@ -292,22 +292,46 @@ public class DatabaseManager {
         // We use a per-acquire nonce (not a per-JVM boot_id) because two
         // acquires from the same JVM (quit then quick reconnect) must also
         // be distinguished.
+        // P0 SAFETY NOTE — MySQL left-to-right SET evaluation hazard.
+        //
+        // MySQL evaluates single-table UPDATE SET assignments left to right,
+        // and a later assignment's RHS sees the NEW value of any column that
+        // an earlier assignment in the SAME statement already wrote. The
+        // previous form repeated `IF(locked_by IS NULL OR locked_at < ?, ...)`
+        // for every column. Once the `locked_by = ...` assignment ran, the
+        // following `locked_by IS NULL` checks evaluated against the just-
+        // written (non-null) value, so for a just-released lock (locked_at
+        // NULL, locked_at < ? => NULL => false) the `locked_at` and
+        // `lock_session_id` IFs went false and left those columns at their
+        // post-release NULL values. The read-back's `lock_session_id` match
+        // then failed, breaking every acquire-after-release sequence.
+        //
+        // Fix: drive ALL four assignments off a single predicate that
+        // references only `locked_at`, and assign `locked_at` LAST. The
+        // earlier assignments (fencing_token, locked_by, lock_session_id)
+        // then see the OLD `locked_at` (not yet written), and `locked_at`'s
+        // own RHS is evaluated before its assignment, so it also sees OLD.
+        // `locked_at IS NULL OR locked_at < ?` is exactly "lock is free or
+        // expired": releaseLock / the save paths clear locked_at to NULL on
+        // release, and acquireLock sets it to `now` while held. No reliance
+        // on locked_by here, so the same-serverName quick-reconnect guard
+        // continues to come from the read-back's lock_session_id check.
         String sql = String.format("""
             INSERT INTO `%s` (uuid, data, version, checksum, fencing_token, locked_by, locked_at, lock_session_id, last_server, last_updated)
             VALUES (?, '', 0, 0, 1, ?, ?, ?, NULL, 0)
             ON DUPLICATE KEY UPDATE
-                fencing_token = IF(locked_by IS NULL OR locked_at < ?,
+                fencing_token = IF(locked_at IS NULL OR locked_at < ?,
                                    LAST_INSERT_ID(fencing_token + 1),
                                    fencing_token),
-                locked_by = IF(locked_by IS NULL OR locked_at < ?,
+                locked_by = IF(locked_at IS NULL OR locked_at < ?,
                                ?,
                                locked_by),
-                locked_at = IF(locked_by IS NULL OR locked_at < ?,
-                               ?,
-                               locked_at),
-                lock_session_id = IF(locked_by IS NULL OR locked_at < ?,
+                lock_session_id = IF(locked_at IS NULL OR locked_at < ?,
                                       ?,
-                                      lock_session_id)
+                                      lock_session_id),
+                locked_at = IF(locked_at IS NULL OR locked_at < ?,
+                               ?,
+                               locked_at)
             """, dataTable);
 
         try (Connection conn = dataSource.getConnection()) {
@@ -321,10 +345,10 @@ public class DatabaseManager {
                 expiredTime,      // fencing_token IF predicate
                 expiredTime,      // locked_by IF predicate
                 serverName,       // locked_by new value
-                expiredTime,      // locked_at IF predicate
-                now,              // locked_at new value
                 expiredTime,      // lock_session_id IF predicate
-                lockSessionId     // lock_session_id new value
+                lockSessionId,    // lock_session_id new value
+                expiredTime,      // locked_at IF predicate
+                now               // locked_at new value
             );
 
             // Read back fencing_token, locked_by, AND lock_session_id using
