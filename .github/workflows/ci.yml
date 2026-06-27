@@ -64,9 +64,9 @@ jobs:
           # GitHub Actions annotations (::error::) so they're visible in the
           # check-run annotations API without needing log access.
           echo "=== Build error lines ==="
-          grep -iE "(error:|FAILURE|What went wrong|Could not|Unresolved|cannot find symbol)" build-output.log | head -30 || true
+          grep -iE "(error:|FAILURE|FAILED|What went wrong|Could not|Unresolved|cannot find symbol|AssertionFailed)" build-output.log | head -30 || true
           echo "=== Emitting as annotations ==="
-          grep -iE "(error:|FAILURE|What went wrong|Could not|Unresolved|cannot find symbol)" build-output.log | head -10 | while IFS= read -r line; do
+          grep -iE "(error:|FAILURE|FAILED|What went wrong|Could not|Unresolved|cannot find symbol|AssertionFailed)" build-output.log | head -10 | while IFS= read -r line; do
             # Truncate to 250 chars (annotation message limit) and strip problematic chars
             msg=$(echo "$line" | cut -c1-250 | tr '\r' ' ')
             echo "::error file=build.gradle.kts::$msg"
