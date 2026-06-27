@@ -266,6 +266,26 @@ public class ConfigManager {
                         + "on a fully trusted network.");
             }
         }
+
+        // 3) Multi-cluster DB isolation (round 16, P0 #1). cluster-id only
+        //    isolates Redis pub/sub streams; the DB tables key on uuid with
+        //    no cluster_id column. A non-empty cluster-id paired with the
+        //    default table-prefix is almost always a misconfiguration: the
+        //    operator intends to run multiple clusters against one MySQL
+        //    instance, but the DB rows would silently collide. Force them to
+        //    pick a distinct table-prefix (or database) per cluster.
+        if (clusterId != null && !clusterId.isBlank()
+                && "fastsync_".equals(tablePrefix)) {
+            throw new RuntimeException(
+                "Refusing to start: cluster-id='" + clusterId + "' is set but "
+                    + "database.table-prefix is still the default 'fastsync_'. "
+                    + "cluster-id only isolates Redis messaging, NOT database "
+                    + "rows — two clusters sharing the same MySQL database + "
+                    + "table-prefix would silently overwrite each other's "
+                    + "player data. Set a distinct database.table-prefix per "
+                    + "cluster (e.g. '" + clusterId.toLowerCase() + "_'), or "
+                    + "leave cluster-id empty for a single-cluster deploy.");
+        }
     }
 
     private static boolean isLoopbackHost(String host) {
@@ -347,8 +367,12 @@ public class ConfigManager {
         syncAir = source.getBoolean("sync.sync-air", true);
         syncExtraData = source.getBoolean("sync.sync-extra-data", true);
         lockTimeout = source.getInt("sync.lock-timeout", 60);
-        lockRetryIntervalMs = source.getLong("sync.lock-retry-interval-ms", 1000);
-        lockMaxRetries = source.getInt("sync.lock-max-retries", 30);
+        // Round 16 (P1 #5): tightened defaults. Previously 1000ms x 30 = 30s
+        // worst-case pre-login block, which caused severe UX under login storms
+        // and DB hiccups. New defaults: 300ms x 15 = 4.5s worst-case. The
+        // Velocity handoff path is faster and does not wait the full window.
+        lockRetryIntervalMs = source.getLong("sync.lock-retry-interval-ms", 300);
+        lockMaxRetries = source.getInt("sync.lock-max-retries", 15);
         saveDelay = source.getInt("sync.save-delay", 0);
         clearBeforeApply = source.getBoolean("sync.clear-before-apply", true);
         loadFailKickMessage = source.getString("sync.load-fail-kick-message",
@@ -361,10 +385,12 @@ public class ConfigManager {
         heartbeatIntervalSeconds = source.getInt("sync.heartbeat-interval-seconds", 10);
 
         // Login backpressure: limit concurrent pre-login data loads to prevent
-        // login storms from exhausting the DB connection pool. Default leaves
-        // 2 connections for heartbeat/quit saves.
+        // login storms from exhausting the DB connection pool. Round 16 (P1 #5):
+        // default leaves 3 connections for heartbeat/quit/final-save threads
+        // and caps at 6 so a login burst cannot starve save/heartbeat traffic.
+        // Operators with a large pool can raise this explicitly in config.
         maxConcurrentLoads = source.getInt("sync.max-concurrent-loads",
-            Math.max(2, poolSize - 2));
+            Math.max(2, Math.min(6, poolSize - 3)));
         if (maxConcurrentLoads < 1) {
             logger.warning("[Config] sync.max-concurrent-loads must be >= 1. Using 1.");
             maxConcurrentLoads = 1;
