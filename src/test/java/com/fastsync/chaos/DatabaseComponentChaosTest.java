@@ -99,7 +99,7 @@ class DatabaseComponentChaosTest {
         String server = "server-A";
 
         // Acquire lock
-        var lockResult = databaseManager.acquireLock(uuid, server);
+        var lockResult = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lockResult.acquired(), "Lock acquisition should succeed");
         long fencingToken = lockResult.fencingToken();
 
@@ -110,7 +110,7 @@ class DatabaseComponentChaosTest {
         checksums.put("INVENTORY", 12345L);
 
         var result = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, fencingToken, null, -1, 1L);
+            uuid, components, checksums, server, fencingToken, "test-session", -1, 1L);
 
         assertTrue(result.success(), "Component save should succeed with correct fencing");
         assertEquals(1, result.newVersion() - result.oldVersion(),
@@ -175,7 +175,7 @@ class DatabaseComponentChaosTest {
         UUID uuid = UUID.randomUUID();
         String server = "server-A";
 
-        var lock = databaseManager.acquireLock(uuid, server);
+        var lock = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lock.acquired());
         long fencingToken = lock.fencingToken();
 
@@ -185,7 +185,7 @@ class DatabaseComponentChaosTest {
         Map<String, Long> checksums = new HashMap<>();
         checksums.put("INVENTORY", 12345L);
         var compResult = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, fencingToken, null, -1, 1L);
+            uuid, components, checksums, server, fencingToken, "test-session", -1, 1L);
         assertTrue(compResult.success());
 
         long genBefore = databaseManager.getComponentGeneration(uuid);
@@ -196,7 +196,7 @@ class DatabaseComponentChaosTest {
         byte[] blob = new byte[]{10, 20, 30};
         long checksum = 99999L;
         boolean saved = databaseManager.saveDataAndReleaseLockClearComponents(
-            uuid, blob, checksum, compResult.newVersion(), fencingToken, server, null);
+            uuid, blob, checksum, compResult.newVersion(), fencingToken, server, "test-session");
         assertTrue(saved, "Full Blob save should succeed");
 
         long genAfter = databaseManager.getComponentGeneration(uuid);
@@ -213,7 +213,7 @@ class DatabaseComponentChaosTest {
         UUID uuid = UUID.randomUUID();
         String server = "server-A";
 
-        var lock = databaseManager.acquireLock(uuid, server);
+        var lock = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lock.acquired());
         long fencingToken = lock.fencingToken();
 
@@ -223,14 +223,14 @@ class DatabaseComponentChaosTest {
         Map<String, Long> cs1 = new HashMap<>();
         cs1.put("INVENTORY", 111L);
         var r1 = databaseManager.upsertComponentsIfLockHeld(
-            uuid, comp1, cs1, server, fencingToken, null, -1, 1L);
+            uuid, comp1, cs1, server, fencingToken, "test-session", -1, 1L);
         assertTrue(r1.success());
         assertEquals(0, r1.generation(), "First component save should be at generation 0");
 
         // Full Blob save → generation becomes 1
         byte[] blob = new byte[]{99};
         boolean saved = databaseManager.saveDataKeepLockClearComponents(
-            uuid, blob, 222L, r1.newVersion(), fencingToken, server, null);
+            uuid, blob, 222L, r1.newVersion(), fencingToken, server, "test-session");
         assertTrue(saved);
 
         long newGen = databaseManager.getComponentGeneration(uuid);
@@ -275,7 +275,7 @@ class DatabaseComponentChaosTest {
         long currentGeneration = 0;
 
         // Acquire initial lock
-        var lock = databaseManager.acquireLock(uuid, server);
+        var lock = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lock.acquired());
         currentFencing = lock.fencingToken();
 
@@ -289,7 +289,7 @@ class DatabaseComponentChaosTest {
                     Map<String, Long> cs = new HashMap<>();
                     cs.put("INVENTORY", (long) i);
                     var result = databaseManager.upsertComponentsIfLockHeld(
-                        uuid, comps, cs, server, currentFencing, null, -1, 1L);
+                        uuid, comps, cs, server, currentFencing, "test-session", -1, 1L);
                     if (result.success()) {
                         assertTrue(result.newVersion() > currentVersion,
                             "Iter " + i + ": version not monotonic: " + currentVersion + " -> " + result.newVersion());
@@ -303,7 +303,7 @@ class DatabaseComponentChaosTest {
                     // Full Blob save (keep lock)
                     boolean saved = databaseManager.saveDataKeepLockClearComponents(
                         uuid, new byte[]{(byte) i}, (long) i * 10,
-                        currentVersion, currentFencing, server, null);
+                        currentVersion, currentFencing, server, "test-session");
                     if (saved) {
                         currentVersion++;
                         currentGeneration++;
@@ -317,7 +317,7 @@ class DatabaseComponentChaosTest {
                     if (staleToken > 0) {
                         var staleResult = databaseManager.upsertComponentsIfLockHeld(
                             uuid, Map.of("VITALS", new byte[]{1}),
-                            Map.of("VITALS", 1L), server, staleToken, null, -1, 2L);
+                            Map.of("VITALS", 1L), server, staleToken, "test-session", -1, 2L);
                         assertFalse(staleResult.success(),
                             "Iter " + i + ": stale fencing write must be rejected");
                     }
@@ -370,7 +370,7 @@ class DatabaseComponentChaosTest {
         UUID uuid = UUID.randomUUID();
         String server = "server-A";
 
-        var lock = databaseManager.acquireLock(uuid, server);
+        var lock = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lock.acquired());
         long fencingToken = lock.fencingToken();
 
@@ -383,7 +383,7 @@ class DatabaseComponentChaosTest {
         checksums.put("INVENTORY", 42L);
 
         var result = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, fencingToken, null, -1, 1L);
+            uuid, components, checksums, server, fencingToken, "test-session", -1, 1L);
 
         assertTrue(result.success(), "Component save should succeed");
         assertEquals(versionBefore, result.oldVersion(),
@@ -426,7 +426,7 @@ class DatabaseComponentChaosTest {
         UUID uuid = UUID.randomUUID();
         String server = "server-A";
 
-        var lock = databaseManager.acquireLock(uuid, server);
+        var lock = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lock.acquired());
         long fencingToken = lock.fencingToken();
 
@@ -440,7 +440,7 @@ class DatabaseComponentChaosTest {
         checksums.put("INVENTORY", 555L);
 
         var result = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, fencingToken, null, -1, 1L);
+            uuid, components, checksums, server, fencingToken, "test-session", -1, 1L);
         assertTrue(result.success(), "Component save should succeed at the DB level");
 
         // Simulate crash: no full Blob save, no lock release.
@@ -489,7 +489,7 @@ class DatabaseComponentChaosTest {
         UUID uuid = UUID.randomUUID();
         String server = "server-A";
 
-        var lock = databaseManager.acquireLock(uuid, server);
+        var lock = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lock.acquired());
         long fencingToken = lock.fencingToken();
 
@@ -499,7 +499,7 @@ class DatabaseComponentChaosTest {
         Map<String, Long> checksums = new HashMap<>();
         checksums.put("INVENTORY", 111L);
         var compResult = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, fencingToken, null, -1, 1L);
+            uuid, components, checksums, server, fencingToken, "test-session", -1, 1L);
         assertTrue(compResult.success());
         assertEquals(0, compResult.generation(), "First component save should be at generation 0");
         assertEquals(1L, compResult.componentBitmap(), "Bitmap should have INVENTORY bit");
@@ -510,7 +510,7 @@ class DatabaseComponentChaosTest {
         byte[] finalBlob = new byte[]{99, 88, 77};  // the "winning" full Blob
         long finalChecksum = 99999L;
         boolean saved = databaseManager.saveDataAndReleaseLockClearComponents(
-            uuid, finalBlob, finalChecksum, compResult.newVersion(), fencingToken, server, null);
+            uuid, finalBlob, finalChecksum, compResult.newVersion(), fencingToken, server, "test-session");
         assertTrue(saved, "QUIT full Blob save should succeed");
 
         // Verify DB state after QUIT save
@@ -556,7 +556,7 @@ class DatabaseComponentChaosTest {
         UUID uuid = UUID.randomUUID();
         String server = "server-A";
 
-        var lock = databaseManager.acquireLock(uuid, server);
+        var lock = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lock.acquired());
         long fencingToken = lock.fencingToken();
 
@@ -566,14 +566,14 @@ class DatabaseComponentChaosTest {
         Map<String, Long> checksums = new HashMap<>();
         checksums.put("VITALS", 42L);
         var compResult = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, fencingToken, null, -1, 2L);  // bit 1 = VITALS
+            uuid, components, checksums, server, fencingToken, "test-session", -1, 2L);  // bit 1 = VITALS
         assertTrue(compResult.success());
         assertEquals(0, compResult.generation());
 
         // Online full Blob save (keepLockClearComponents) — generation bumps to 1
         byte[] onlineBlob = new byte[]{10, 20, 30};
         boolean saved = databaseManager.saveDataKeepLockClearComponents(
-            uuid, onlineBlob, 333L, compResult.newVersion(), fencingToken, server, null);
+            uuid, onlineBlob, 333L, compResult.newVersion(), fencingToken, server, "test-session");
         assertTrue(saved, "Online full Blob save should succeed");
 
         assertEquals(1, databaseManager.getComponentGeneration(uuid),
@@ -602,7 +602,7 @@ class DatabaseComponentChaosTest {
         UUID uuid = UUID.randomUUID();
         String server = "server-A";
 
-        var lock = databaseManager.acquireLock(uuid, server);
+        var lock = databaseManager.acquireLock(uuid, server, "test-session");
         assertTrue(lock.acquired());
         long fencingToken = lock.fencingToken();
 
@@ -618,7 +618,7 @@ class DatabaseComponentChaosTest {
         cs.put("EXPERIENCE", 3L);
 
         var r = databaseManager.upsertComponentsIfLockHeld(
-            uuid, comps, cs, server, fencingToken, null, -1, bits);
+            uuid, comps, cs, server, fencingToken, "test-session", -1, bits);
         assertTrue(r.success());
         assertEquals(bits, r.componentBitmap(),
             "Bitmap should have bits 0,1,2 set: " + Long.toBinaryString(r.componentBitmap()));
@@ -627,7 +627,7 @@ class DatabaseComponentChaosTest {
 
         // Full Blob save must clear ALL bits
         boolean saved = databaseManager.saveDataKeepLockClearComponents(
-            uuid, new byte[]{99}, 999L, r.newVersion(), fencingToken, server, null);
+            uuid, new byte[]{99}, 999L, r.newVersion(), fencingToken, server, "test-session");
         assertTrue(saved);
 
         assertEquals(0L, databaseManager.getComponentBitmap(uuid),

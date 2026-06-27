@@ -61,6 +61,27 @@ public class DatabaseManager {
     private static final Field<Long> COMPONENT_UPDATED_AT_FIELD = field(name("updated_at"), Long.class);
     private static final Field<Long> GENERATION_FIELD = field(name("generation"), Long.class);
 
+    /**
+     * Fail-closed guard for production lock operations. All save/release/
+     * heartbeat/component-upsert methods MUST pass a non-null, non-blank
+     * lockSessionId. Passing null would bypass the lock_session_id WHERE
+     * clause and could clear/overwrite another session's lock — exactly the
+     * race that lock_session_id was added to prevent.
+     *
+     * <p>Test/migration compatibility is handled by the deprecated overload
+     * (e.g. {@link #releaseLock(UUID, String)}) which does not call this
+     * guard. Production callers (SyncManager) must always track and pass the
+     * session id from {@code playerLockSessions}.
+     *
+     * @throws IllegalArgumentException if lockSessionId is null or blank
+     */
+    private static void requireLockSession(String lockSessionId, String operation) {
+        if (lockSessionId == null || lockSessionId.isBlank()) {
+            throw new IllegalArgumentException(
+                operation + " requires non-null, non-blank lockSessionId — refusing to bypass lock_session_id WHERE clause");
+        }
+    }
+
     private final Logger logger;
     private final ConfigManager config;
     private HikariDataSource dataSource;
@@ -698,6 +719,7 @@ public class DatabaseManager {
      */
     public boolean saveDataAndReleaseLockClearComponents(UUID uuid, byte[] data, long checksum,
             long expectedVersion, long fencingToken, String serverName, String lockSessionId) throws SQLException {
+        requireLockSession(lockSessionId, "saveDataAndReleaseLockClearComponents");
         long now = System.currentTimeMillis();
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
@@ -726,7 +748,7 @@ public class DatabaseManager {
                         .and(VERSION_FIELD.eq(expectedVersion))
                         .and(FENCING_TOKEN_FIELD.eq(fencingToken))
                         .and(LOCKED_BY_FIELD.eq(serverName))
-                        .and(lockSessionId != null ? LOCK_SESSION_ID_FIELD.eq(lockSessionId) : org.jooq.impl.DSL.noCondition()))
+                        .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
                     .execute();
 
                 if (updated <= 0) {
@@ -758,6 +780,7 @@ public class DatabaseManager {
      */
     public boolean saveDataKeepLockClearComponents(UUID uuid, byte[] data, long checksum,
             long expectedVersion, long fencingToken, String serverName, String lockSessionId) throws SQLException {
+        requireLockSession(lockSessionId, "saveDataKeepLockClearComponents");
         long now = System.currentTimeMillis();
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
@@ -776,7 +799,7 @@ public class DatabaseManager {
                         .and(VERSION_FIELD.eq(expectedVersion))
                         .and(FENCING_TOKEN_FIELD.eq(fencingToken))
                         .and(LOCKED_BY_FIELD.eq(serverName))
-                        .and(lockSessionId != null ? LOCK_SESSION_ID_FIELD.eq(lockSessionId) : org.jooq.impl.DSL.noCondition()))
+                        .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
                     .execute();
 
                 if (updated <= 0) {
@@ -857,6 +880,7 @@ public class DatabaseManager {
      * @return true if the lock was released, false if the lock is no longer ours
      */
     public boolean releaseLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
+        requireLockSession(lockSessionId, "releaseLock");
         try (Connection conn = dataSource.getConnection()) {
             return dsl(conn).update(playerData)
                 .set(LOCKED_BY_FIELD, (String) null)
@@ -865,7 +889,7 @@ public class DatabaseManager {
                 .where(UUID_FIELD.eq(uuid.toString())
                     .and(LOCKED_BY_FIELD.eq(serverName))
                     .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                    .and(lockSessionId != null ? LOCK_SESSION_ID_FIELD.eq(lockSessionId) : org.jooq.impl.DSL.noCondition()))
+                    .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
                 .execute() > 0;
         }
     }
@@ -887,6 +911,7 @@ public class DatabaseManager {
      *         is no longer held by us (possible infringement — must reload)
      */
     public boolean refreshLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
+        requireLockSession(lockSessionId, "refreshLock");
         long now = System.currentTimeMillis();
         try (Connection conn = dataSource.getConnection()) {
             return dsl(conn).update(playerData)
@@ -894,7 +919,7 @@ public class DatabaseManager {
                 .where(UUID_FIELD.eq(uuid.toString())
                     .and(LOCKED_BY_FIELD.eq(serverName))
                     .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                    .and(lockSessionId != null ? LOCK_SESSION_ID_FIELD.eq(lockSessionId) : org.jooq.impl.DSL.noCondition()))
+                    .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
                 .execute() > 0;
         }
     }
@@ -1429,6 +1454,7 @@ public class DatabaseManager {
             String lockSessionId,
             long expectedVersion,
             long dirtyBits) throws SQLException {
+        requireLockSession(lockSessionId, "upsertComponentsIfLockHeld");
         if (componentsWithData == null || componentsWithData.isEmpty()) {
             return ComponentBatchResult.rejected("no components to upsert");
         }
@@ -1532,8 +1558,7 @@ public class DatabaseManager {
                 String updateSql = String.format(
                     "UPDATE `%s` SET `version` = ?, `component_bitmap` = ?, `locked_at` = ?, " +
                     "`last_updated` = ?, `last_server` = ? " +
-                    "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ?" +
-                    (lockSessionId != null ? " AND `lock_session_id` = ?" : ""),
+                    "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
                     dataTable);
 
                 int updated;
@@ -1546,9 +1571,7 @@ public class DatabaseManager {
                     ps.setString(6, uuid.toString());
                     ps.setString(7, serverName);
                     ps.setLong(8, fencingToken);
-                    if (lockSessionId != null) {
-                        ps.setString(9, lockSessionId);
-                    }
+                    ps.setString(9, lockSessionId);
                     updated = ps.executeUpdate();
                 }
 
