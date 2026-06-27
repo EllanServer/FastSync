@@ -1789,6 +1789,9 @@ public class SyncManager {
      *       that accepts a pre-collected player list.
      */
     public SaveAllResult saveAllOnlinePlayers(SaveKind kind) {
+        if (kind == SaveKind.SHUTDOWN) {
+            shuttingDown = true;
+        }
         return savePlayersSnapshot(new ArrayList<>(Bukkit.getOnlinePlayers()), kind);
     }
 
@@ -1824,6 +1827,9 @@ public class SyncManager {
      * @return result with total/success/failed counts
      */
     public SaveAllResult savePlayersSnapshot(List<Player> players, SaveKind kind) {
+        if (kind == SaveKind.SHUTDOWN) {
+            shuttingDown = true;
+        }
         // Phase 1: dispatch (touches Player — must be on global/main thread)
         List<Map.Entry<UUID, CompletableFuture<SaveResult>>> futures = dispatchPlayerSaves(players, kind);
         // Phase 2: wait (no Player access — safe on any thread, including the calling thread)
