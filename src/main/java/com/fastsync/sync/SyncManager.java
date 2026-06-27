@@ -727,6 +727,17 @@ public class SyncManager {
                 logger.severe("[FastSync] Empty-data player joined without valid version/fencing token: " + uuid);
                 failedJoinPlayers.add(uuid);
                 activePlayers.remove(uuid);
+                playerVersions.remove(uuid);
+                playerFencingTokens.remove(uuid);
+                String emptyLockSession = playerLockSessions.remove(uuid);
+                if (dirtyMask != null) {
+                    dirtyMask.remove(uuid);
+                }
+                // Best-effort release if a lock session exists. The helper is
+                // fail-closed: if fencingToken is null/<=0 or emptyLockSession
+                // is null/blank, it logs and refuses tokenless release rather
+                // than clearing another session's lock.
+                releaseLockAsyncBestEffort(uuid, fencingToken, emptyLockSession, "empty-data join without valid token");
                 player.kick(net.kyori.adventure.text.Component.text(
                     "[FastSync] Failed to prepare your data. Please reconnect.",
                     net.kyori.adventure.text.format.NamedTextColor.RED));
@@ -747,11 +758,18 @@ public class SyncManager {
         failedJoinPlayers.add(uuid);
         activePlayers.remove(uuid);
         playerVersions.remove(uuid);
-        playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
+        Long ft = playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
         playersWithBaseline.remove(uuid);
         if (dirtyMask != null) {
             dirtyMask.remove(uuid);
         }
+        // Best-effort release if we hold lock metadata. The helper is
+        // fail-closed: if ft is null/<=0 or lockSession is null/blank, it
+        // logs and refuses tokenless release — the correct behaviour when
+        // no lock was ever acquired (e.g. pre-login fully failed before
+        // acquireLock). When metadata IS present, releasing here prevents
+        // the lock from leaking until timeout.
+        releaseLockAsyncBestEffort(uuid, ft, lockSession, "joined without preloaded data");
         player.kick(net.kyori.adventure.text.Component.text(
             "[FastSync] Failed to prepare your data. Please reconnect.",
             net.kyori.adventure.text.format.NamedTextColor.RED));
