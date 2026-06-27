@@ -102,6 +102,34 @@ public class SyncManager {
     // race for the same player.
     private final ConcurrentHashMap<UUID, java.util.concurrent.locks.ReentrantLock> playerSaveLocks = new ConcurrentHashMap<>();
 
+    // Per-UUID in-flight gate for ONLINE saves (PERIODIC/DEATH/WORLD_SAVE/BULK).
+    // CRITICAL (round 9 P0 fix): prevents the "stale snapshot wins" race where
+    // save A collects an old snapshot, save B collects a new snapshot and
+    // commits first, then save A acquires the saveLock and overwrites B's new
+    // state with its old snapshot.
+    //
+    // The saveLock alone does NOT prevent this — it serializes DB writes but
+    // does NOT serialize the collect step. A's collect can happen before B's
+    // collect, then B commits first, then A commits with stale data.
+    //
+    // The fix: online saves check this gate BEFORE calling collectPlayerData.
+    // If an online save is already in-flight for this UUID, the new save skips
+    // entirely (coalesces to the in-flight one, which will pick up the latest
+    // state on its own collect). This ensures at most one online save is
+    // collecting+serializing+writing per UUID at a time.
+    //
+    // QUIT/SHUTDOWN do NOT use this gate — they must save the final state and
+    // are willing to wait for the saveLock. They are dispatched from
+    // collectAndSavePlayerData / savePlayersSnapshot, which already handle the
+    // saveLock wait. The quit save's collect happens on the entity thread
+    // right before dispatch, and the saveLock ensures it commits after any
+    // in-flight online save.
+    //
+    // The gate is set in savePlayerAsync BEFORE runAtEntity (so the next
+    // periodic tick sees it in-flight and skips) and cleared in the async
+    // executor's finally block (after the DB write completes or fails).
+    private final ConcurrentHashMap<UUID, java.util.concurrent.atomic.AtomicBoolean> onlineSaveInFlight = new ConcurrentHashMap<>();
+
     // Players whose locks were lost (heartbeat refreshLock=false). These players
     // are being kicked and must NOT be saved via the normal QUIT path — their
     // fencing token is no longer valid. The quit handler checks this set and
@@ -2020,6 +2048,34 @@ public class SyncManager {
             }
         }
 
+        // P0 in-flight gate (round 9): claim the per-UUID online-save slot
+        // BEFORE collecting. If another online save is already in-flight for
+        // this UUID, skip this one entirely — the in-flight save will pick up
+        // the latest state on its own collect. This prevents the "stale
+        // snapshot wins" race:
+        //   T1: save A collects old snapshot
+        //   T2: save B collects new snapshot, commits first (v10→v11)
+        //   T3: save A acquires saveLock, refreshVersion to v11, CAS-succeeds
+        //       with old data → B's new state overwritten by A's old snapshot.
+        // The saveLock alone does NOT prevent this because it serializes DB
+        // writes, not collects. The in-flight gate ensures at most one online
+        // save collects+writes per UUID at a time.
+        //
+        // Only for online saves (releaseLock=false). QUIT/SHUTDOWN must save
+        // final state and are handled by collectAndSavePlayerData / savePlayersSnapshot,
+        // which use the saveLock (lock+wait, not tryLock) and run their collect
+        // immediately before dispatch.
+        if (!finalKind.releaseLock) {
+            java.util.concurrent.atomic.AtomicBoolean inFlight =
+                onlineSaveInFlight.computeIfAbsent(uuid, k -> new java.util.concurrent.atomic.AtomicBoolean(false));
+            if (!inFlight.compareAndSet(false, true)) {
+                if (config.isDebug()) {
+                    logger.fine("Skipping " + finalKind + " save for " + uuid + " — online save already in-flight (coalesced)");
+                }
+                return;
+            }
+        }
+
         // Collect player data on the entity's region thread (Folia-safe)
         SchedulerUtil.runAtEntity(plugin, player, () -> {
             // CRITICAL: snapshot dirty state BEFORE collectPlayerData runs.
@@ -2038,47 +2094,71 @@ public class SyncManager {
                     ? dirtyMask.snapshotDirty(uuid)
                     : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
 
-            PlayerData data = collectPlayerData(player);
-
-            pendingSaveCount.incrementAndGet();
-            java.util.concurrent.locks.ReentrantLock saveLock =
-                playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
             try {
-                asyncExecutor.execute(() -> {
-                    // Online save: skip if a save is already in progress for this player.
-                    // The next periodic tick will pick up the latest data — coalescing
-                    // avoids unnecessary version conflicts and saves CPU/DB load.
-                    if (!saveLock.tryLock()) {
-                        pendingSaveCount.decrementAndGet();
-                        if (config.isDebug()) {
-                            logger.fine("Skipping " + finalKind + " save for " + uuid + " — save already in progress");
+                PlayerData data = collectPlayerData(player);
+
+                pendingSaveCount.incrementAndGet();
+                java.util.concurrent.locks.ReentrantLock saveLock =
+                    playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+                try {
+                    asyncExecutor.execute(() -> {
+                        // Online save: skip if a save is already in progress for this player.
+                        // The next periodic tick will pick up the latest data — coalescing
+                        // avoids unnecessary version conflicts and saves CPU/DB load.
+                        if (!saveLock.tryLock()) {
+                            pendingSaveCount.decrementAndGet();
+                            if (config.isDebug()) {
+                                logger.fine("Skipping " + finalKind + " save for " + uuid + " — save already in progress");
+                            }
+                            return;
                         }
-                        return;
+                        try {
+                            // CRITICAL: refresh version/fencingToken after acquiring the lock.
+                            // Without this, if a previous periodic/death save completed first
+                            // and advanced the DB version, this save will CAS-fail with a stale
+                            // version and be treated as a serious lock-infringement conflict.
+                            refreshVersionAndFencingToken(uuid, data);
+                            persistCollectedData(uuid, data, finalKind, preSaveSnapshot);
+                        } catch (Exception e) {
+                            logger.log(Level.WARNING, finalKind + " save failed for " + uuid, e);
+                        } finally {
+                            saveLock.unlock();
+                            pendingSaveCount.decrementAndGet();
+                        }
+                });
+                } catch (java.util.concurrent.RejectedExecutionException e) {
+                    // Queue full — online save can be skipped (coalesced to next tick).
+                    // The player is still online; quit save will persist final state.
+                    pendingSaveCount.decrementAndGet();
+                    if (config.isDebug()) {
+                        logger.fine("Skipping " + finalKind + " save for " + uuid + " — async queue full");
                     }
-                    try {
-                        // CRITICAL: refresh version/fencingToken after acquiring the lock.
-                        // Without this, if a previous periodic/death save completed first
-                        // and advanced the DB version, this save will CAS-fail with a stale
-                        // version and be treated as a serious lock-infringement conflict.
-                        refreshVersionAndFencingToken(uuid, data);
-                        persistCollectedData(uuid, data, finalKind, preSaveSnapshot);
-                    } catch (Exception e) {
-                        logger.log(Level.WARNING, finalKind + " save failed for " + uuid, e);
-                    } finally {
-                        saveLock.unlock();
-                        pendingSaveCount.decrementAndGet();
+                }
+            } finally {
+                // P0 in-flight gate release: MUST run on every exit path from
+                // this entity-thread lambda — normal completion, collectPlayerData
+                // exception, async queue rejection. Without this release, a
+                // single failed online save would permanently block all future
+                // online saves for this UUID (until quit clears activePlayers).
+                // The retired callback below handles the case where the entity
+                // scheduler never ran this lambda at all.
+                if (!finalKind.releaseLock) {
+                    java.util.concurrent.atomic.AtomicBoolean inFlight = onlineSaveInFlight.get(uuid);
+                    if (inFlight != null) {
+                        inFlight.set(false);
                     }
-            });
-            } catch (java.util.concurrent.RejectedExecutionException e) {
-                // Queue full — online save can be skipped (coalesced to next tick).
-                // The player is still online; quit save will persist final state.
-                pendingSaveCount.decrementAndGet();
-                if (config.isDebug()) {
-                    logger.fine("Skipping " + finalKind + " save for " + uuid + " — async queue full");
                 }
             }
         }, () -> {
-            // retired callback: entity no longer valid (player logged out during save tick)
+            // retired callback: entity no longer valid (player logged out during save tick).
+            // The entity-thread lambda above never ran, so its finally block
+            // never released the in-flight gate. Release it here.
+            if (!finalKind.releaseLock) {
+                java.util.concurrent.atomic.AtomicBoolean inFlight = onlineSaveInFlight.get(uuid);
+                if (inFlight != null) {
+                    inFlight.set(false);
+                }
+            }
             if (config.isDebug()) {
                 logger.fine(finalKind + " save skipped for " + uuid + " — entity retired (player offline?)");
             }
@@ -2351,6 +2431,20 @@ public class SyncManager {
             }
             java.util.concurrent.locks.ReentrantLock lock = e.getValue();
             return !lock.isLocked() && !lock.hasQueuedThreads();
+        });
+
+        // Also clean up onlineSaveInFlight entries for players no longer
+        // active/pending. The gate is normally released by the entity-thread
+        // finally block or the retired callback, but if a player disconnects
+        // mid-save and the entity scheduler neither ran the task nor invoked
+        // the retired callback (edge case during shutdown), the entry would
+        // leak. Removing entries for inactive players is safe — the gate is
+        // only consulted by savePlayerAsync, which is gated on activePlayers.
+        onlineSaveInFlight.entrySet().removeIf(e -> {
+            UUID uuid = e.getKey();
+            return !activePlayers.containsKey(uuid)
+                && !pendingData.containsKey(uuid)
+                && !pendingEmptyData.contains(uuid);
         });
     }
 
@@ -2941,12 +3035,36 @@ public class SyncManager {
                         // Quit save: release lock even on conflict — player is leaving.
                         // Use fencing token condition to avoid releasing another
                         // server's lock in case of duplicate server-name config.
+                        //
+                        // P1 (round 9): only notifyLockReleased if releaseLock
+                        // actually returned true (we held the lock and cleared it).
+                        // If actualFencingToken != fencingToken, the lock was
+                        // already lost to another server — releaseLock with our
+                        // stale token affects 0 rows and returns false. Broadcasting
+                        // "released" in that case would mislead waiting servers into
+                        // retrying acquireLock immediately, even though the lock is
+                        // now held by someone else who will release it on their own
+                        // schedule.
+                        //
+                        // If actualFencingToken == fencingToken but version differs
+                        // (same-fencing self-conflict that retry did not fix), the
+                        // lock IS still ours and releaseLock should return true —
+                        // notify is correct in that case.
                         try {
-                            databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                            boolean released = databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                            if (released) {
+                                notifyLockReleased(uuid);
+                            } else if (config.isDebug()) {
+                                logger.fine("Skipping notifyLockReleased for " + uuid + " after " + kind
+                                    + " conflict — releaseLock returned false (lock no longer held by us, ft="
+                                    + fencingToken + ", actualFt=" + actualFencingToken + ")");
+                            }
                         } catch (SQLException lockEx) {
                             logger.log(Level.WARNING, "Failed to release lock after " + kind + " conflict for " + uuid, lockEx);
+                            // Don't notify on SQLException either — we don't know
+                            // whether the release succeeded. Let the lock expire
+                            // naturally so the next server probes conservatively.
                         }
-                        notifyLockReleased(uuid);
                     }
                     // Online save: do NOT release lock — player is still on this server.
                     // The CAS failure means someone else wrote (fencing token violation),

@@ -431,6 +431,28 @@ public class DatabaseManager {
         // the reconnect sees `locked_by IS NULL` on the first acquireLock
         // retry and proceeds immediately. (b) is the safety net for crashes.
         //
+        // P0 SAFETY CHECK (round 9): even with the OR clause removed, the
+        // read-back alone is NOT sufficient to detect "lock held by same
+        // serverName from a prior quit save". When the UPDATE arm's IF
+        // predicate is false (lock held + not expired), MySQL does NOT update
+        // any column, but the row still exists with locked_by = serverName
+        // from the prior session. A naive read-back that only checks
+        // `locked_by == serverName` would incorrectly return SUCCESS.
+        //
+        // We fix this by reading back `locked_at` alongside `locked_by` and
+        // requiring `locked_at == now` (the exact value we just wrote). If the
+        // UPDATE arm ran (IF predicate true), locked_at was set to `now`. If
+        // the UPDATE arm's IF was false (lock held), locked_at retains the
+        // prior session's value, which is strictly less than `now` (the prior
+        // session's heartbeat or acquire happened before this call). The only
+        // way locked_at could equal `now` without us holding the lock is a
+        // concurrent acquire from another thread at the exact same millisecond
+        // — and even then, that thread would have its own serverName or would
+        // have bumped the fencing_token, which we'd see as a mismatch.
+        //
+        // For the INSERT arm (brand-new player), locked_at is set to `now` in
+        // the VALUES clause, so the check passes correctly.
+        //
         // Note: if you genuinely need same-process lock re-entry (e.g. for a
         // debug command), introduce a session_id / boot_id column and gate on
         // that, NOT on serverName. serverName alone is ambiguous because
@@ -465,15 +487,35 @@ public class DatabaseManager {
                 now               // locked_at new value
             );
 
-            // Read back the committed fencing_token and lock owner on the same
-            // connection. We hold the lock iff locked_by == serverName; the
-            // fencing_token is the one we just wrote (PK point lookup).
-            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD)
+            // Read back the committed fencing_token, locked_by, AND locked_at
+            // on the same connection. We hold the lock iff:
+            //   - locked_by == serverName (lock is ours, not another server's)
+            //   - locked_at == now (we just set it this call — rules out the
+            //     case where the UPDATE arm's IF was false because the lock
+            //     was already held by a prior session with the same serverName)
+            // The fencing_token we read is the one we just wrote (PK point
+            // lookup; no other server can bump it before our read-back because
+            // we hold the row's X lock via the just-completed
+            // INSERT...ON DUPLICATE KEY UPDATE).
+            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD, LOCKED_AT_FIELD)
                 .from(playerData)
                 .where(UUID_FIELD.eq(uuid.toString()))
                 .fetchOne();
 
-            if (record == null || !serverName.equals(record.get(LOCKED_BY_FIELD))) {
+            if (record == null) {
+                return LockResult.FAILED;
+            }
+            String lockedBy = record.get(LOCKED_BY_FIELD);
+            Long lockedAt = record.get(LOCKED_AT_FIELD);
+            if (!serverName.equals(lockedBy)) {
+                // Lock is held by another server (or NULL = free but our UPDATE
+                // didn't fire for some reason). Not ours.
+                return LockResult.FAILED;
+            }
+            // P0 check: locked_at must be the value we just wrote. If it's a
+            // stale value from a prior session (quit save still in flight),
+            // the UPDATE arm's IF was false and we did NOT acquire the lock.
+            if (lockedAt == null || lockedAt != now) {
                 return LockResult.FAILED;
             }
             Long token = record.get(FENCING_TOKEN_FIELD);
