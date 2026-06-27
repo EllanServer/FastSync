@@ -30,3 +30,5 @@ Thumbs.db
 **/config-local.yml
 **/secrets.yml
 target/
+*.bak
+build.gradle.kts.bak
