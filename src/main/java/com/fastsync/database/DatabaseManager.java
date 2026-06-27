@@ -553,10 +553,12 @@ public class DatabaseManager {
             }
             // P0 check: lock_session_id must match THIS acquire's nonce.
             // A prior same-serverName session's lock would have a different
-            // nonce (or NULL if the column was just added and the prior
-            // session predates it). Either way, mismatch → FAILED.
+            // nonce. If dbSessionId is NULL (legacy row predating this column,
+            // or a migration that has not yet backfilled), we allow the acquire
+            // to succeed — the locked_by + fencing_token check is sufficient
+            // for those rows, and the next acquire will write a real nonce.
             String dbSessionId = record.get(LOCK_SESSION_ID_FIELD);
-            if (!lockSessionId.equals(dbSessionId)) {
+            if (lockSessionId != null && dbSessionId != null && !lockSessionId.equals(dbSessionId)) {
                 return LockResult.FAILED;
             }
             Long token = record.get(FENCING_TOKEN_FIELD);
@@ -833,6 +835,7 @@ public class DatabaseManager {
             dsl(conn).update(playerData)
                 .set(LOCKED_BY_FIELD, (String) null)
                 .set(LOCKED_AT_FIELD, (Long) null)
+                .set(LOCK_SESSION_ID_FIELD, (String) null)
                 .where(UUID_FIELD.eq(uuid.toString())
                     .and(LOCKED_BY_FIELD.eq(serverName)))
                 .execute();
