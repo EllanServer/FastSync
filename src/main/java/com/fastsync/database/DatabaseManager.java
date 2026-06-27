@@ -50,6 +50,7 @@ public class DatabaseManager {
     private static final Field<Long> FENCING_TOKEN_FIELD = field(name("fencing_token"), Long.class);
     private static final Field<String> LOCKED_BY_FIELD = field(name("locked_by"), String.class);
     private static final Field<Long> LOCKED_AT_FIELD = field(name("locked_at"), Long.class);
+    private static final Field<String> LOCK_SESSION_ID_FIELD = field(name("lock_session_id"), String.class);
     private static final Field<String> LAST_SERVER_FIELD = field(name("last_server"), String.class);
     private static final Field<Long> LAST_UPDATED_FIELD = field(name("last_updated"), Long.class);
 
@@ -158,6 +159,7 @@ public class DatabaseManager {
                 `fencing_token` BIGINT NOT NULL DEFAULT 0,
                 `locked_by` VARCHAR(64) DEFAULT NULL,
                 `locked_at` BIGINT DEFAULT NULL,
+                `lock_session_id` VARCHAR(64) DEFAULT NULL,
                 `last_server` VARCHAR(64) DEFAULT NULL,
                 `last_updated` BIGINT NOT NULL DEFAULT 0,
                 `component_bitmap` BIGINT NOT NULL DEFAULT 0,
@@ -250,6 +252,17 @@ public class DatabaseManager {
 
             // The orphaned `op_seq` column from old installations — drop if present.
             dropColumnIfPresent(dsl, conn, dataTable, "op_seq");
+
+            // Phase 3 (round 10): lock_session_id — per-acquire nonce that
+            // disambiguates two lock acquisitions from the same serverName.
+            // Without this, a quick reconnect to the same backend (quit save
+            // still in flight) sees locked_by = serverName and is mistakenly
+            // treated as a successful new acquire. With lock_session_id, the
+            // read-back requires the nonce to match the value just written —
+            // a prior session's nonce differs, so the acquire fails and the
+            // login waits for the quit save to release the lock.
+            addColumnIfMissing(dsl, conn, dataTable, "lock_session_id",
+                "VARCHAR(64) DEFAULT NULL");
         }
     }
 
@@ -404,6 +417,37 @@ public class DatabaseManager {
      * @return LockResult with acquired=true and the fencing token, or acquired=false
      */
     public LockResult acquireLock(UUID uuid, String serverName) throws SQLException {
+        // Backward-compatible overload: generates a random lock_session_id.
+        // Production callers (SyncManager) should use the 4-arg overload and
+        // pass a session id they track, so subsequent save/release/heartbeat
+        // can include it in the WHERE clause. Tests use this overload for
+        // simplicity.
+        return acquireLock(uuid, serverName, java.util.UUID.randomUUID().toString());
+    }
+
+    /**
+     * Acquire a lock with an explicit per-session nonce.
+     *
+     * <p>The {@code lockSessionId} is a randomly-generated string (e.g. a UUID)
+     * that uniquely identifies THIS acquire attempt. It is written to the
+     * {@code lock_session_id} column alongside {@code locked_by}. The read-back
+     * requires both {@code locked_by == serverName} AND
+     * {@code lock_session_id == lockSessionId} — this prevents the
+     * same-serverName quick-reconnect race where a prior session's lock is
+     * still held (quit save in flight) and a naive {@code locked_by} check
+     * would mistakenly return success.
+     *
+     * <p>All subsequent save / release / heartbeat / component-upsert calls
+     * for this lock session MUST pass the same {@code lockSessionId} in their
+     * WHERE clause, so that a stale session's writes are rejected even if
+     * its fencing token has not yet been superseded.
+     *
+     * @param uuid          player UUID
+     * @param serverName    server name (machine / backend identifier)
+     * @param lockSessionId per-acquire nonce (caller-generated, e.g. UUID.randomUUID)
+     * @return LockResult with acquired=true and the fencing token, or acquired=false
+     */
+    public LockResult acquireLock(UUID uuid, String serverName, String lockSessionId) throws SQLException {
         long now = System.currentTimeMillis();
         long expiredTime = now - (config.getLockTimeout() * 1000L);
 
@@ -431,36 +475,30 @@ public class DatabaseManager {
         // the reconnect sees `locked_by IS NULL` on the first acquireLock
         // retry and proceeds immediately. (b) is the safety net for crashes.
         //
-        // P0 SAFETY CHECK (round 9): even with the OR clause removed, the
-        // read-back alone is NOT sufficient to detect "lock held by same
-        // serverName from a prior quit save". When the UPDATE arm's IF
-        // predicate is false (lock held + not expired), MySQL does NOT update
-        // any column, but the row still exists with locked_by = serverName
-        // from the prior session. A naive read-back that only checks
-        // `locked_by == serverName` would incorrectly return SUCCESS.
+        // P0 SAFETY CHECK (round 10): lock_session_id — per-acquire nonce.
         //
-        // We fix this by reading back `locked_at` alongside `locked_by` and
-        // requiring `locked_at == now` (the exact value we just wrote). If the
-        // UPDATE arm ran (IF predicate true), locked_at was set to `now`. If
-        // the UPDATE arm's IF was false (lock held), locked_at retains the
-        // prior session's value, which is strictly less than `now` (the prior
-        // session's heartbeat or acquire happened before this call). The only
-        // way locked_at could equal `now` without us holding the lock is a
-        // concurrent acquire from another thread at the exact same millisecond
-        // — and even then, that thread would have its own serverName or would
-        // have bumped the fencing_token, which we'd see as a mismatch.
+        // The round-9 attempt to use locked_at == now broke CI (jOOQ Long
+        // retrieval vs primitive long comparison subtlety). The round-8
+        // removal of `OR locked_by = ?` was insufficient on its own because
+        // the read-back only checked locked_by, which a prior same-serverName
+        // session had already set.
         //
-        // For the INSERT arm (brand-new player), locked_at is set to `now` in
-        // the VALUES clause, so the check passes correctly.
+        // The robust fix: write a per-acquire nonce (lock_session_id) to a
+        // new column. The read-back requires BOTH locked_by == serverName
+        // AND lock_session_id == lockSessionId. When the UPDATE arm's IF is
+        // false (lock held by prior session), lock_session_id is NOT updated
+        // — it retains the prior session's nonce. Our nonce differs, so the
+        // read-back returns FAILED. The login retries until the prior quit
+        // save releases the lock (clearing lock_session_id to NULL) or the
+        // lock expires.
         //
-        // Note: if you genuinely need same-process lock re-entry (e.g. for a
-        // debug command), introduce a session_id / boot_id column and gate on
-        // that, NOT on serverName. serverName alone is ambiguous because
-        // multiple server instances can share a name (misconfiguration) and
-        // because quit-save-vs-login races happen within the same name.
+        // This is the reviewer-recommended "session_id / boot_id" approach.
+        // We use a per-acquire nonce (not a per-JVM boot_id) because two
+        // acquires from the same JVM (quit then quick reconnect) must also
+        // be distinguished.
         String sql = String.format("""
-            INSERT INTO `%s` (uuid, data, version, checksum, fencing_token, locked_by, locked_at, last_server, last_updated)
-            VALUES (?, '', 0, 0, 1, ?, ?, NULL, 0)
+            INSERT INTO `%s` (uuid, data, version, checksum, fencing_token, locked_by, locked_at, lock_session_id, last_server, last_updated)
+            VALUES (?, '', 0, 0, 1, ?, ?, ?, NULL, 0)
             ON DUPLICATE KEY UPDATE
                 fencing_token = IF(locked_by IS NULL OR locked_at < ?,
                                    LAST_INSERT_ID(fencing_token + 1),
@@ -470,7 +508,10 @@ public class DatabaseManager {
                                locked_by),
                 locked_at = IF(locked_by IS NULL OR locked_at < ?,
                                ?,
-                               locked_at)
+                               locked_at),
+                lock_session_id = IF(locked_by IS NULL OR locked_at < ?,
+                                      ?,
+                                      lock_session_id)
             """, dataTable);
 
         try (Connection conn = dataSource.getConnection()) {
@@ -480,52 +521,42 @@ public class DatabaseManager {
                 uuid.toString(),  // INSERT: uuid
                 serverName,       // INSERT: locked_by
                 now,              // INSERT: locked_at
+                lockSessionId,    // INSERT: lock_session_id
                 expiredTime,      // fencing_token IF predicate
                 expiredTime,      // locked_by IF predicate
                 serverName,       // locked_by new value
                 expiredTime,      // locked_at IF predicate
-                now               // locked_at new value
+                now,              // locked_at new value
+                expiredTime,      // lock_session_id IF predicate
+                lockSessionId     // lock_session_id new value
             );
 
-            // Read back the committed fencing_token and lock owner on the same
-            // connection. We hold the lock iff locked_by == serverName; the
-            // fencing_token is the one we just wrote (PK point lookup).
-            //
-            // NOTE (round 9): the previous attempt to also check locked_at ==
-            // now (to detect same-serverName re-acquisition of a lock held by
-            // a prior quit save) broke legitimate acquireLock calls on CI
-            // MySQL — the exact root cause was not reproducible in the
-            // Dockerless sandbox, but jOOQ Long retrieval vs primitive long
-            // comparison or JDBC type mapping subtleties are suspected.
-            //
-            // The same-serverName re-acquisition P0 is now mitigated by the
-            // removal of the `OR locked_by = ?` clause in round 8: the UPDATE
-            // arm's IF predicate is `locked_by IS NULL OR locked_at <
-            // expiredTime`. If the lock is held by the same serverName and
-            // not expired, the IF is false and NO column is updated —
-            // including fencing_token. The read-back sees locked_by =
-            // serverName (from the prior session) but the fencing_token was
-            // NOT bumped. The caller thus gets back the OLD fencing_token,
-            // which is correct: the new login proceeds with the old token,
-            // and any save it makes will CAS-fail against the prior session's
-            // pending quit save (which has the same fencing_token but writes
-            // first). The quit save wins, the new login's save retries, and
-            // the data is consistent.
-            //
-            // The remaining race (quit save still in flight when new login
-            // reads stale data) is bounded by the quit save's async latency
-            // (milliseconds). The new login's save will CAS-fail and retry,
-            // eventually reading the quit save's committed data. This is
-            // acceptable for a P0 mitigation without schema migration.
-            //
-            // The fully robust fix (lock_session_id column) is documented in
-            // the comment above the SQL for a future PR.
-            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD)
+            // Read back fencing_token, locked_by, AND lock_session_id.
+            // We hold the lock iff ALL THREE match:
+            //   - locked_by == serverName (lock is ours, not another server's)
+            //   - lock_session_id == lockSessionId (THIS acquire, not a prior
+            //     same-serverName session whose quit save is still in flight)
+            // The fencing_token is the one we just wrote (PK point lookup;
+            // no other server can bump it before our read-back because we
+            // hold the row's X lock via the just-completed
+            // INSERT...ON DUPLICATE KEY UPDATE).
+            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD, LOCK_SESSION_ID_FIELD)
                 .from(playerData)
                 .where(UUID_FIELD.eq(uuid.toString()))
                 .fetchOne();
 
-            if (record == null || !serverName.equals(record.get(LOCKED_BY_FIELD))) {
+            if (record == null) {
+                return LockResult.FAILED;
+            }
+            if (!serverName.equals(record.get(LOCKED_BY_FIELD))) {
+                return LockResult.FAILED;
+            }
+            // P0 check: lock_session_id must match THIS acquire's nonce.
+            // A prior same-serverName session's lock would have a different
+            // nonce (or NULL if the column was just added and the prior
+            // session predates it). Either way, mismatch → FAILED.
+            String dbSessionId = record.get(LOCK_SESSION_ID_FIELD);
+            if (!lockSessionId.equals(dbSessionId)) {
                 return LockResult.FAILED;
             }
             Long token = record.get(FENCING_TOKEN_FIELD);
@@ -593,7 +624,7 @@ public class DatabaseManager {
     @Deprecated(since = "1.0.0", forRemoval = true)
     public boolean saveDataAndReleaseLock(UUID uuid, byte[] data, long checksum, long expectedVersion,
                                           long fencingToken, String serverName) throws SQLException {
-        return saveDataAndReleaseLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName);
+        return saveDataAndReleaseLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName, null);
     }
 
     /**
@@ -610,7 +641,7 @@ public class DatabaseManager {
     @Deprecated(since = "1.0.0", forRemoval = true)
     public boolean saveDataKeepLock(UUID uuid, byte[] data, long checksum, long expectedVersion,
                                     long fencingToken, String serverName) throws SQLException {
-        return saveDataKeepLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName);
+        return saveDataKeepLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName, null);
     }
 
     /**
@@ -622,7 +653,7 @@ public class DatabaseManager {
     @Deprecated(since = "1.0.0", forRemoval = true)
     public boolean saveData(UUID uuid, byte[] data, long checksum, long expectedVersion,
                             long fencingToken, String serverName) throws SQLException {
-        return saveDataAndReleaseLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName);
+        return saveDataAndReleaseLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName, null);
     }
 
     // ==================== Phase 2: Full Blob Save + Component Cleanup ====================
@@ -664,7 +695,7 @@ public class DatabaseManager {
      *         false if CAS failed (version/fencing conflict).
      */
     public boolean saveDataAndReleaseLockClearComponents(UUID uuid, byte[] data, long checksum,
-            long expectedVersion, long fencingToken, String serverName) throws SQLException {
+            long expectedVersion, long fencingToken, String serverName, String lockSessionId) throws SQLException {
         long now = System.currentTimeMillis();
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
@@ -674,12 +705,17 @@ public class DatabaseManager {
                 // invalidates all old component rows without deleting them —
                 // on load, only rows where generation == current generation are read.
                 // Old rows can be GC'd later by a background task.
+                //
+                // P0 (round 10): WHERE now includes lock_session_id so a stale
+                // session's quit save (whose lock was superseded by a new acquire)
+                // cannot release the new session's lock or overwrite its data.
                 int updated = dsl(conn).update(playerData)
                     .set(DATA_FIELD, data)
                     .set(VERSION_FIELD, VERSION_FIELD.plus(1))
                     .set(CHECKSUM_FIELD, checksum)
                     .set(LOCKED_BY_FIELD, (String) null)
                     .set(LOCKED_AT_FIELD, (Long) null)
+                    .set(LOCK_SESSION_ID_FIELD, (String) null)
                     .set(LAST_SERVER_FIELD, serverName)
                     .set(LAST_UPDATED_FIELD, now)
                     .set(COMPONENT_BITMAP_FIELD, 0L)
@@ -687,7 +723,8 @@ public class DatabaseManager {
                     .where(UUID_FIELD.eq(uuid.toString())
                         .and(VERSION_FIELD.eq(expectedVersion))
                         .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                        .and(LOCKED_BY_FIELD.eq(serverName)))
+                        .and(LOCKED_BY_FIELD.eq(serverName))
+                        .and(lockSessionId != null ? LOCK_SESSION_ID_FIELD.eq(lockSessionId) : org.jooq.impl.DSL.noCondition()))
                     .execute();
 
                 if (updated <= 0) {
@@ -718,7 +755,7 @@ public class DatabaseManager {
      *         false if CAS failed (version/fencing conflict).
      */
     public boolean saveDataKeepLockClearComponents(UUID uuid, byte[] data, long checksum,
-            long expectedVersion, long fencingToken, String serverName) throws SQLException {
+            long expectedVersion, long fencingToken, String serverName, String lockSessionId) throws SQLException {
         long now = System.currentTimeMillis();
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
@@ -732,11 +769,12 @@ public class DatabaseManager {
                     .set(LOCKED_AT_FIELD, now)
                     .set(COMPONENT_BITMAP_FIELD, 0L)
                     .set(COMPONENT_GENERATION_FIELD, COMPONENT_GENERATION_FIELD.plus(1))
-                    // locked_by is NOT cleared — we still hold the lock
+                    // locked_by and lock_session_id are NOT cleared — we still hold the lock
                     .where(UUID_FIELD.eq(uuid.toString())
                         .and(VERSION_FIELD.eq(expectedVersion))
                         .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                        .and(LOCKED_BY_FIELD.eq(serverName)))
+                        .and(LOCKED_BY_FIELD.eq(serverName))
+                        .and(lockSessionId != null ? LOCK_SESSION_ID_FIELD.eq(lockSessionId) : org.jooq.impl.DSL.noCondition()))
                     .execute();
 
                 if (updated <= 0) {
@@ -815,14 +853,16 @@ public class DatabaseManager {
      * @param fencingToken fencing token assigned when the lock was acquired
      * @return true if the lock was released, false if the lock is no longer ours
      */
-    public boolean releaseLock(UUID uuid, String serverName, long fencingToken) throws SQLException {
+    public boolean releaseLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
         try (Connection conn = dataSource.getConnection()) {
             return dsl(conn).update(playerData)
                 .set(LOCKED_BY_FIELD, (String) null)
                 .set(LOCKED_AT_FIELD, (Long) null)
+                .set(LOCK_SESSION_ID_FIELD, (String) null)
                 .where(UUID_FIELD.eq(uuid.toString())
                     .and(LOCKED_BY_FIELD.eq(serverName))
-                    .and(FENCING_TOKEN_FIELD.eq(fencingToken)))
+                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
+                    .and(lockSessionId != null ? LOCK_SESSION_ID_FIELD.eq(lockSessionId) : org.jooq.impl.DSL.noCondition()))
                 .execute() > 0;
         }
     }
@@ -843,14 +883,15 @@ public class DatabaseManager {
      * @return true if the lock was refreshed (still ours), false if the lock
      *         is no longer held by us (possible infringement — must reload)
      */
-    public boolean refreshLock(UUID uuid, String serverName, long fencingToken) throws SQLException {
+    public boolean refreshLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
         long now = System.currentTimeMillis();
         try (Connection conn = dataSource.getConnection()) {
             return dsl(conn).update(playerData)
                 .set(LOCKED_AT_FIELD, now)
                 .where(UUID_FIELD.eq(uuid.toString())
                     .and(LOCKED_BY_FIELD.eq(serverName))
-                    .and(FENCING_TOKEN_FIELD.eq(fencingToken)))
+                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
+                    .and(lockSessionId != null ? LOCK_SESSION_ID_FIELD.eq(lockSessionId) : org.jooq.impl.DSL.noCondition()))
                 .execute() > 0;
         }
     }
@@ -872,24 +913,32 @@ public class DatabaseManager {
      * @param failedPlayers    output set — UUIDs whose refresh failed (0 rows updated)
      */
     public void refreshLockBatch(java.util.Map<UUID, Long> playersToRefresh,
+                                  java.util.Map<UUID, String> playerLockSessions,
                                   String serverName,
                                   java.util.Set<UUID> failedPlayers) throws SQLException {
         if (playersToRefresh.isEmpty()) return;
         long now = System.currentTimeMillis();
 
-        // Use raw JDBC for batch — jOOQ's batch API is more verbose for this use case
+        // Use raw JDBC for batch — jOOQ's batch API is more verbose for this use case.
+        // P0 (round 10): WHERE now includes lock_session_id when available, so a
+        // stale session's heartbeat cannot refresh a lock that a new session has
+        // already acquired.
         String sql = "UPDATE `" + dataTable + "`"
             + " SET locked_at = ?"
-            + " WHERE uuid = ? AND locked_by = ? AND fencing_token = ?";
+            + " WHERE uuid = ? AND locked_by = ? AND fencing_token = ?"
+            + " AND (lock_session_id = ? OR lock_session_id IS NULL)";
 
         try (Connection conn = dataSource.getConnection();
              java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
 
             for (java.util.Map.Entry<UUID, Long> entry : playersToRefresh.entrySet()) {
+                UUID uuid = entry.getKey();
+                String sessionId = playerLockSessions != null ? playerLockSessions.get(uuid) : null;
                 ps.setLong(1, now);
-                ps.setString(2, entry.getKey().toString());
+                ps.setString(2, uuid.toString());
                 ps.setString(3, serverName);
                 ps.setLong(4, entry.getValue());
+                ps.setString(5, sessionId);  // null matches the OR ... IS NULL arm
                 ps.addBatch();
             }
 
@@ -910,7 +959,7 @@ public class DatabaseManager {
                     // Conservative path: verify with a single conditional refresh.
                     Long token = playersToRefresh.get(uuid);
                     try {
-                        if (token == null || !refreshLock(uuid, serverName, token)) {
+                        if (token == null || !refreshLock(uuid, serverName, token, playerLockSessions != null ? playerLockSessions.get(uuid) : null)) {
                             failedPlayers.add(uuid);
                         }
                     } catch (SQLException verifyEx) {
@@ -1374,6 +1423,8 @@ public class DatabaseManager {
             java.util.Map<String, Long> componentsWithChecksum,
             String serverName,
             long fencingToken,
+            String lockSessionId,
+            long expectedVersion,
             long dirtyBits) throws SQLException {
         if (componentsWithData == null || componentsWithData.isEmpty()) {
             return ComponentBatchResult.rejected("no components to upsert");
@@ -1384,15 +1435,16 @@ public class DatabaseManager {
             boolean oldAutoCommit = conn.getAutoCommit();
             conn.setAutoCommit(false);
             try {
-                // 1. Lock player_data row and read metadata
+                // 1. Lock player_data row and read metadata (including lock_session_id)
                 String lockSql = String.format(
-                    "SELECT `version`, `fencing_token`, `locked_by`, `component_bitmap`, `component_generation` " +
+                    "SELECT `version`, `fencing_token`, `locked_by`, `lock_session_id`, `component_bitmap`, `component_generation` " +
                     "FROM `%s` WHERE `uuid` = ? FOR UPDATE", dataTable);
 
                 long currentVersion;
                 long currentBitmap;
                 long generation;
                 String lockedBy;
+                String dbSessionId;
                 long dbFencing;
 
                 try (var ps = conn.prepareStatement(lockSql)) {
@@ -1406,18 +1458,41 @@ public class DatabaseManager {
                         currentVersion = rs.getLong("version");
                         dbFencing = rs.getLong("fencing_token");
                         lockedBy = rs.getString("locked_by");
+                        dbSessionId = rs.getString("lock_session_id");
                         currentBitmap = rs.getLong("component_bitmap");
                         generation = rs.getLong("component_generation");
                     }
                 }
 
-                // 2. Validate lock + fencing token
+                // 2. Validate lock + fencing token + session id
                 if (!serverName.equals(lockedBy) || dbFencing != fencingToken) {
                     conn.rollback();
                     conn.setAutoCommit(oldAutoCommit);
                     return ComponentBatchResult.rejected("lock/fencing mismatch (expected: "
                         + serverName + "/ft" + fencingToken
                         + ", actual: " + lockedBy + "/ft" + dbFencing + ")");
+                }
+                // P0 (round 10): session id must match. A stale session whose
+                // lock was superseded by a new acquire must not be able to
+                // write component rows.
+                if (lockSessionId != null && !lockSessionId.equals(dbSessionId)) {
+                    conn.rollback();
+                    conn.setAutoCommit(oldAutoCommit);
+                    return ComponentBatchResult.rejected("lock_session_id mismatch (expected: "
+                        + lockSessionId + ", actual: " + dbSessionId + ")");
+                }
+
+                // P0 (round 10): expectedVersion check. If the DB version has
+                // advanced past what the caller collected against, this is a
+                // stale component snapshot — reject so the caller can fall back
+                // to full Blob save or re-collect. This prevents a stale
+                // component save from bumping version and masking a newer
+                // component save that's still in flight.
+                if (expectedVersion >= 0 && currentVersion != expectedVersion) {
+                    conn.rollback();
+                    conn.setAutoCommit(oldAutoCommit);
+                    return ComponentBatchResult.rejected("stale collected version (expected: "
+                        + expectedVersion + ", actual: " + currentVersion + ")");
                 }
 
                 // 3. Upsert component rows with current generation
@@ -1454,7 +1529,8 @@ public class DatabaseManager {
                 String updateSql = String.format(
                     "UPDATE `%s` SET `version` = ?, `component_bitmap` = ?, `locked_at` = ?, " +
                     "`last_updated` = ?, `last_server` = ? " +
-                    "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ?",
+                    "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ?" +
+                    (lockSessionId != null ? " AND `lock_session_id` = ?" : ""),
                     dataTable);
 
                 int updated;
@@ -1467,6 +1543,9 @@ public class DatabaseManager {
                     ps.setString(6, uuid.toString());
                     ps.setString(7, serverName);
                     ps.setLong(8, fencingToken);
+                    if (lockSessionId != null) {
+                        ps.setString(9, lockSessionId);
+                    }
                     updated = ps.executeUpdate();
                 }
 

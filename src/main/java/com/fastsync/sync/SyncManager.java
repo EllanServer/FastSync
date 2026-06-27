@@ -94,6 +94,15 @@ public class SyncManager {
     // Track the fencing token for each player (Kleppmann stale-write defence)
     private final ConcurrentHashMap<UUID, Long> playerFencingTokens = new ConcurrentHashMap<>();
 
+    // P0 (round 10): per-acquire lock session id. Each successful acquireLock
+    // generates a random nonce (UUID string) that is written to the
+    // lock_session_id column. All subsequent save / release / heartbeat /
+    // component-upsert calls for this session include the nonce in their WHERE
+    // clause. This prevents a stale session (e.g. quit save still in flight
+    // when the player quick-reconnects to the same backend) from releasing
+    // or overwriting the new session's lock/data.
+    private final ConcurrentHashMap<UUID, String> playerLockSessions = new ConcurrentHashMap<>();
+
     // Per-UUID save lock: ensures saves for the same player run sequentially.
     // Periodic saves use tryLock() and skip if a save is in flight (coalescing —
     // the next periodic save will pick up the latest data).
@@ -447,14 +456,20 @@ public class SyncManager {
 
     private LoadResult loadPlayerDataInternal(UUID uuid) {
         // Step 1: Try to acquire lock (returns fencing token on success)
+        // P0 (round 10): generate a per-acquire lockSessionId so this session's
+        // saves/releases/heartbeats can be distinguished from a prior session's
+        // in-flight quit save. The nonce is stored in playerLockSessions after
+        // successful acquire and passed to every subsequent DB call.
         boolean locked = false;
         long fencingToken = 0;
+        String lockSessionId = java.util.UUID.randomUUID().toString();
         for (int i = 0; i < config.getLockMaxRetries(); i++) {
             try {
-                LockResult lockResult = databaseManager.acquireLock(uuid, config.getServerName());
+                LockResult lockResult = databaseManager.acquireLock(uuid, config.getServerName(), lockSessionId);
                 if (lockResult.acquired()) {
                     locked = true;
                     fencingToken = lockResult.fencingToken();
+                    playerLockSessions.put(uuid, lockSessionId);
                     break;
                 }
 
@@ -566,7 +581,7 @@ public class SyncManager {
 
                 if (loadLatency != null) loadLatency.recordError();
             try {
-                databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, playerLockSessions.get(uuid));
                 notifyLockReleased(uuid);
             } catch (SQLException ex) {
                 logger.log(Level.WARNING, "Failed to release lock after checksum failure for " + uuid, ex);
@@ -661,7 +676,7 @@ public class SyncManager {
         // Release lock on error — use token version if we have a valid token
         try {
             if (fencingToken > 0) {
-                databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, playerLockSessions.get(uuid));
             } else {
                 databaseManager.releaseLock(uuid, config.getServerName());
             }
@@ -715,7 +730,7 @@ public class SyncManager {
         failedJoinPlayers.add(uuid);
         activePlayers.remove(uuid);
         playerVersions.remove(uuid);
-        playerFencingTokens.remove(uuid);
+        playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
         playersWithBaseline.remove(uuid);
         if (dirtyMask != null) {
             dirtyMask.remove(uuid);
@@ -901,7 +916,7 @@ public class SyncManager {
             failedJoinPlayers.add(uuid);
             activePlayers.remove(uuid);
             playerVersions.remove(uuid);
-            Long ft = playerFencingTokens.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
             if (dirtyMask != null) {
                 dirtyMask.remove(uuid);
             }
@@ -911,7 +926,7 @@ public class SyncManager {
                 try {
                     asyncExecutor.execute(() -> {
                         try {
-                            databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                            databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, playerLockSessions.get(uuid));
                             notifyLockReleased(uuid);
                         } catch (SQLException e) {
                             logger.log(Level.WARNING, "Failed to release lock after apply failure for " + uuid, e);
@@ -922,7 +937,7 @@ public class SyncManager {
                 } catch (java.util.concurrent.RejectedExecutionException e) {
                     pendingSaveCount.decrementAndGet();
                     try {
-                        databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                        databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, playerLockSessions.get(uuid));
                         notifyLockReleased(uuid);
                     } catch (SQLException ex) {
                         logger.log(Level.WARNING, "Failed to release lock after apply failure for " + uuid, ex);
@@ -994,7 +1009,7 @@ public class SyncManager {
             pendingData.remove(uuid);
             pendingEmptyData.remove(uuid);
             pendingLoadTimes.remove(uuid);
-            Long ft = playerFencingTokens.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
             if (dirtyMask != null) {
                 dirtyMask.remove(uuid);
             }
@@ -1005,7 +1020,7 @@ public class SyncManager {
                 try {
                     asyncExecutor.execute(() -> {
                         try {
-                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                            databaseManager.releaseLock(uuid, config.getServerName(), ft, playerLockSessions.get(uuid));
                             notifyLockReleased(uuid);
                         } catch (SQLException e) {
                             logger.log(Level.WARNING, "Failed to release lock for failed-join player " + uuid, e);
@@ -1016,7 +1031,7 @@ public class SyncManager {
                 } catch (java.util.concurrent.RejectedExecutionException e) {
                     pendingSaveCount.decrementAndGet();
                     try {
-                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        databaseManager.releaseLock(uuid, config.getServerName(), ft, playerLockSessions.get(uuid));
                         notifyLockReleased(uuid);
                     } catch (SQLException ex) {
                         logger.log(Level.WARNING, "Failed to release lock for failed-join player " + uuid, ex);
@@ -1035,7 +1050,7 @@ public class SyncManager {
             && !quarantinedPlayers.contains(uuid)) {
             logger.warning("[Quit] Skipping save for inactive/untracked player " + uuid);
             playerVersions.remove(uuid);
-            playerFencingTokens.remove(uuid);
+            playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
             return;
         }
 
@@ -1045,7 +1060,7 @@ public class SyncManager {
             pendingEmptyData.remove(uuid);
             pendingLoadTimes.remove(uuid);
             activePlayers.remove(uuid);
-            Long ft = playerFencingTokens.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
             if (dirtyMask != null) {
                 dirtyMask.remove(uuid);
             }
@@ -1057,7 +1072,7 @@ public class SyncManager {
                 asyncExecutor.execute(() -> {
                     try {
                         if (ft != null && ft > 0) {
-                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                            databaseManager.releaseLock(uuid, config.getServerName(), ft, playerLockSessions.get(uuid));
                         } else {
                             databaseManager.releaseLock(uuid, config.getServerName());
                         }
@@ -1076,7 +1091,7 @@ public class SyncManager {
                 pendingSaveCount.decrementAndGet();
                 try {
                     if (ft != null && ft > 0) {
-                        databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        databaseManager.releaseLock(uuid, config.getServerName(), ft, playerLockSessions.get(uuid));
                     } else {
                         databaseManager.releaseLock(uuid, config.getServerName());
                     }
@@ -1104,7 +1119,7 @@ public class SyncManager {
         if (quarantinedPlayers.remove(uuid)) {
             logger.warning("[Quit] Player " + uuid + " was quarantined (lock lost during session)."
                 + " Skipping final save — data may be stale. Player should have been kicked.");
-            Long ft = playerFencingTokens.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
             playerVersions.remove(uuid);
             playersWithBaseline.remove(uuid);
             releaseLockAsyncBestEffort(uuid, ft, "quarantined player quit");
@@ -1135,7 +1150,7 @@ public class SyncManager {
                     // another thread is waiting on the same lock instance.
                     // Locks are cleaned up lazily by cleanupStaleEntries().
                     playerVersions.remove(uuid);
-                    playerFencingTokens.remove(uuid);
+                    playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
                     playersWithBaseline.remove(uuid);
                     pendingSaveCount.decrementAndGet();
                 }
@@ -1153,7 +1168,7 @@ public class SyncManager {
             } finally {
                 saveLock.unlock();
                 playerVersions.remove(uuid);
-                playerFencingTokens.remove(uuid);
+                playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
                 playersWithBaseline.remove(uuid);
                 pendingSaveCount.decrementAndGet();
             }
@@ -1186,7 +1201,7 @@ public class SyncManager {
         pendingEmptyData.remove(uuid);
         pendingLoadTimes.remove(uuid);
         activePlayers.remove(uuid);
-        Long ft = playerFencingTokens.remove(uuid);
+        Long ft = playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
         if (dirtyMask != null) {
             dirtyMask.remove(uuid);
         }
@@ -1194,7 +1209,7 @@ public class SyncManager {
         playersWithBaseline.remove(uuid);
         try {
             if (ft != null && ft > 0) {
-                databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                databaseManager.releaseLock(uuid, config.getServerName(), ft, playerLockSessions.get(uuid));
             } else {
                 databaseManager.releaseLock(uuid, config.getServerName());
             }
@@ -1235,7 +1250,7 @@ public class SyncManager {
         // Check quarantine — skip save if lock was lost
         if (quarantinedPlayers.remove(uuid)) {
             logger.warning("[Quit-Sync] Player " + uuid + " was quarantined. Skipping save.");
-            Long ft = playerFencingTokens.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
             if (dirtyMask != null) {
                 dirtyMask.remove(uuid);
             }
@@ -1257,7 +1272,7 @@ public class SyncManager {
         } finally {
             saveLock.unlock();
             playerVersions.remove(uuid);
-            playerFencingTokens.remove(uuid);
+            playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
             playersWithBaseline.remove(uuid);
         }
     }
@@ -1287,7 +1302,7 @@ public class SyncManager {
         Runnable task = () -> {
             try {
                 if (fencingToken != null && fencingToken > 0) {
-                    databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                    databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, playerLockSessions.get(uuid));
                 } else {
                     logger.warning("[LockRelease] " + reason + " for " + uuid
                         + " has no fencing token; refusing unsafe tokenless release.");
@@ -2094,17 +2109,30 @@ public class SyncManager {
                     ? dirtyMask.snapshotDirty(uuid)
                     : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
 
+            PlayerData data;
             try {
-                PlayerData data = collectPlayerData(player);
+                data = collectPlayerData(player);
+            } catch (Throwable t) {
+                // collect failed — release gate so future saves can proceed.
+                // (The gate must NOT stay set on collect failure, otherwise
+                // the player is stuck with no online saves until quit.)
+                if (!finalKind.releaseLock) {
+                    java.util.concurrent.atomic.AtomicBoolean inFlight = onlineSaveInFlight.get(uuid);
+                    if (inFlight != null) inFlight.set(false);
+                }
+                throw t;
+            }
 
-                pendingSaveCount.incrementAndGet();
-                java.util.concurrent.locks.ReentrantLock saveLock =
-                    playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
-                try {
-                    asyncExecutor.execute(() -> {
-                        // Online save: skip if a save is already in progress for this player.
-                        // The next periodic tick will pick up the latest data — coalescing
-                        // avoids unnecessary version conflicts and saves CPU/DB load.
+            pendingSaveCount.incrementAndGet();
+            java.util.concurrent.locks.ReentrantLock saveLock =
+                playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+            try {
+                asyncExecutor.execute(() -> {
+                    // Online save: skip if a save is already in progress for this player.
+                    // The next periodic tick will pick up the latest data — coalescing
+                    // avoids unnecessary version conflicts and saves CPU/DB load.
+                    boolean locked = false;
+                    try {
                         if (!saveLock.tryLock()) {
                             pendingSaveCount.decrementAndGet();
                             if (config.isDebug()) {
@@ -2112,41 +2140,53 @@ public class SyncManager {
                             }
                             return;
                         }
-                        try {
-                            // CRITICAL: refresh version/fencingToken after acquiring the lock.
-                            // Without this, if a previous periodic/death save completed first
-                            // and advanced the DB version, this save will CAS-fail with a stale
-                            // version and be treated as a serious lock-infringement conflict.
-                            refreshVersionAndFencingToken(uuid, data);
-                            persistCollectedData(uuid, data, finalKind, preSaveSnapshot);
-                        } catch (Exception e) {
-                            logger.log(Level.WARNING, finalKind + " save failed for " + uuid, e);
-                        } finally {
+                        locked = true;
+                        // CRITICAL: refresh version/fencingToken after acquiring the lock.
+                        // Without this, if a previous periodic/death save completed first
+                        // and advanced the DB version, this save will CAS-fail with a stale
+                        // version and be treated as a serious lock-infringement conflict.
+                        refreshVersionAndFencingToken(uuid, data);
+                        persistCollectedData(uuid, data, finalKind, preSaveSnapshot);
+                    } catch (Exception e) {
+                        logger.log(Level.WARNING, finalKind + " save failed for " + uuid, e);
+                    } finally {
+                        if (locked) {
                             saveLock.unlock();
-                            pendingSaveCount.decrementAndGet();
                         }
-                });
-                } catch (java.util.concurrent.RejectedExecutionException e) {
-                    // Queue full — online save can be skipped (coalesced to next tick).
-                    // The player is still online; quit save will persist final state.
-                    pendingSaveCount.decrementAndGet();
-                    if (config.isDebug()) {
-                        logger.fine("Skipping " + finalKind + " save for " + uuid + " — async queue full");
+                        pendingSaveCount.decrementAndGet();
+                        // P0 (round 10): gate released HERE — in the async DB
+                        // task's finally, AFTER the DB write completed (or
+                        // failed/skipped). The previous code released the gate
+                        // in the entity-thread lambda's finally, which ran as
+                        // soon as the async task was SUBMITTED (not completed).
+                        // That left a window where a second online save could
+                        // collect a new snapshot and commit it BEFORE this
+                        // save's async DB write ran — and because
+                        // refreshVersionAndFencingToken() bumps the stale
+                        // snapshot's version to the latest, this save would
+                        // CAS-succeed with old data and overwrite the new state.
+                        // Releasing the gate only after the DB write completes
+                        // ensures collect+serialize+DB-commit are serialized
+                        // per-UUID for online saves.
+                        if (!finalKind.releaseLock) {
+                            java.util.concurrent.atomic.AtomicBoolean inFlight = onlineSaveInFlight.get(uuid);
+                            if (inFlight != null) inFlight.set(false);
+                        }
                     }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                // Queue full — online save can be skipped (coalesced to next tick).
+                // The player is still online; quit save will persist final state.
+                pendingSaveCount.decrementAndGet();
+                if (config.isDebug()) {
+                    logger.fine("Skipping " + finalKind + " save for " + uuid + " — async queue full");
                 }
-            } finally {
-                // P0 in-flight gate release: MUST run on every exit path from
-                // this entity-thread lambda — normal completion, collectPlayerData
-                // exception, async queue rejection. Without this release, a
-                // single failed online save would permanently block all future
-                // online saves for this UUID (until quit clears activePlayers).
-                // The retired callback below handles the case where the entity
-                // scheduler never ran this lambda at all.
+                // Release gate — async task never submitted, so its finally
+                // never runs. Without this release the gate would stay set
+                // and block all future online saves for this UUID.
                 if (!finalKind.releaseLock) {
                     java.util.concurrent.atomic.AtomicBoolean inFlight = onlineSaveInFlight.get(uuid);
-                    if (inFlight != null) {
-                        inFlight.set(false);
-                    }
+                    if (inFlight != null) inFlight.set(false);
                 }
             }
         }, () -> {
@@ -2248,14 +2288,14 @@ public class SyncManager {
             java.util.Set<UUID> failedPlayers = new java.util.HashSet<>();
 
             try {
-                databaseManager.refreshLockBatch(playersToRefresh, serverName, failedPlayers);
+                databaseManager.refreshLockBatch(playersToRefresh, playerLockSessions, serverName, failedPlayers);
             } catch (SQLException e) {
                 batchFailed = true;
                 logger.log(Level.WARNING, "[Heartbeat] Batch refresh failed; falling back to per-player", e);
                 // Fallback: per-player refresh
                 for (java.util.Map.Entry<UUID, Long> entry : playersToRefresh.entrySet()) {
                     try {
-                        if (!databaseManager.refreshLock(entry.getKey(), serverName, entry.getValue())) {
+                        if (!databaseManager.refreshLock(entry.getKey(), serverName, entry.getValue(), playerLockSessions.get(entry.getKey()))) {
                             failedPlayers.add(entry.getKey());
                         }
                     } catch (SQLException ex) {
@@ -2395,14 +2435,14 @@ public class SyncManager {
             pendingLoadTimes.remove(uuid);
             // Clean up ALL tracking maps to prevent memory leaks during login storms
             playerVersions.remove(uuid);
-            Long ft = playerFencingTokens.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid); playerLockSessions.remove(uuid);
             failedJoinPlayers.remove(uuid);
             quarantinedPlayers.remove(uuid);
             playersWithBaseline.remove(uuid);
             asyncExecutor.execute(() -> {
                 try {
                     if (ft != null && ft > 0) {
-                        boolean released = databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                        boolean released = databaseManager.releaseLock(uuid, config.getServerName(), ft, playerLockSessions.get(uuid));
                         if (released) {
                             notifyLockReleased(uuid);
                         }
@@ -2751,7 +2791,8 @@ public class SyncManager {
             com.fastsync.database.DatabaseManager.ComponentBatchResult batchResult =
                 databaseManager.upsertComponentsIfLockHeld(
                     uuid, componentBlobs, componentChecksums,
-                    config.getServerName(), data.getFencingToken(), dirtyBits);
+                    config.getServerName(), data.getFencingToken(),
+                    playerLockSessions.get(uuid), data.getVersion(), dirtyBits);
             long dbElapsed = (System.nanoTime() - dbStart) / 1_000_000;
             if (saveLatency != null) saveLatency.record(dbElapsed);
 
@@ -2958,14 +2999,15 @@ public class SyncManager {
             //   - component_generation defaults to 0, incrementing to 1 is harmless
             //   - no component rows exist, so the generation bump invalidates nothing
             boolean saved;
+            String session = playerLockSessions.get(uuid);
             if (kind.releaseLock) {
                 // Final save (quit): release lock after successful write, and
                 // atomically invalidate stale component rows via generation bump.
-                saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName(), session);
             } else {
                 // Online save (periodic/bulk/world_save/death): keep lock, refresh
                 // locked_at, and atomically invalidate stale component rows.
-                saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName(), session);
             }
 
             long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
@@ -3006,9 +3048,9 @@ public class SyncManager {
                     // variant so a previous component-storage session cannot
                     // resurrect stale component rows after the Blob is rewritten.
                     if (kind.releaseLock) {
-                        saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName(), session);
                     } else {
-                        saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName(), session);
                     }
 
                     if (saved) {
@@ -3051,7 +3093,7 @@ public class SyncManager {
                         // lock IS still ours and releaseLock should return true —
                         // notify is correct in that case.
                         try {
-                            boolean released = databaseManager.releaseLock(uuid, config.getServerName(), fencingToken);
+                            boolean released = databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, playerLockSessions.get(uuid));
                             if (released) {
                                 notifyLockReleased(uuid);
                             } else if (config.isDebug()) {
@@ -3173,7 +3215,7 @@ public class SyncManager {
                     try {
                         Long ft = playerFencingTokens.get(uuid);
                         if (ft != null) {
-                            databaseManager.releaseLock(uuid, config.getServerName(), ft);
+                            databaseManager.releaseLock(uuid, config.getServerName(), ft, playerLockSessions.get(uuid));
                         } else {
                             databaseManager.releaseLock(uuid, config.getServerName());
                         }
