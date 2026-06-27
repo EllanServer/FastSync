@@ -103,6 +103,13 @@ public class AsyncExecutor {
      * Submit a task for async execution.
      * Exceptions are logged via the SLF4J/j.u.l logger (not stderr).
      *
+     * <p>Catches {@link Throwable} (not just {@link Exception}) so that
+     * {@link Error} subtypes ({@link OutOfMemoryError},
+     * {@link StackOverflowError}, {@link NoClassDefFoundError}, etc.) are
+     * logged before the worker thread dies. Otherwise the {@code Error}
+     * would be silently swallowed by the worker, leaving no trace in the
+     * log for operators to diagnose.
+     *
      * @throws java.util.concurrent.RejectedExecutionException if the queue is full.
      *         Callers must handle this — typically by skipping (periodic save)
      *         or falling back to synchronous execution (QUIT/SHUTDOWN).
@@ -111,9 +118,9 @@ public class AsyncExecutor {
         executor.execute(() -> {
             try {
                 task.run();
-            } catch (Exception e) {
+            } catch (Throwable t) {
                 logger.log(Level.SEVERE,
-                    "[" + poolName + "] Uncaught exception in async task: " + e.getMessage(), e);
+                    "[" + poolName + "] Uncaught exception in async task: " + t.getMessage(), t);
             }
         });
     }
@@ -121,10 +128,25 @@ public class AsyncExecutor {
     /**
      * Submit a task and return a CompletableFuture.
      *
+     * <p>Unlike the previous bare {@code CompletableFuture.runAsync(task, executor)},
+     * this wraps the task in a try/catch that records any {@link Throwable}
+     * (including {@link Error} subtypes) at {@link Level#SEVERE} before
+     * rethrowing. Without this wrapper, an {@code Error} thrown by the task
+     * would surface only as an uncompleted future and a bare stack trace on
+     * stderr — invisible to operators tailing the log file.
+     *
      * @throws java.util.concurrent.RejectedExecutionException if the queue is full.
      */
     public java.util.concurrent.CompletableFuture<Void> submit(Runnable task) {
-        return java.util.concurrent.CompletableFuture.runAsync(task, executor);
+        return java.util.concurrent.CompletableFuture.runAsync(() -> {
+            try {
+                task.run();
+            } catch (Throwable t) {
+                logger.log(Level.SEVERE,
+                    "[" + poolName + "] Uncaught exception in async submitted task: " + t.getMessage(), t);
+                throw t;
+            }
+        }, executor);
     }
 
     /**

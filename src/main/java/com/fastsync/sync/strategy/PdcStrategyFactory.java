@@ -26,6 +26,16 @@ public class PdcStrategyFactory {
         
         if ("registered-only".equalsIgnoreCase(mode)) {
             List<RegisteredKeysPdcStrategy.KeyBinding> keys = parseRegisteredKeys(config, logger);
+            // P2 (round 15): registered-only mode with an empty key list is
+            // technically safe (NoopPdcStrategy would be the equivalent), but
+            // operationally misleading — an operator who toggled sync-pdc=true
+            // expects PDC to actually flow, and a silent no-op looks like a
+            // broken feature. Warn loudly so the missing config is obvious.
+            if (keys.isEmpty()) {
+                logger.warning("[PDC] sync-pdc is enabled but pdc.registered-keys is empty; "
+                    + "no PDC keys will be synchronized. Populate pdc.registered-keys "
+                    + "with 'namespace:key=TYPE' entries, or set pdc.mode to 'off'.");
+            }
             return new RegisteredKeysPdcStrategy(keys, logger, debug);
         }
 

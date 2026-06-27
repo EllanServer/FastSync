@@ -200,6 +200,15 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
     @Override
     public void onDisable() {
+        // P0 (round 15): close the online-save gate FIRST. Any periodic/death/
+        // world_save task that fires during the shutdown-save window must be
+        // rejected by savePlayerAsync, otherwise it could collect a stale
+        // snapshot and commit it after the SHUTDOWN save — rolling back the
+        // player's final state.
+        if (syncManager != null) {
+            syncManager.beginShutdown();
+        }
+
         // Cancel scheduled tasks (Paper/Folia compatible)
         SchedulerUtil.cancel(cleanupTask);
         SchedulerUtil.cancel(periodicSaveTask);

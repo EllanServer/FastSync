@@ -155,6 +155,17 @@ public class DatabaseManager {
         dataSource = new HikariDataSource(hikariConfig);
 
         createTables();
+        // P1 (round 15): greenfield schema self-check. Verifies that the DDL
+        // actually produced the columns the runtime expects. This is NOT a
+        // migration — it never ALTERs or DROPs anything. It only catches:
+        //   - MySQL permission anomalies that silently skip CREATE TABLE
+        //   - partial DDL failure (one table created, the other not)
+        //   - table-prefix misconfiguration pointing at a different schema
+        //   - MySQL/MariaDB dialect differences that reject a column
+        //   - column-name typos introduced when editing the DDL above
+        // Failure throws SQLException and stops plugin startup (FastSync will
+        // disable itself in onEnable's catch block).
+        validateGreenfieldSchemaStrict();
         logger.info("Database connection established: " + config.getDbHost() + ":" + config.getDbPort() + "/" + config.getDbDatabase());
     }
 
@@ -216,6 +227,59 @@ public class DatabaseManager {
 
         try (Connection conn = dataSource.getConnection()) {
             dsl(conn).execute(componentTableSql);
+        }
+    }
+
+    /**
+     * Greenfield schema self-check (round 15, P1).
+     *
+     * <p>Verifies that both tables contain the exact column set the runtime
+     * code reads/writes. This is a <b>read-only</b> validation: it never
+     * issues ALTER, DROP, or any repair statement. On any missing column it
+     * throws {@link SQLException}, which propagates out of {@link #initialize()}
+     * and causes FastSync to disable itself in {@code onEnable}.
+     *
+     * <p>Rationale: CREATE TABLE IF NOT EXISTS is a no-op if a same-named table
+     * already exists (e.g. created by a prior misconfigured deploy, or by a
+     * different plugin sharing the prefix). Without this check, the plugin
+     * would start "successfully" and then fail at runtime with cryptic
+     * "Unknown column" errors during the first save — far worse than refusing
+     * to start.
+     */
+    private void validateGreenfieldSchemaStrict() throws SQLException {
+        requireColumns(dataTable,
+            "uuid", "data", "version", "checksum",
+            "fencing_token", "locked_by", "locked_at", "lock_session_id",
+            "last_server", "last_updated",
+            "component_bitmap", "component_generation");
+        requireColumns(componentTable,
+            "uuid", "component", "generation",
+            "data", "version", "checksum", "updated_at");
+    }
+
+    /**
+     * Throw {@link SQLException} if any of {@code requiredColumns} is absent
+     * from {@code tableName}. Uses {@link Connection#getMetaData()} so the
+     * check works across MySQL/MariaDB without dialect-specific SQL.
+     */
+    private void requireColumns(String tableName, String... requiredColumns) throws SQLException {
+        try (Connection conn = dataSource.getConnection()) {
+            java.util.Set<String> actual = new java.util.HashSet<>();
+            try (java.sql.ResultSet rs = conn.getMetaData().getColumns(
+                    conn.getCatalog(), conn.getSchema(), tableName, null)) {
+                while (rs.next()) {
+                    actual.add(rs.getString("COLUMN_NAME"));
+                }
+            }
+            for (String required : requiredColumns) {
+                if (!actual.contains(required)) {
+                    throw new SQLException(
+                        "Greenfield schema validation failed: table '" + tableName
+                        + "' is missing required column '" + required
+                        + "'. Refusing to start. Found columns: " + actual
+                        + ". This is a greenfield deploy — drop the table or fix the prefix and restart.");
+                }
+            }
         }
     }
 
@@ -548,6 +612,67 @@ public class DatabaseManager {
     }
 
     /**
+     * Snapshot of the lock-relevant columns for a player_data row.
+     *
+     * <p>Used by the final-save retry path to make a precise retry decision
+     * in ONE round-trip instead of separate {@code getCurrentVersion} +
+     * {@code getCurrentFencingToken} calls. Carries {@code lockedBy} and
+     * {@code lockSessionId} so the caller can verify the lock is STILL ours
+     * before retrying — a version bump alone is not enough, because the lock
+     * could have been stolen by another server between our CAS failure and
+     * the read.
+     *
+     * <p>Round 15 P1: the old retry path only compared version + fencing token.
+     * If the lock was stolen (locked_by / lock_session_id changed) but the
+     * fencing token happened to match, the retry would write through a CAS
+     * that no longer belonged to us. The DB CAS would still reject it (the
+     * WHERE clause includes locked_by + lock_session_id), but the retry
+     * decision itself was imprecise and wasted an attempt.
+     */
+    public record LockState(
+            long version,
+            long fencingToken,
+            String lockedBy,
+            String lockSessionId,
+            boolean rowExists) {
+        /**
+         * True if the lock is still held by {@code expectedServer} with the
+         * given fencing token and session id.
+         */
+        public boolean isHeldBy(String expectedServer, long expectedFencing, String expectedSession) {
+            if (!rowExists || expectedServer == null || expectedSession == null) return false;
+            return expectedServer.equals(lockedBy)
+                && fencingToken == expectedFencing
+                && expectedSession.equals(lockSessionId);
+        }
+    }
+
+    /**
+     * Read version, fencing_token, locked_by, and lock_session_id in one query.
+     * Returns {@code rowExists=false} if the player_data row does not exist.
+     */
+    public LockState getLockState(UUID uuid) throws SQLException {
+        try (Connection conn = dataSource.getConnection()) {
+            Record r = dsl(conn)
+                .select(VERSION_FIELD, FENCING_TOKEN_FIELD, LOCKED_BY_FIELD, LOCK_SESSION_ID_FIELD)
+                .from(playerData)
+                .where(UUID_FIELD.eq(uuid.toString()))
+                .fetchOne();
+            if (r == null) {
+                return new LockState(-1, -1, null, null, false);
+            }
+            Long v = r.get(VERSION_FIELD);
+            Long f = r.get(FENCING_TOKEN_FIELD);
+            return new LockState(
+                v != null ? v : -1,
+                f != null ? f : -1,
+                r.get(LOCKED_BY_FIELD),
+                r.get(LOCK_SESSION_ID_FIELD),
+                true);
+        }
+    }
+
+    /**
      * Release a lock using a fencing token + lock-session id condition.
      *
      * <p>Clears the lock only if {@code locked_by = serverName AND
@@ -837,14 +962,54 @@ public class DatabaseManager {
             long newVersion,
             long componentBitmap,
             long generation,
-            String errorMessage) {
-        public static ComponentBatchResult rejected(String msg) {
-            return new ComponentBatchResult(false, -1, -1, 0, 0, msg);
+            String errorMessage,
+            ComponentRejectReason reason) {
+        public static ComponentBatchResult rejected(String msg, ComponentRejectReason reason) {
+            return new ComponentBatchResult(false, -1, -1, 0, 0, msg, reason);
         }
         public static ComponentBatchResult success(long oldVersion, long newVersion,
                 long bitmap, long generation) {
-            return new ComponentBatchResult(true, oldVersion, newVersion, bitmap, generation, null);
+            return new ComponentBatchResult(true, oldVersion, newVersion, bitmap, generation, null,
+                ComponentRejectReason.NONE);
         }
+    }
+
+    /**
+     * Structured reason for a component-batch rejection. Lets the caller
+     * ({@code persistComponentsOnly}) decide between:
+     * <ul>
+     *   <li>{@link #FALLBACK_FULL_BLOB} — safe to retry as a full Blob save</li>
+     *   <li>{@link #SKIP_STALE_ONLINE_SAVE} — stale collected version; skip this
+     *       online save, the next cycle re-collects</li>
+     *   <li>{@link #FATAL_LOCK_CONFLICT} — lock/fencing/session mismatch; the
+     *       lock is no longer ours, MUST NOT fall back to a full Blob save</li>
+     *   <li>{@link #DB_UNAVAILABLE} — SQL error; caller decides retry/backoff</li>
+     * </ul>
+     *
+     * <p>Round 3 directive #2 (round 15 P0): previously every rejection
+     * returned {@code null} from {@code persistComponentsOnly}, which made
+     * {@code persistCollectedData} blindly fall back to a full Blob save —
+     * even when the rejection was a lock/fencing/session mismatch where
+     * falling back would overwrite a newer session's data with a stale
+     * snapshot.
+     */
+    public enum ComponentRejectReason {
+        /** Save succeeded (not a rejection). */
+        NONE,
+        /** Caller passed an empty component map — fall back to full Blob. */
+        NO_COMPONENTS,
+        /** No player_data row exists yet — fall back to full Blob to establish baseline. */
+        MISSING_BASELINE_ROW,
+        /** locked_by or fencing_token mismatch — lock no longer ours. Fatal. */
+        LOCK_OR_FENCING_MISMATCH,
+        /** lock_session_id mismatch — stale session. Fatal. */
+        SESSION_MISMATCH,
+        /** DB version advanced past the collected version — stale snapshot. Skip. */
+        STALE_VERSION,
+        /** player_data metadata UPDATE affected 0 rows (lock lost mid-tx). Fatal. */
+        METADATA_UPDATE_FAILED,
+        /** SQL exception during the transaction. Retryable with backoff. */
+        SQL_ERROR
     }
 
     /**
@@ -1015,7 +1180,7 @@ public class DatabaseManager {
             long dirtyBits) throws SQLException {
         requireLockSession(lockSessionId, "upsertComponentsIfLockHeld");
         if (componentsWithData == null || componentsWithData.isEmpty()) {
-            return ComponentBatchResult.rejected("no components to upsert");
+            return ComponentBatchResult.rejected("no components to upsert", ComponentRejectReason.NO_COMPONENTS);
         }
         long now = System.currentTimeMillis();
 
@@ -1041,7 +1206,8 @@ public class DatabaseManager {
                         if (!rs.next()) {
                             conn.rollback();
                             conn.setAutoCommit(oldAutoCommit);
-                            return ComponentBatchResult.rejected("missing player_data row");
+                            return ComponentBatchResult.rejected("missing player_data row",
+                                ComponentRejectReason.MISSING_BASELINE_ROW);
                         }
                         currentVersion = rs.getLong("version");
                         dbFencing = rs.getLong("fencing_token");
@@ -1058,7 +1224,8 @@ public class DatabaseManager {
                     conn.setAutoCommit(oldAutoCommit);
                     return ComponentBatchResult.rejected("lock/fencing mismatch (expected: "
                         + serverName + "/ft" + fencingToken
-                        + ", actual: " + lockedBy + "/ft" + dbFencing + ")");
+                        + ", actual: " + lockedBy + "/ft" + dbFencing + ")",
+                        ComponentRejectReason.LOCK_OR_FENCING_MISMATCH);
                 }
                 // P0 (round 10): session id must match. A stale session whose
                 // lock was superseded by a new acquire must not be able to
@@ -1067,7 +1234,8 @@ public class DatabaseManager {
                     conn.rollback();
                     conn.setAutoCommit(oldAutoCommit);
                     return ComponentBatchResult.rejected("lock_session_id mismatch (expected: "
-                        + lockSessionId + ", actual: " + dbSessionId + ")");
+                        + lockSessionId + ", actual: " + dbSessionId + ")",
+                        ComponentRejectReason.SESSION_MISMATCH);
                 }
 
                 // P0 (round 10): expectedVersion check. If the DB version has
@@ -1080,7 +1248,8 @@ public class DatabaseManager {
                     conn.rollback();
                     conn.setAutoCommit(oldAutoCommit);
                     return ComponentBatchResult.rejected("stale collected version (expected: "
-                        + expectedVersion + ", actual: " + currentVersion + ")");
+                        + expectedVersion + ", actual: " + currentVersion + ")",
+                        ComponentRejectReason.STALE_VERSION);
                 }
 
                 // 3. Upsert component rows with current generation
@@ -1137,7 +1306,8 @@ public class DatabaseManager {
                 if (updated <= 0) {
                     conn.rollback();
                     conn.setAutoCommit(oldAutoCommit);
-                    return ComponentBatchResult.rejected("failed to update player_data metadata");
+                    return ComponentBatchResult.rejected("failed to update player_data metadata",
+                        ComponentRejectReason.METADATA_UPDATE_FAILED);
                 }
 
                 conn.commit();

@@ -1824,6 +1824,13 @@ public class SyncManager {
      * @return result with total/success/failed counts
      */
     public SaveAllResult savePlayersSnapshot(List<Player> players, SaveKind kind) {
+        // P0 (round 15): belt-and-suspenders guard. onDisable is supposed to
+        // call beginShutdown() before this, but if a caller forgets, the
+        // SHUTDOWN path itself closes the online-save gate so a late periodic
+        // save cannot race with the final save.
+        if (kind == SaveKind.SHUTDOWN) {
+            shuttingDown = true;
+        }
         // Phase 1: dispatch (touches Player — must be on global/main thread)
         List<Map.Entry<UUID, CompletableFuture<SaveResult>>> futures = dispatchPlayerSaves(players, kind);
         // Phase 2: wait (no Player access — safe on any thread, including the calling thread)
@@ -2562,9 +2569,32 @@ public class SyncManager {
     // ==================== Shutdown ====================
 
     /**
+     * Mark the manager as shutting down. Once set, all new online saves
+     * (PERIODIC/DEATH/WORLD_SAVE/BULK) are rejected by {@link #savePlayerAsync}
+     * so they cannot race with the SHUTDOWN save and overwrite a player's
+     * final state.
+     *
+     * <p><b>Must be called before {@link #saveAllOnlinePlayers} / {@link #savePlayersSnapshot}
+     * in {@code onDisable}.</b> Without this, a periodic save task that fires
+     * during the shutdown-save window could collect a stale snapshot and
+     * commit it after the SHUTDOWN save, rolling back the final state.
+     *
+     * <p>{@link #savePlayersSnapshot} with {@link SaveKind#SHUTDOWN} also sets
+     * this flag as a belt-and-suspenders guard, so even if a caller forgets to
+     * call {@code beginShutdown()} the SHUTDOWN path itself closes the gate.
+     */
+    public void beginShutdown() {
+        shuttingDown = true;
+    }
+
+    /**
      * Shut down the sync manager, closing Redis and thread pool.
      */
     public void shutdown() {
+        // Idempotent: ensure the shutdown flag is set even if beginShutdown()
+        // was not called. This prevents any online save dispatched by a stale
+        // scheduled task from racing with the final shutdown wait.
+        shuttingDown = true;
         // Log final latency stats before shutdown
         logLatencyStats();
 
@@ -2746,7 +2776,7 @@ public class SyncManager {
      * com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot)} for the
      * full rationale.
      */
-    private SaveResult persistComponentsOnly(UUID uuid, PlayerData data, SaveKind kind,
+    private ComponentSaveOutcome persistComponentsOnly(UUID uuid, PlayerData data, SaveKind kind,
             com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot dirtySnapshot) {
         try {
             // CRITICAL safety gate: refuse to do a component-only save unless the
@@ -2758,22 +2788,23 @@ public class SyncManager {
             // data == null and treats the player as brand new — the component
             // overlay is skipped, and the player's state is silently lost.
             //
-            // Returning null here forces the caller (persistCollectedData) to
-            // fall back to a full Blob save, which establishes the baseline.
-            // Subsequent periodic saves can then safely take the component-only
-            // fast path because playersWithBaseline now contains this UUID.
+            // Returning FALLBACK_FULL_BLOB here forces the caller
+            // (persistCollectedData) to fall back to a full Blob save, which
+            // establishes the baseline. Subsequent periodic saves can then
+            // safely take the component-only fast path because
+            // playersWithBaseline now contains this UUID.
             if (!playersWithBaseline.contains(uuid)) {
                 if (config.isDebug()) {
                     logger.fine("[Component] No baseline Blob for " + uuid
                         + " — falling back to full Blob save first.");
                 }
-                return null;
+                return ComponentSaveOutcome.fallbackFullBlob();
             }
 
             // Use the caller-provided snapshot (taken before collectPlayerData).
             // See method javadoc for why this must NOT be re-snapshot here.
             if (dirtySnapshot == null || dirtySnapshot.isEmpty()) {
-                return null;  // nothing dirty, fall back (shouldn't happen — caller checks)
+                return ComponentSaveOutcome.fallbackFullBlob();  // nothing dirty (shouldn't happen — caller checks)
             }
             java.util.Set<com.fastsync.sync.dirty.ComponentDirtyMask.Component> dirty =
                 dirtySnapshot.components();
@@ -2785,7 +2816,7 @@ public class SyncManager {
                     logger.fine("Component save for " + uuid + " skipped — too many dirty ("
                         + dirty.size() + " > " + config.getComponentBatchSize() + ")");
                 }
-                return null;
+                return ComponentSaveOutcome.fallbackFullBlob();
             }
 
             long startSer = System.nanoTime();
@@ -2826,7 +2857,7 @@ public class SyncManager {
                     logger.fine("[Component] All dirty components for " + uuid
                         + " produced empty payloads — falling back to full save.");
                 }
-                return null;
+                return ComponentSaveOutcome.fallbackFullBlob();
             }
 
             long serElapsed = (System.nanoTime() - startSer) / 1_000_000;
@@ -2855,8 +2886,63 @@ public class SyncManager {
             if (saveLatency != null) saveLatency.record(dbElapsed);
 
             if (!batchResult.success()) {
-                logger.warning("[Component] Save rejected for " + uuid + ": " + batchResult.errorMessage());
-                return null;  // fall back to full save
+                // P0 (round 15): classify the rejection. Previously every
+                // rejection fell back to a full Blob save — but a
+                // lock/fencing/session mismatch means the lock is no longer
+                // ours, and a full Blob save would overwrite a newer session's
+                // data with our stale snapshot. A stale version means our
+                // snapshot is behind the DB; falling back would also clobber
+                // newer state. Only the "no baseline / no components" cases
+                // are safe to fall back from.
+                com.fastsync.database.DatabaseManager.ComponentRejectReason r = batchResult.reason();
+                if (r == null) {
+                    r = com.fastsync.database.DatabaseManager.ComponentRejectReason.SQL_ERROR;
+                }
+                switch (r) {
+                    case NO_COMPONENTS, MISSING_BASELINE_ROW -> {
+                        logger.warning("[Component] Save rejected for " + uuid
+                            + " (" + r + "): " + batchResult.errorMessage()
+                            + " — falling back to full Blob save.");
+                        return ComponentSaveOutcome.fallbackFullBlob();
+                    }
+                    case STALE_VERSION -> {
+                        // Our collected snapshot is behind the DB version.
+                        // Skip THIS online save — do NOT fall back to a full
+                        // Blob save with the stale snapshot (it would clobber
+                        // the newer state). The next periodic cycle re-collects
+                        // against the current version.
+                        logger.warning("[Component] Save rejected for " + uuid
+                            + " (STALE_VERSION): " + batchResult.errorMessage()
+                            + " — skipping this online save; next cycle re-collects.");
+                        return ComponentSaveOutcome.skipStaleOnlineSave(batchResult.errorMessage());
+                    }
+                    case LOCK_OR_FENCING_MISMATCH, SESSION_MISMATCH, METADATA_UPDATE_FAILED -> {
+                        // The lock is no longer ours (or was superseded). A
+                        // full Blob save would be rejected by the same CAS
+                        // anyway, but more importantly it would be a
+                        // semantically wrong attempt to overwrite a newer
+                        // session's data. Treat as a fatal lock conflict —
+                        // do NOT fall back, do NOT release the lock (the
+                        // caller's releaseLock path is gated on success).
+                        logger.severe("[Component] Save rejected for " + uuid
+                            + " (" + r + "): " + batchResult.errorMessage()
+                            + " — lock no longer held by this session; NOT falling back to full Blob save.");
+                        return ComponentSaveOutcome.fatalLockConflict(batchResult.errorMessage());
+                    }
+                    case SQL_ERROR, NONE -> {
+                        // SQL_ERROR: the transaction blew up. A full Blob save
+                        // would likely hit the same DB issue, but it is a
+                        // different code path and MIGHT succeed (e.g. the
+                        // component INSERT hit a constraint the Blob UPDATE
+                        // would not). Treat as DB_UNAVAILABLE — the caller's
+                        // online-save path will handle the error result.
+                        logger.log(Level.WARNING, "[Component] Save rejected for " + uuid
+                            + " (" + r + "): " + batchResult.errorMessage()
+                            + " — treating as DB_UNAVAILABLE; not falling back to full Blob save.", 
+                            batchResult.errorMessage());
+                        return ComponentSaveOutcome.dbUnavailable(batchResult.errorMessage());
+                    }
+                }
             }
 
             // Update local version tracking with the new version from the DB.
@@ -2887,11 +2973,58 @@ public class SyncManager {
                 batchResult.newVersion(), totalCompressedSize,
                 "Component save " + kind + " (" + componentBlobs.size() + " components, gen=" + batchResult.generation() + ")");
 
-            return SaveResult.success(batchResult.oldVersion(), batchResult.newVersion(), totalCompressedSize);
+            return ComponentSaveOutcome.success(
+                SaveResult.success(batchResult.oldVersion(), batchResult.newVersion(), totalCompressedSize));
 
+        } catch (java.sql.SQLException e) {
+            logger.log(Level.WARNING, "[Component] Save failed (SQL) for " + uuid, e);
+            return ComponentSaveOutcome.dbUnavailable(e.getMessage());
         } catch (Exception e) {
-            logger.log(Level.WARNING, "Component save failed for " + uuid + ", falling back to full save", e);
-            return null;  // fall back to full save
+            logger.log(Level.WARNING, "[Component] Save failed for " + uuid, e);
+            return ComponentSaveOutcome.dbUnavailable(e.getMessage());
+        }
+    }
+
+    /**
+     * Outcome of a component-only save attempt. Replaces the old
+     * {@code SaveResult | null} contract so the caller can distinguish
+     * "fall back to full Blob" from "skip this online save" and
+     * "fatal lock conflict — do NOT fall back".
+     *
+     * <p>Round 15 P0: the old {@code null} return made
+     * {@code persistCollectedData} blindly fall back to a full Blob save for
+     * EVERY rejection, including lock/fencing/session mismatches where the
+     * lock was no longer ours — which would overwrite a newer session's data
+     * with a stale snapshot.
+     */
+    public record ComponentSaveOutcome(Decision decision, SaveResult result, String message) {
+        public enum Decision {
+            /** Component save succeeded; {@code result} carries the SaveResult. */
+            SUCCESS,
+            /** Safe to fall back to a full Blob save (no baseline / no components). */
+            FALLBACK_FULL_BLOB,
+            /** Stale collected version — skip this online save, do NOT fall back. */
+            SKIP_STALE_ONLINE_SAVE,
+            /** Lock/fencing/session mismatch — do NOT fall back, do NOT release lock. */
+            FATAL_LOCK_CONFLICT,
+            /** DB unavailable / SQL error — caller handles as error, no fallback. */
+            DB_UNAVAILABLE
+        }
+
+        public static ComponentSaveOutcome success(SaveResult result) {
+            return new ComponentSaveOutcome(Decision.SUCCESS, result, null);
+        }
+        public static ComponentSaveOutcome fallbackFullBlob() {
+            return new ComponentSaveOutcome(Decision.FALLBACK_FULL_BLOB, null, null);
+        }
+        public static ComponentSaveOutcome skipStaleOnlineSave(String msg) {
+            return new ComponentSaveOutcome(Decision.SKIP_STALE_ONLINE_SAVE, null, msg);
+        }
+        public static ComponentSaveOutcome fatalLockConflict(String msg) {
+            return new ComponentSaveOutcome(Decision.FATAL_LOCK_CONFLICT, null, msg);
+        }
+        public static ComponentSaveOutcome dbUnavailable(String msg) {
+            return new ComponentSaveOutcome(Decision.DB_UNAVAILABLE, null, msg);
         }
     }
 
@@ -2980,15 +3113,65 @@ public class SyncManager {
             // let persistComponentsOnly re-snapshot here, the snapshot would be
             // taken AFTER collect and could include changes the component row
             // does NOT contain — clearing them would lose data.
-            SaveResult componentResult = persistComponentsOnly(uuid, data, kind, preSaveSnapshot);
+            SaveResult componentResult = null;
+            ComponentSaveOutcome outcome = persistComponentsOnly(uuid, data, kind, preSaveSnapshot);
+            switch (outcome.decision()) {
+                case SUCCESS -> {
+                    return outcome.result();
+                }
+                case FALLBACK_FULL_BLOB -> {
+                    // Fall through to full Blob save below.
+                    componentResult = null;
+                }
+                case SKIP_STALE_ONLINE_SAVE -> {
+                    // Stale collected version — skip this online save entirely.
+                    // Do NOT fall back to full Blob (would clobber newer state).
+                    // Return an error result so the caller's audit/logging sees
+                    // the skip; the next periodic cycle re-collects.
+                    logger.info("[Save] " + kind + " for " + uuid
+                        + " skipped — component path saw stale version: " + outcome.message());
+                    return SaveResult.error("stale collected version (skipped)",
+                        SaveFailureReason.VERSION_CONFLICT);
+                }
+                case FATAL_LOCK_CONFLICT -> {
+                    // Lock/fencing/session mismatch — the lock is no longer ours.
+                    // Do NOT fall back to full Blob (would overwrite newer data).
+                    // Do NOT release the lock here — the caller's release path
+                    // is gated on success. Return a FENCING_MISMATCH error so
+                    // the conflict manager / audit path picks it up.
+                    logger.severe("[Save] " + kind + " for " + uuid
+                        + " aborted — component path detected fatal lock conflict: "
+                        + outcome.message());
+                    return SaveResult.error("fatal lock conflict: " + outcome.message(),
+                        SaveFailureReason.FENCING_MISMATCH);
+                }
+                case DB_UNAVAILABLE -> {
+                    // SQL error — do NOT fall back to full Blob (same DB, likely
+                    // same failure). Return DB_UNAVAILABLE so the caller can
+                    // retry with backoff.
+                    logger.warning("[Save] " + kind + " for " + uuid
+                        + " aborted — component path hit DB error: " + outcome.message());
+                    return SaveResult.error("component DB error: " + outcome.message(),
+                        SaveFailureReason.DB_UNAVAILABLE);
+                }
+            }
+            // Fall through to full save if component path fell back
             if (componentResult != null) {
                 return componentResult;
             }
-            // Fall through to full save if component path failed
         }
 
-        // Retry flag for same-fencing self-conflict (our own previous save advanced the version).
-        boolean retried = false;
+        // P1 (round 15): final-save retry now uses a bounded loop with a full
+        // LockState read (version + fencing + locked_by + lock_session_id) per
+        // retry, instead of the old single-shot version+token comparison.
+        //
+        // Final saves (releaseLock=true: QUIT/SHUTDOWN) get up to 3 attempts
+        // because they persist the player's FINAL state — a single transient
+        // same-fencing self-conflict (our own previous online save advanced the
+        // version while we waited for the saveLock) must not lose the final
+        // state. Online saves (releaseLock=false) keep 1 attempt: they are
+        // best-effort and the next periodic cycle will retry.
+        int maxAttempts = kind.releaseLock ? 3 : 1;
 
         try {
             // 1. Serialize
@@ -3009,6 +3192,8 @@ public class SyncManager {
             // 4. DB CAS save with version + fencing token
             long expectedVersion = data.getVersion();
             long fencingToken = data.getFencingToken();
+            String session = playerLockSessions.get(uuid);
+            String serverName = config.getServerName();
             long saveStart = System.nanoTime();
 
             // Full Blob save ALWAYS uses the ClearComponents variant, regardless
@@ -3028,113 +3213,124 @@ public class SyncManager {
             //   - component_bitmap defaults to 0, so setting it to 0 is a no-op
             //   - component_generation defaults to 0, incrementing to 1 is harmless
             //   - no component rows exist, so the generation bump invalidates nothing
-            boolean saved;
-            String session = playerLockSessions.get(uuid);
-            if (kind.releaseLock) {
-                // Final save (quit): release lock after successful write, and
-                // atomically invalidate stale component rows via generation bump.
-                saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName(), session);
-            } else {
-                // Online save (periodic/bulk/world_save/death): keep lock, refresh
-                // locked_at, and atomically invalidate stale component rows.
-                saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName(), session);
+            boolean saved = false;
+            int attempt = 0;
+            // Conflict diagnostics from the LAST attempt (used if all attempts fail).
+            long actualVersion = expectedVersion;
+            long actualFencingToken = fencingToken;
+            String actualLockedBy = serverName;
+            String actualSession = session;
+
+            while (attempt < maxAttempts) {
+                attempt++;
+                if (kind.releaseLock) {
+                    saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, serverName, session);
+                } else {
+                    saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, serverName, session);
+                }
+
+                if (saved) {
+                    break;
+                }
+
+                // CAS failed. Read the full lock state ONCE to classify.
+                com.fastsync.database.DatabaseManager.LockState state = databaseManager.getLockState(uuid);
+                actualVersion = state.version();
+                actualFencingToken = state.fencingToken();
+                actualLockedBy = state.lockedBy();
+                actualSession = state.lockSessionId();
+
+                // Retryable condition: lock is STILL ours (server + fencing +
+                // session all match) AND the DB version advanced past what we
+                // expected (our own previous save won the race). This is a
+                // same-fencing self-conflict — safe to retry with the actual
+                // version.
+                //
+                // If ANY of these fail, the retry is NOT safe:
+                //   - locked_by / session mismatch → lock was stolen; retry
+                //     would be rejected by CAS anyway and is semantically wrong
+                //   - fencing mismatch → lock was lost to another server
+                //   - version <= expected → unexpected state (row vanished or
+                //     version went backwards); do not loop
+                boolean lockStillOurs = state.isHeldBy(serverName, fencingToken, session);
+                if (!lockStillOurs || actualVersion <= expectedVersion) {
+                    if (config.isDebug()) {
+                        logger.fine("[Fencing] " + kind + " save for " + uuid
+                            + " — not retrying (attempt " + attempt + "/" + maxAttempts
+                            + "): lockStillOurs=" + lockStillOurs
+                            + ", expectedV=" + expectedVersion + ", actualV=" + actualVersion
+                            + ", actualLockedBy=" + actualLockedBy
+                            + ", actualSession=" + actualSession);
+                    }
+                    break;  // fall through to conflict handling
+                }
+
+                // Same-fencing self-conflict: retry with the actual version.
+                logger.info("[Fencing] " + kind + " save for " + uuid
+                    + " — same-fencing self-conflict (attempt " + attempt + "/" + maxAttempts
+                    + ", expected v" + expectedVersion + ", actual v" + actualVersion
+                    + ", ft=" + fencingToken + "). Retrying with actual version.");
+
+                expectedVersion = actualVersion;
+                data.setVersion(actualVersion);
+
+                // Re-serialize with the updated version so the checksum matches.
+                serialized = PlayerDataSerializer.serialize(data);
+                compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
+                checksum = DatabaseManager.computeChecksum(serialized);
+                // Loop continues → next attempt uses the new expectedVersion.
             }
 
             long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
             if (saveLatency != null) saveLatency.record(saveElapsedMs);
 
             if (!saved) {
-                // 5a. Conflict — check if this is a same-fencing self-conflict
-                long actualVersion = databaseManager.getCurrentVersion(uuid);
-                long actualFencingToken = databaseManager.getCurrentFencingToken(uuid);
+                // Genuine conflict (external fencing violation, lock lost, or
+                // all retries exhausted).
+                conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
+                logger.warning("[Fencing] " + kind + " save rejected for " + uuid +
+                    " (expected v" + expectedVersion + "/ft" + fencingToken +
+                    ", actual v" + actualVersion + "/ft" + actualFencingToken +
+                    ", locked_by=" + actualLockedBy + ", session=" + actualSession + ")"
+                    + (attempt > 1 ? " [after " + attempt + " attempts]" : ""));
 
-                // Same-fencing retry: if the fencing token matches and the actual
-                // version is higher, our own previous save (periodic/death/etc.)
-                // advanced the version while we waited for the saveLock. This is
-                // NOT an external conflict — retry with the actual version.
-                // Applies to BOTH online saves (releaseLock=false) and final saves
-                // (releaseLock=true), since multiple online saves can queue up
-                // and the earlier one advances the version.
-                if (!retried
-                    && actualFencingToken == fencingToken
-                    && actualVersion > expectedVersion) {
+                logOperation(uuid, OperationType.CONFLICT, fencingToken, expectedVersion,
+                    compressed.length, kind + " conflict: expected v" + expectedVersion + "/ft" + fencingToken +
+                    ", actual v" + actualVersion + "/ft" + actualFencingToken);
 
-                    logger.info("[Fencing] " + kind + " save for " + uuid
-                        + " — same-fencing self-conflict (expected v" + expectedVersion
-                        + ", actual v" + actualVersion + ", ft=" + fencingToken
-                        + "). Retrying with actual version.");
+                if (saveLatency != null) saveLatency.recordError();
 
-                    // Update data with the actual version and re-serialize
-                    data.setVersion(actualVersion);
-                    retried = true;
-
-                    // Re-serialize with updated version
-                    serialized = PlayerDataSerializer.serialize(data);
-                    compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
-                    checksum = DatabaseManager.computeChecksum(serialized);
-
-                    // Retry the save with the actual version. Same rationale
-                    // as the first attempt: always use the ClearComponents
-                    // variant so a previous component-storage session cannot
-                    // resurrect stale component rows after the Blob is rewritten.
-                    if (kind.releaseLock) {
-                        saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName(), session);
-                    } else {
-                        saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName(), session);
-                    }
-
-                    if (saved) {
-                        // Retry succeeded — treat as success with the actual version
-                        expectedVersion = actualVersion;
-                    }
+                if (kind.releaseLock) {
+                    // P0 (round 11): final save CAS conflict — DO NOT release
+                    // the lock. Releasing here would let the next server
+                    // acquire immediately and load stale DB data (the final
+                    // state was never saved). The lock will expire after
+                    // lock-timeout, giving operators a window to investigate.
+                    // Only saveDataAndReleaseLockClearComponents(...) == true
+                    // (success path) may notifyLockReleased — see line ~3230.
+                    logger.severe("[FinalSave] " + kind + " CAS failed for " + uuid
+                        + " (expected v" + expectedVersion + "/ft" + fencingToken
+                        + ", actual v" + actualVersion + "/ft" + actualFencingToken
+                        + ", session=" + session + ")"
+                        + "; NOT releasing lock. The lock will expire after "
+                        + config.getLockTimeout() + "s to protect final state.");
+                } else {
+                    // Online save: do NOT release lock — player is still on this server.
+                    // The CAS failure means someone else wrote (fencing token violation),
+                    // which is a serious bug. Log it at SEVERE and keep the lock.
+                    logger.log(Level.SEVERE, "[Fencing] Online save conflict for " + uuid
+                        + " — possible lock infringement! The lock should be held by us but CAS failed."
+                        + " expected v" + expectedVersion + "/ft" + fencingToken
+                        + ", actual v" + actualVersion + "/ft" + actualFencingToken);
                 }
 
-                if (!saved) {
-                    // Genuine conflict (external fencing violation or retry also failed)
-                    conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
-                    logger.warning("[Fencing] " + kind + " save rejected for " + uuid +
-                        " (expected v" + expectedVersion + "/ft" + fencingToken +
-                        ", actual v" + actualVersion + "/ft" + actualFencingToken + ")"
-                        + (retried ? " [after retry]" : ""));
-
-                    logOperation(uuid, OperationType.CONFLICT, fencingToken, expectedVersion,
-                        compressed.length, kind + " conflict: expected v" + expectedVersion + "/ft" + fencingToken +
-                        ", actual v" + actualVersion + "/ft" + actualFencingToken);
-
-                    if (saveLatency != null) saveLatency.recordError();
-
-                    if (kind.releaseLock) {
-                        // P0 (round 11): final save CAS conflict — DO NOT release
-                        // the lock. Releasing here would let the next server
-                        // acquire immediately and load stale DB data (the final
-                        // state was never saved). The lock will expire after
-                        // lock-timeout, giving operators a window to investigate.
-                        // Only saveDataAndReleaseLockClearComponents(...) == true
-                        // (success path) may notifyLockReleased — see line ~3230.
-                        logger.severe("[FinalSave] " + kind + " CAS failed for " + uuid
-                            + " (expected v" + expectedVersion + "/ft" + fencingToken
-                            + ", actual v" + actualVersion + "/ft" + actualFencingToken
-                            + ", session=" + session + ")"
-                            + "; NOT releasing lock. The lock will expire after "
-                            + config.getLockTimeout() + "s to protect final state.");
-                    } else {
-                        // Online save: do NOT release lock — player is still on this server.
-                        // The CAS failure means someone else wrote (fencing token violation),
-                        // which is a serious bug. Log it at SEVERE and keep the lock.
-                        logger.log(Level.SEVERE, "[Fencing] Online save conflict for " + uuid
-                            + " — possible lock infringement! The lock should be held by us but CAS failed."
-                            + " expected v" + expectedVersion + "/ft" + fencingToken
-                            + ", actual v" + actualVersion + "/ft" + actualFencingToken);
-                    }
-
-                    // Classify the conflict reason for structured retry handling.
-                    // If fencing tokens differ → FENCING_MISMATCH (lock was lost).
-                    // If fencing tokens match but version differs → VERSION_CONFLICT (external or same-fencing).
-                    SaveFailureReason reason = (actualFencingToken != fencingToken)
-                        ? SaveFailureReason.FENCING_MISMATCH
-                        : SaveFailureReason.VERSION_CONFLICT;
-                    return SaveResult.conflict(expectedVersion, actualVersion, compressed.length, reason);
-                }
+                // Classify the conflict reason for structured retry handling.
+                // If fencing tokens differ → FENCING_MISMATCH (lock was lost).
+                // If fencing tokens match but version differs → VERSION_CONFLICT (external or same-fencing).
+                SaveFailureReason reason = (actualFencingToken != fencingToken)
+                    ? SaveFailureReason.FENCING_MISMATCH
+                    : SaveFailureReason.VERSION_CONFLICT;
+                return SaveResult.conflict(expectedVersion, actualVersion, compressed.length, reason);
             }
 
             // 5b. Success: advance version + log + snapshot + publish
