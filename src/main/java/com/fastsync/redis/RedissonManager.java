@@ -165,13 +165,6 @@ public class RedissonManager {
     }
 
     /**
-     * Legacy constructor without namespace isolation or SSL/timeout (uses "default" cluster, no TLS).
-     */
-    public RedissonManager(String host, int port, String password, int database, String serverName) {
-        this(host, port, password, database, serverName, "", "", false, 5000, true, 100000, true);
-    }
-
-    /**
      * Enable/disable verbose debug logging (mirrors the old {@code config.isDebug()} gate).
      *
      * @param debug true to log pub/sub and stream trace messages

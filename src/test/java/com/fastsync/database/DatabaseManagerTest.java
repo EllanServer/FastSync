@@ -106,20 +106,20 @@ class DatabaseManagerTest {
         String serverB = "server-b";
 
         // Server A acquires lock
-        LockResult lock1 = databaseManager.acquireLock(uuid, serverA);
+        LockResult lock1 = databaseManager.acquireLock(uuid, serverA, "session-a");
         assertTrue(lock1.acquired(), "First lock acquisition should succeed");
         assertEquals(1, lock1.fencingToken(), "First token should be 1");
 
         // Server A releases lock
-        databaseManager.releaseLock(uuid, serverA);
+        databaseManager.releaseLock(uuid, serverA, lock1.fencingToken(), "session-a");
 
         // Server B acquires lock
-        LockResult lock2 = databaseManager.acquireLock(uuid, serverB);
+        LockResult lock2 = databaseManager.acquireLock(uuid, serverB, "session-b");
         assertTrue(lock2.acquired(), "Second lock acquisition should succeed after release");
         assertEquals(2, lock2.fencingToken(), "Fencing token should monotonically increase to 2");
 
         // Server A trying to acquire again should fail (held by B)
-        LockResult lock3 = databaseManager.acquireLock(uuid, serverA);
+        LockResult lock3 = databaseManager.acquireLock(uuid, serverA, "session-a");
         assertFalse(lock3.acquired(), "Lock acquisition should fail while held by another server");
     }
 
@@ -130,26 +130,26 @@ class DatabaseManagerTest {
         long checksum = DatabaseManager.computeChecksum(data);
 
         // Acquire lock and save initial data
-        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "test-session");
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "session-a");
         assertTrue(lock.acquired());
-        assertTrue(databaseManager.saveData(uuid, data, checksum, 0, lock.fencingToken(), "server-a"));
+        assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data, checksum, 0, lock.fencingToken(), "server-a", "session-a"));
 
         // Another server acquires lock (fencing token increments)
-        databaseManager.releaseLock(uuid, "server-a");
-        LockResult lock2 = databaseManager.acquireLock(uuid, "server-b", "test-session");
+        databaseManager.releaseLock(uuid, "server-a", lock.fencingToken(), "session-a");
+        LockResult lock2 = databaseManager.acquireLock(uuid, "server-b", "session-b");
         assertTrue(lock2.acquired());
 
         // Save with newer data, using the current DB version as expectedVersion
         byte[] data2 = new byte[]{4, 5, 6};
         long checksum2 = DatabaseManager.computeChecksum(data2);
         VersionedData current = databaseManager.loadData(uuid);
-        assertTrue(databaseManager.saveData(uuid, data2, checksum2, current.version(), lock2.fencingToken(), "server-b"));
+        assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data2, checksum2, current.version(), lock2.fencingToken(), "server-b", "session-b"));
 
         // Now the original server tries to write with stale version 0
         // This should be rejected because DB version is now 2
         byte[] staleData = new byte[]{7, 8, 9};
         long staleChecksum = DatabaseManager.computeChecksum(staleData);
-        boolean saved = databaseManager.saveData(uuid, staleData, staleChecksum, 0, lock.fencingToken(), "server-a");
+        boolean saved = databaseManager.saveDataKeepLockClearComponents(uuid, staleData, staleChecksum, 0, lock.fencingToken(), "server-a", "session-a");
         assertFalse(saved, "Stale version write should be rejected (Dynamo OCC)");
 
         // Verify DB still has the newer data
@@ -164,23 +164,23 @@ class DatabaseManagerTest {
         long checksum = DatabaseManager.computeChecksum(data);
 
         // Server A acquires lock (token 1) and saves
-        LockResult lockA = databaseManager.acquireLock(uuid, "server-a", "test-session");
-        assertTrue(databaseManager.saveData(uuid, data, checksum, 0, lockA.fencingToken(), "server-a"));
+        LockResult lockA = databaseManager.acquireLock(uuid, "server-a", "session-a");
+        assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data, checksum, 0, lockA.fencingToken(), "server-a", "session-a"));
 
         // Server B acquires lock (token 2) and saves
-        databaseManager.releaseLock(uuid, "server-a");
-        LockResult lockB = databaseManager.acquireLock(uuid, "server-b", "test-session");
+        databaseManager.releaseLock(uuid, "server-a", lockA.fencingToken(), "session-a");
+        LockResult lockB = databaseManager.acquireLock(uuid, "server-b", "session-b");
         byte[] dataB = new byte[]{4, 5, 6};
         long checksumB = DatabaseManager.computeChecksum(dataB);
         VersionedData current = databaseManager.loadData(uuid);
-        assertTrue(databaseManager.saveData(uuid, dataB, checksumB, current.version(), lockB.fencingToken(), "server-b"));
+        assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, dataB, checksumB, current.version(), lockB.fencingToken(), "server-b", "session-b"));
 
         // Server A (token 1) tries to write again with the current version —
         // should still be rejected because the stored fencing token (2) > lockA's token (1)
         VersionedData afterB = databaseManager.loadData(uuid);
         byte[] dataA2 = new byte[]{7, 8, 9};
         long checksumA2 = DatabaseManager.computeChecksum(dataA2);
-        boolean saved = databaseManager.saveData(uuid, dataA2, checksumA2, afterB.version(), lockA.fencingToken(), "server-a");
+        boolean saved = databaseManager.saveDataKeepLockClearComponents(uuid, dataA2, checksumA2, afterB.version(), lockA.fencingToken(), "server-a", "session-a");
         assertFalse(saved, "Lower fencing token write should be rejected (Kleppmann)");
     }
 
@@ -190,8 +190,8 @@ class DatabaseManagerTest {
         byte[] data = new byte[]{10, 20, 30};
         long checksum = DatabaseManager.computeChecksum(data);
 
-        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "test-session");
-        assertTrue(databaseManager.saveData(uuid, data, checksum, 0, lock.fencingToken(), "server-a"));
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "session-a");
+        assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data, checksum, 0, lock.fencingToken(), "server-a", "session-a"));
 
         VersionedData loaded = databaseManager.loadData(uuid);
         assertArrayEquals(data, loaded.data());

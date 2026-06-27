@@ -28,17 +28,7 @@ public class PdcStrategyFactory {
             List<RegisteredKeysPdcStrategy.KeyBinding> keys = parseRegisteredKeys(config, logger);
             return new RegisteredKeysPdcStrategy(keys, logger, debug);
         }
-        
-        if ("unsafe-reflection".equalsIgnoreCase(mode)) {
-            if (config.isUnsafePdcConfirmed()) {
-                logger.warning("[PDC] Using UNSAFE reflection strategy. This may break on Paper updates.");
-                return new ReflectionNmsPdcStrategy(logger, debug);
-            } else {
-                logger.warning("[PDC] unsafe-reflection mode requires pdc.unsafe-reflection.enabled: true. Falling back to off.");
-                return new NoopPdcStrategy();
-            }
-        }
-        
+
         logger.warning("[PDC] Unknown mode '" + mode + "', falling back to off.");
         return new NoopPdcStrategy();
     }

@@ -211,9 +211,6 @@ sync:
 #   registered-only  - (default) Only sync keys explicitly listed in registered-keys below.
 #                      Production recommended: avoids syncing plugin-internal data.
 #                      Uses stable Bukkit API, compatible with all Paper versions.
-#   unsafe-reflection - Use reflection to access NMS internals.
-#                      Fallback for older Paper versions. Requires explicit
-#                      confirmation (unsafe-reflection.enabled: true).
 pdc:
   mode: "registered-only"
   # When mode=safe-all-paper, clear the target PDC before restoring (true = full sync, false = merge/append).
@@ -222,9 +219,6 @@ pdc:
   # When mode=registered-only, list keys to sync as "namespace:key=TYPE"
   # e.g. "myplugin:progress=INTEGER", "myplugin:rank=STRING"
   registered-keys: []
-  # Double-confirmation for unsafe-reflection mode
-  unsafe-reflection:
-    enabled: false
 
 # ------------------------------------------------------------
 # Statistics Sync Strategy

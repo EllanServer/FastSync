@@ -99,9 +99,8 @@ public class ConfigManager {
     private boolean syncLockedMaps;
 
     // PDC strategy config
-    private String pdcMode;                    // off | safe-all-paper | registered-only | unsafe-reflection
+    private String pdcMode;                    // off | safe-all-paper | registered-only
     private boolean pdcClearBeforeRestore;     // safe-all-paper: clear PDC before restore (full sync vs merge)
-    private boolean unsafePdcConfirmed;        // explicit confirmation for unsafe-reflection
     private java.util.List<String> registeredPdcKeys;  // list of "namespace:key=TYPE" strings
 
     // Typed statistics config
@@ -351,10 +350,8 @@ public class ConfigManager {
         syncLockedMaps = source.getBoolean("sync.sync-locked-maps", false);
 
         // PDC strategy
-        pdcMode = source.getString("pdc.mode",
-            syncPDC ? "safe-all-paper" : "off");
+        pdcMode = source.getString("pdc.mode", "registered-only");
         pdcClearBeforeRestore = source.getBoolean("pdc.clear-before-restore", true);
-        unsafePdcConfirmed = source.getBoolean("pdc.unsafe-reflection.enabled", false);
         registeredPdcKeys = source.getStringList("pdc.registered-keys");
 
         // Typed statistics
@@ -366,20 +363,6 @@ public class ConfigManager {
         locationRequireSameWorldName = source.getBoolean("sync.location.require-same-world-name", true);
         locationRequireSameWorldUuid = source.getBoolean("sync.location.require-same-world-uuid", true);
         locationFallbackToSpawn = source.getBoolean("sync.location.fallback-to-spawn", true);
-
-        // Migration: old sync-pdc boolean -> new pdc.mode
-        if (source.contains("sync.sync-pdc") && !source.contains("pdc.mode")) {
-            boolean oldPdc = source.getBoolean("sync.sync-pdc", true);
-            pdcMode = oldPdc ? "safe-all-paper" : "off";
-            logger.warning("[Config] Migrated old 'sync.sync-pdc' to 'pdc.mode=" + pdcMode + "'. Please update your config.");
-        }
-        // Migration: old sync-statistics boolean -> new statistics.typed.enabled
-        if (source.contains("sync.sync-statistics") && !source.contains("statistics.typed.enabled")) {
-            // Old behavior: if sync-statistics was true, typed stats were on (full mode)
-            typedStatsEnabled = syncStatistics;
-            if (syncStatistics) typedStatsMode = "full";
-            logger.warning("[Config] Migrated old 'sync.sync-statistics' to 'statistics.typed.enabled=" + typedStatsEnabled + "'. Please update your config.");
-        }
 
         // Snapshot
         snapshotEnabled = source.getBoolean("snapshot.enabled", true);
@@ -496,7 +479,7 @@ public class ConfigManager {
 
     public String getPdcMode() { return pdcMode; }
     public boolean isPdcClearBeforeRestore() { return pdcClearBeforeRestore; }
-    public boolean isUnsafePdcConfirmed() { return unsafePdcConfirmed; }
+
     public java.util.List<String> getRegisteredPdcKeys() { return registeredPdcKeys; }
 
     public boolean isTypedStatsEnabled() { return typedStatsEnabled; }

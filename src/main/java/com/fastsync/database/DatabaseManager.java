@@ -157,7 +157,6 @@ public class DatabaseManager {
         dataSource = new HikariDataSource(hikariConfig);
 
         createTables();
-        migrateSchema();
         logger.info("Database connection established: " + config.getDbHost() + ":" + config.getDbPort() + "/" + config.getDbDatabase());
     }
 
@@ -220,230 +219,6 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             dsl(conn).execute(componentTableSql);
         }
-    }
-
-    /**
-     * Migrate the schema for existing tables.
-     * Adds version and checksum columns if they don't already exist.
-     *
-     * <p>MySQL 8+ honours {@code ADD COLUMN IF NOT EXISTS}; older versions raise
-     * a "Duplicate column" error which jOOQ surfaces as a
-     * {@link DataAccessException} wrapping the underlying {@link SQLException}.
-     * We walk the exception cause chain to detect that benign case and suppress
-     * it, logging anything else as a migration note.
-     */
-    private void migrateSchema() throws SQLException {
-        // CRITICAL: MySQL 8.0/8.4 does NOT support `ALTER TABLE ... ADD COLUMN
-        // IF NOT EXISTS` (that is a MariaDB extension). The previous code used
-        // IF NOT EXISTS unconditionally, which produced a SQL syntax error on
-        // every startup of MySQL 8.x. The error was caught and logged as a
-        // "migration note", so the column was NEVER actually added on MySQL 8.x
-        // — meaning upgrades from old versions that lacked the column would
-        // silently fail, and subsequent INSERT/UPDATE queries would error at
-        // runtime with "Unknown column 'component_bitmap'".
-        //
-        // The fix: probe information_schema.columns first, and only emit the
-        // ALTER if the column is actually missing. This works on every MySQL
-        // version (5.7+, 8.0, 8.4) and produces no warnings on fresh installs
-        // (where CREATE TABLE already added every column).
-        try (Connection conn = dataSource.getConnection()) {
-            DSLContext dsl = dsl(conn);
-
-            // player_data column additions (idempotent — skipped if column exists)
-            addColumnIfMissing(dsl, conn, dataTable, "version",
-                "BIGINT NOT NULL DEFAULT 0");
-            addColumnIfMissing(dsl, conn, dataTable, "checksum",
-                "BIGINT NOT NULL DEFAULT 0");
-            addColumnIfMissing(dsl, conn, dataTable, "fencing_token",
-                "BIGINT NOT NULL DEFAULT 0");
-            // Phase 2: component_bitmap tracks which components have been
-            // migrated from the legacy single-Blob to the per-component table.
-            // Default 0 = no components migrated yet (pure Blob mode).
-            addColumnIfMissing(dsl, conn, dataTable, "component_bitmap",
-                "BIGINT NOT NULL DEFAULT 0");
-            // component_generation: incremented on every full Blob save. Component
-            // rows are only read if their generation matches player_data.component_generation.
-            // This prevents stale component rows from overriding a fresh full Blob.
-            addColumnIfMissing(dsl, conn, dataTable, "component_generation",
-                "BIGINT NOT NULL DEFAULT 0");
-
-            // player_component: add generation column for baseline tracking
-            addColumnIfMissing(dsl, conn, componentTable, "generation",
-                "BIGINT NOT NULL DEFAULT 0");
-
-            // The orphaned `op_seq` column from old installations — drop if present.
-            dropColumnIfPresent(dsl, conn, dataTable, "op_seq");
-
-            // Phase 3 (round 10): lock_session_id — per-acquire nonce that
-            // disambiguates two lock acquisitions from the same serverName.
-            // Without this, a quick reconnect to the same backend (quit save
-            // still in flight) sees locked_by = serverName and is mistakenly
-            // treated as a successful new acquire. With lock_session_id, the
-            // read-back requires the nonce to match the value just written —
-            // a prior session's nonce differs, so the acquire fails and the
-            // login waits for the quit save to release the lock.
-            addColumnIfMissing(dsl, conn, dataTable, "lock_session_id",
-                "VARCHAR(64) DEFAULT NULL");
-        }
-    }
-
-    /**
-     * Probe {@code information_schema.columns} and only run the ALTER if the
-     * column is missing. Works on every MySQL version (no IF NOT EXISTS needed).
-     */
-    private void addColumnIfMissing(DSLContext dsl, Connection conn,
-            String tableName, String columnName, String columnDef) throws SQLException {
-        if (columnExists(conn, tableName, columnName)) {
-            return;
-        }
-        String sql = String.format("ALTER TABLE `%s` ADD COLUMN `%s` %s",
-            tableName, columnName, columnDef);
-        try {
-            dsl.execute(sql);
-            logger.info("Schema migration: added column " + tableName + "." + columnName);
-        } catch (DataAccessException e) {
-            // Race: another server may have added the column concurrently.
-            // Treat duplicate-column as benign; anything else is a real problem.
-            if (!isDuplicateColumnError(e)) {
-                throw e;
-            }
-        }
-    }
-
-    /**
-     * Probe {@code information_schema.columns} and only run the ALTER if the
-     * column is present. Works on every MySQL version (no IF EXISTS needed).
-     */
-    private void dropColumnIfPresent(DSLContext dsl, Connection conn,
-            String tableName, String columnName) throws SQLException {
-        if (!columnExists(conn, tableName, columnName)) {
-            return;
-        }
-        String sql = String.format("ALTER TABLE `%s` DROP COLUMN `%s`",
-            tableName, columnName);
-        try {
-            dsl.execute(sql);
-            logger.info("Schema migration: dropped column " + tableName + "." + columnName);
-        } catch (DataAccessException e) {
-            // Race or unsupported DROP. Log and continue — this is best-effort
-            // cleanup of a legacy column, not a correctness requirement.
-            if (!isCannotDropColumnError(e)) {
-                logger.warning("Schema migration note (DROP " + columnName + "): " + e.getMessage());
-            }
-        }
-    }
-
-    /**
-     * Check whether a column exists in the given table via information_schema.
-     * Database name is read from the connection's catalog so this works
-     * regardless of which database the connection is bound to.
-     */
-    private boolean columnExists(Connection conn, String tableName, String columnName) throws SQLException {
-        String dbName = conn.getCatalog();
-        String sql = "SELECT 1 FROM information_schema.columns " +
-            "WHERE table_schema = ? AND table_name = ? AND column_name = ?";
-        try (var ps = conn.prepareStatement(sql)) {
-            ps.setString(1, dbName);
-            ps.setString(2, tableName);
-            ps.setString(3, columnName);
-            try (var rs = ps.executeQuery()) {
-                return rs.next();
-            }
-        }
-    }
-
-    /**
-     * Walk the jOOQ exception cause chain looking for the MySQL
-     * "Duplicate column" error, which is the expected outcome of adding a column
-     * that already exists on MySQL versions without {@code IF NOT EXISTS} support.
-     */
-    private static boolean isDuplicateColumnError(Throwable e) {
-        Throwable t = e;
-        while (t != null) {
-            String message = t.getMessage();
-            if (message != null && message.contains("Duplicate column")) {
-                return true;
-            }
-            t = t.getCause();
-        }
-        return false;
-    }
-
-    /**
-     * Walk the jOOQ exception cause chain looking for the MySQL error raised when
-     * attempting to drop a column that does not exist — either because the
-     * {@code DROP COLUMN IF NOT EXISTS} syntax is unsupported (older MySQL) or
-     * because the column was never present. MySQL surfaces this as error 1091
-     * ("Can't DROP ...; check that column/key exists"); some variants report an
-     * "Unknown column" error. Both are benign outcomes of the {@code op_seq}
-     * cleanup migration and are suppressed.
-     */
-    private static boolean isCannotDropColumnError(Throwable e) {
-        Throwable t = e;
-        while (t != null) {
-            String message = t.getMessage();
-            if (message != null && (message.contains("check that column/key exists")
-                    || message.contains("Can't DROP")
-                    || message.contains("Unknown column"))) {
-                return true;
-            }
-            t = t.getCause();
-        }
-        return false;
-    }
-
-    /**
-     * Acquire a lock for a player's data and generate a fencing token.
-     *
-     * <p>Per Kleppmann's fencing token pattern: every successful lock acquisition
-     * increments a monotonically increasing {@code fencing_token} in the database.
-     * This token must be presented on save; the storage layer rejects any write
-     * whose fencing token is less than the stored value, preventing stale writes
-     * from servers that experienced GC pauses, network delays, or clock skew.
-     *
-     * <p>This is stronger than Redis SET NX PX locks, which cannot generate
-     * fencing tokens and thus cannot defend against stale writes at the storage layer.
-     *
-     * <p><b>Implementation:</b> The former three roundtrips — a separate
-     * {@code INSERT IGNORE} to ensure the row exists, a conditional
-     * {@code UPDATE} to take the lock and bump the token, and a
-     * {@code SELECT} to read the token back — are collapsed into a single
-     * {@code INSERT ... ON DUPLICATE KEY UPDATE} plus one read-back SELECT on the
-     * same borrowed connection. The INSERT arm creates the row for brand-new
-     * players with {@code fencing_token = 1}; the ON DUPLICATE KEY UPDATE arm
-     * atomically increments {@code fencing_token} (via the
-     * {@code LAST_INSERT_ID(expr)} idiom) and rewrites
-     * {@code locked_by}/{@code locked_at} only when the lock is free, expired, or
-     * already held by this server — the same predicate the old conditional UPDATE
-     * used. The statement is issued as raw SQL via {@link DSLContext#execute(String)}
-     * because jOOQ's DSL does not express {@code ON DUPLICATE KEY UPDATE} with
-     * conditional {@code IF()} expressions cleanly.
-     *
-     * <p><b>InnoDB locking (per MySQL 8.4 docs):</b> The duplicate-key conflict is
-     * resolved on the PRIMARY KEY ({@code uuid}) — a single-row X lock with no gap
-     * locks or next-key locks, so different UUIDs never contend. The read-back
-     * SELECT is a PK point lookup.
-     *
-     * <p><b>Why the read-back checks {@code locked_by} rather than relying on
-     * {@code LAST_INSERT_ID()} alone:</b> The {@code LAST_INSERT_ID(expr)} idiom
-     * only sets the connection's last-insert ID when the UPDATE arm actually
-     * evaluates the expression. On a fresh INSERT (a new player) the UPDATE arm
-     * never runs, and on a pooled connection {@code LAST_INSERT_ID()} may still
-     * hold a stale value from a previous statement — so a zero return is not a
-     * reliable failure signal. The committed {@code locked_by} column is
-     * unambiguous: we hold the lock iff it equals {@code serverName}. Once we hold
-     * the lock no other server can bump the token before the read-back, so the
-     * {@code fencing_token} we read is the one we just wrote.
-     *
-     * @return LockResult with acquired=true and the fencing token, or acquired=false
-     */
-    public LockResult acquireLock(UUID uuid, String serverName) throws SQLException {
-        // Backward-compatible overload: generates a random lock_session_id.
-        // Production callers (SyncManager) should use the 4-arg overload and
-        // pass a session id they track, so subsequent save/release/heartbeat
-        // can include it in the WHERE clause. Tests use this overload for
-        // simplicity.
-        return acquireLock(uuid, serverName, java.util.UUID.randomUUID().toString());
     }
 
     /**
@@ -517,22 +292,46 @@ public class DatabaseManager {
         // We use a per-acquire nonce (not a per-JVM boot_id) because two
         // acquires from the same JVM (quit then quick reconnect) must also
         // be distinguished.
+        // P0 SAFETY NOTE — MySQL left-to-right SET evaluation hazard.
+        //
+        // MySQL evaluates single-table UPDATE SET assignments left to right,
+        // and a later assignment's RHS sees the NEW value of any column that
+        // an earlier assignment in the SAME statement already wrote. The
+        // previous form repeated `IF(locked_by IS NULL OR locked_at < ?, ...)`
+        // for every column. Once the `locked_by = ...` assignment ran, the
+        // following `locked_by IS NULL` checks evaluated against the just-
+        // written (non-null) value, so for a just-released lock (locked_at
+        // NULL, locked_at < ? => NULL => false) the `locked_at` and
+        // `lock_session_id` IFs went false and left those columns at their
+        // post-release NULL values. The read-back's `lock_session_id` match
+        // then failed, breaking every acquire-after-release sequence.
+        //
+        // Fix: drive ALL four assignments off a single predicate that
+        // references only `locked_at`, and assign `locked_at` LAST. The
+        // earlier assignments (fencing_token, locked_by, lock_session_id)
+        // then see the OLD `locked_at` (not yet written), and `locked_at`'s
+        // own RHS is evaluated before its assignment, so it also sees OLD.
+        // `locked_at IS NULL OR locked_at < ?` is exactly "lock is free or
+        // expired": releaseLock / the save paths clear locked_at to NULL on
+        // release, and acquireLock sets it to `now` while held. No reliance
+        // on locked_by here, so the same-serverName quick-reconnect guard
+        // continues to come from the read-back's lock_session_id check.
         String sql = String.format("""
             INSERT INTO `%s` (uuid, data, version, checksum, fencing_token, locked_by, locked_at, lock_session_id, last_server, last_updated)
             VALUES (?, '', 0, 0, 1, ?, ?, ?, NULL, 0)
             ON DUPLICATE KEY UPDATE
-                fencing_token = IF(locked_by IS NULL OR locked_at < ?,
+                fencing_token = IF(locked_at IS NULL OR locked_at < ?,
                                    LAST_INSERT_ID(fencing_token + 1),
                                    fencing_token),
-                locked_by = IF(locked_by IS NULL OR locked_at < ?,
+                locked_by = IF(locked_at IS NULL OR locked_at < ?,
                                ?,
                                locked_by),
-                locked_at = IF(locked_by IS NULL OR locked_at < ?,
-                               ?,
-                               locked_at),
-                lock_session_id = IF(locked_by IS NULL OR locked_at < ?,
+                lock_session_id = IF(locked_at IS NULL OR locked_at < ?,
                                       ?,
-                                      lock_session_id)
+                                      lock_session_id),
+                locked_at = IF(locked_at IS NULL OR locked_at < ?,
+                               ?,
+                               locked_at)
             """, dataTable);
 
         try (Connection conn = dataSource.getConnection()) {
@@ -546,44 +345,40 @@ public class DatabaseManager {
                 expiredTime,      // fencing_token IF predicate
                 expiredTime,      // locked_by IF predicate
                 serverName,       // locked_by new value
-                expiredTime,      // locked_at IF predicate
-                now,              // locked_at new value
                 expiredTime,      // lock_session_id IF predicate
-                lockSessionId     // lock_session_id new value
+                lockSessionId,    // lock_session_id new value
+                expiredTime,      // locked_at IF predicate
+                now               // locked_at new value
             );
 
-            // Read back fencing_token, locked_by, AND lock_session_id.
-            // We hold the lock iff ALL THREE match:
-            //   - locked_by == serverName (lock is ours, not another server's)
-            //   - lock_session_id == lockSessionId (THIS acquire, not a prior
-            //     same-serverName session whose quit save is still in flight)
-            // The fencing_token is the one we just wrote (PK point lookup;
-            // no other server can bump it before our read-back because we
-            // hold the row's X lock via the just-completed
-            // INSERT...ON DUPLICATE KEY UPDATE).
-            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD, LOCK_SESSION_ID_FIELD)
-                .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
-                .fetchOne();
+            // Read back fencing_token, locked_by, AND lock_session_id using
+            // raw JDBC (not jOOQ) to avoid Field type resolution issues that
+            // caused null returns on CI MySQL.
+            String readSql = String.format(
+                "SELECT `fencing_token`, `locked_by`, `lock_session_id` FROM `%s` WHERE `uuid` = ?",
+                dataTable);
+            long readToken = 0;
+            String readLockedBy = null;
+            String readSessionId = null;
+            try (var ps = conn.prepareStatement(readSql)) {
+                ps.setString(1, uuid.toString());
+                try (var rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return LockResult.FAILED;
+                    }
+                    readToken = rs.getLong("fencing_token");
+                    readLockedBy = rs.getString("locked_by");
+                    readSessionId = rs.getString("lock_session_id");
+                }
+            }
 
-            if (record == null) {
+            if (!serverName.equals(readLockedBy)) {
                 return LockResult.FAILED;
             }
-            if (!serverName.equals(record.get(LOCKED_BY_FIELD))) {
+            if (!lockSessionId.equals(readSessionId)) {
                 return LockResult.FAILED;
             }
-            // P0 check: lock_session_id must match THIS acquire's nonce.
-            // A prior same-serverName session's lock would have a different
-            // nonce. If dbSessionId is NULL (legacy row predating this column,
-            // or a migration that has not yet backfilled), we allow the acquire
-            // to succeed — the locked_by + fencing_token check is sufficient
-            // for those rows, and the next acquire will write a real nonce.
-            String dbSessionId = record.get(LOCK_SESSION_ID_FIELD);
-            if (lockSessionId != null && dbSessionId != null && !lockSessionId.equals(dbSessionId)) {
-                return LockResult.FAILED;
-            }
-            Long token = record.get(FENCING_TOKEN_FIELD);
-            return token != null ? LockResult.success(token) : LockResult.FAILED;
+            return readToken > 0 ? LockResult.success(readToken) : LockResult.FAILED;
         }
     }
 
@@ -625,58 +420,6 @@ public class DatabaseManager {
             }
         }
         return VersionedData.EMPTY;
-    }
-
-    /**
-     * Save player data AND RELEASE the lock (quit/final save).
-     *
-     * <p><b>DEPRECATED.</b> This overload does NOT clear {@code component_bitmap}
-     * or bump {@code component_generation}, so it is unsafe to use if
-     * component-storage was ever enabled for this UUID — stale component rows
-     * would survive the full Blob save and overlay the fresh Blob on next load.
-     *
-     * <p>For safety, this method now delegates to
-     * {@link #saveDataAndReleaseLockClearComponents}, which atomically bumps
-     * the generation. The CAS semantics (version + fencing token + locked_by)
-     * are identical — only two extra columns are written. Existing callers and
-     * tests do not need to change.
-     *
-     * @deprecated since 1.0.0, for removal. Use
-     *             {@link #saveDataAndReleaseLockClearComponents} directly.
-     */
-    @Deprecated(since = "1.0.0", forRemoval = true)
-    public boolean saveDataAndReleaseLock(UUID uuid, byte[] data, long checksum, long expectedVersion,
-                                          long fencingToken, String serverName) throws SQLException {
-        return saveDataAndReleaseLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName, null);
-    }
-
-    /**
-     * Save player data AND KEEP the lock (online/periodic/bulk save).
-     *
-     * <p><b>DEPRECATED.</b> Same rationale as
-     * {@link #saveDataAndReleaseLock}: this overload does not invalidate
-     * stale component rows. Delegates to
-     * {@link #saveDataKeepLockClearComponents}.
-     *
-     * @deprecated since 1.0.0, for removal. Use
-     *             {@link #saveDataKeepLockClearComponents} directly.
-     */
-    @Deprecated(since = "1.0.0", forRemoval = true)
-    public boolean saveDataKeepLock(UUID uuid, byte[] data, long checksum, long expectedVersion,
-                                    long fencingToken, String serverName) throws SQLException {
-        return saveDataKeepLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName, null);
-    }
-
-    /**
-     * Save player data and release the lock (legacy/backward-compatible alias).
-     *
-     * @deprecated since 1.0.0, for removal. Use
-     *             {@link #saveDataAndReleaseLockClearComponents} directly.
-     */
-    @Deprecated(since = "1.0.0", forRemoval = true)
-    public boolean saveData(UUID uuid, byte[] data, long checksum, long expectedVersion,
-                            long fencingToken, String serverName) throws SQLException {
-        return saveDataAndReleaseLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName, null);
     }
 
     // ==================== Phase 2: Full Blob Save + Component Cleanup ====================
@@ -724,32 +467,29 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
-                // CAS update player_data with new Blob + clear lock + reset bitmap
-                // + increment component_generation. The generation increment
-                // invalidates all old component rows without deleting them —
-                // on load, only rows where generation == current generation are read.
-                // Old rows can be GC'd later by a background task.
-                //
-                // P0 (round 10): WHERE now includes lock_session_id so a stale
-                // session's quit save (whose lock was superseded by a new acquire)
-                // cannot release the new session's lock or overwrite its data.
-                int updated = dsl(conn).update(playerData)
-                    .set(DATA_FIELD, data)
-                    .set(VERSION_FIELD, VERSION_FIELD.plus(1))
-                    .set(CHECKSUM_FIELD, checksum)
-                    .set(LOCKED_BY_FIELD, (String) null)
-                    .set(LOCKED_AT_FIELD, (Long) null)
-                    .set(LOCK_SESSION_ID_FIELD, (String) null)
-                    .set(LAST_SERVER_FIELD, serverName)
-                    .set(LAST_UPDATED_FIELD, now)
-                    .set(COMPONENT_BITMAP_FIELD, 0L)
-                    .set(COMPONENT_GENERATION_FIELD, COMPONENT_GENERATION_FIELD.plus(1))
-                    .where(UUID_FIELD.eq(uuid.toString())
-                        .and(VERSION_FIELD.eq(expectedVersion))
-                        .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                        .and(LOCKED_BY_FIELD.eq(serverName))
-                        .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
-                    .execute();
+                // Raw JDBC for the CAS update — jOOQ Field type resolution
+                // caused lock_session_id WHERE mismatches on CI MySQL.
+                String sql = String.format(
+                    "UPDATE `%s` SET `data` = ?, `version` = `version` + 1, `checksum` = ?, " +
+                    "`locked_by` = NULL, `locked_at` = NULL, `lock_session_id` = NULL, " +
+                    "`last_server` = ?, `last_updated` = ?, " +
+                    "`component_bitmap` = 0, `component_generation` = `component_generation` + 1 " +
+                    "WHERE `uuid` = ? AND `version` = ? AND `fencing_token` = ? " +
+                    "AND `locked_by` = ? AND `lock_session_id` = ?",
+                    dataTable);
+                int updated;
+                try (var ps = conn.prepareStatement(sql)) {
+                    ps.setBytes(1, data);
+                    ps.setLong(2, checksum);
+                    ps.setString(3, serverName);
+                    ps.setLong(4, now);
+                    ps.setString(5, uuid.toString());
+                    ps.setLong(6, expectedVersion);
+                    ps.setLong(7, fencingToken);
+                    ps.setString(8, serverName);
+                    ps.setString(9, lockSessionId);
+                    updated = ps.executeUpdate();
+                }
 
                 if (updated <= 0) {
                     conn.rollback();
@@ -785,22 +525,27 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
-                int updated = dsl(conn).update(playerData)
-                    .set(DATA_FIELD, data)
-                    .set(VERSION_FIELD, VERSION_FIELD.plus(1))
-                    .set(CHECKSUM_FIELD, checksum)
-                    .set(LAST_SERVER_FIELD, serverName)
-                    .set(LAST_UPDATED_FIELD, now)
-                    .set(LOCKED_AT_FIELD, now)
-                    .set(COMPONENT_BITMAP_FIELD, 0L)
-                    .set(COMPONENT_GENERATION_FIELD, COMPONENT_GENERATION_FIELD.plus(1))
-                    // locked_by and lock_session_id are NOT cleared — we still hold the lock
-                    .where(UUID_FIELD.eq(uuid.toString())
-                        .and(VERSION_FIELD.eq(expectedVersion))
-                        .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                        .and(LOCKED_BY_FIELD.eq(serverName))
-                        .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
-                    .execute();
+                String sql = String.format(
+                    "UPDATE `%s` SET `data` = ?, `version` = `version` + 1, `checksum` = ?, " +
+                    "`last_server` = ?, `last_updated` = ?, `locked_at` = ?, " +
+                    "`component_bitmap` = 0, `component_generation` = `component_generation` + 1 " +
+                    "WHERE `uuid` = ? AND `version` = ? AND `fencing_token` = ? " +
+                    "AND `locked_by` = ? AND `lock_session_id` = ?",
+                    dataTable);
+                int updated;
+                try (var ps = conn.prepareStatement(sql)) {
+                    ps.setBytes(1, data);
+                    ps.setLong(2, checksum);
+                    ps.setString(3, serverName);
+                    ps.setLong(4, now);
+                    ps.setLong(5, now);
+                    ps.setString(6, uuid.toString());
+                    ps.setLong(7, expectedVersion);
+                    ps.setLong(8, fencingToken);
+                    ps.setString(9, serverName);
+                    ps.setString(10, lockSessionId);
+                    updated = ps.executeUpdate();
+                }
 
                 if (updated <= 0) {
                     conn.rollback();
@@ -845,52 +590,34 @@ public class DatabaseManager {
     }
 
     /**
-     * Release the lock without saving data (e.g., on error).
-     */
-    /**
-     * @deprecated Use {@link #releaseLock(UUID, String, long)} instead.
-     *             This overload does not check the fencing token and can
-     *             release another server's lock if server-names are duplicated.
-     */
-    @Deprecated(since = "1.0.0", forRemoval = true)
-    public void releaseLock(UUID uuid, String serverName) throws SQLException {
-        try (Connection conn = dataSource.getConnection()) {
-            dsl(conn).update(playerData)
-                .set(LOCKED_BY_FIELD, (String) null)
-                .set(LOCKED_AT_FIELD, (Long) null)
-                .set(LOCK_SESSION_ID_FIELD, (String) null)
-                .where(UUID_FIELD.eq(uuid.toString())
-                    .and(LOCKED_BY_FIELD.eq(serverName)))
-                .execute();
-        }
-    }
-
-    /**
-     * Release a lock using a fencing token condition.
+     * Release a lock using a fencing token + lock-session id condition.
      *
-     * <p>This is the safe variant of {@link #releaseLock(UUID, String)}: it only
-     * clears the lock if {@code locked_by = serverName AND fencing_token = fencingToken}.
-     * This prevents a misconfigured server (duplicate server-name) from releasing
-     * a newer lock acquired by a different server instance that happened to use
-     * the same name.
+     * <p>Clears the lock only if {@code locked_by = serverName AND
+     * fencing_token = fencingToken AND lock_session_id = lockSessionId}.
+     * This prevents a stale session (whose lock was superseded by a new acquire
+     * on the same serverName) from releasing the new session's lock.
      *
      * @param uuid         player UUID
      * @param serverName   server that holds the lock
      * @param fencingToken fencing token assigned when the lock was acquired
+     * @param lockSessionId per-acquire nonce that must match the stored value
      * @return true if the lock was released, false if the lock is no longer ours
      */
     public boolean releaseLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
         requireLockSession(lockSessionId, "releaseLock");
-        try (Connection conn = dataSource.getConnection()) {
-            return dsl(conn).update(playerData)
-                .set(LOCKED_BY_FIELD, (String) null)
-                .set(LOCKED_AT_FIELD, (Long) null)
-                .set(LOCK_SESSION_ID_FIELD, (String) null)
-                .where(UUID_FIELD.eq(uuid.toString())
-                    .and(LOCKED_BY_FIELD.eq(serverName))
-                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                    .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
-                .execute() > 0;
+        // Use raw JDBC to avoid jOOQ Field type resolution issues with
+        // lock_session_id column on CI MySQL.
+        String sql = String.format(
+            "UPDATE `%s` SET `locked_by` = NULL, `locked_at` = NULL, `lock_session_id` = NULL " +
+            "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
+            dataTable);
+        try (Connection conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(sql)) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, serverName);
+            ps.setLong(3, fencingToken);
+            ps.setString(4, lockSessionId);
+            return ps.executeUpdate() > 0;
         }
     }
 
@@ -913,14 +640,18 @@ public class DatabaseManager {
     public boolean refreshLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
         requireLockSession(lockSessionId, "refreshLock");
         long now = System.currentTimeMillis();
-        try (Connection conn = dataSource.getConnection()) {
-            return dsl(conn).update(playerData)
-                .set(LOCKED_AT_FIELD, now)
-                .where(UUID_FIELD.eq(uuid.toString())
-                    .and(LOCKED_BY_FIELD.eq(serverName))
-                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                    .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
-                .execute() > 0;
+        String sql = String.format(
+            "UPDATE `%s` SET `locked_at` = ? " +
+            "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
+            dataTable);
+        try (Connection conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, now);
+            ps.setString(2, uuid.toString());
+            ps.setString(3, serverName);
+            ps.setLong(4, fencingToken);
+            ps.setString(5, lockSessionId);
+            return ps.executeUpdate() > 0;
         }
     }
 
@@ -954,7 +685,7 @@ public class DatabaseManager {
         String sql = "UPDATE `" + dataTable + "`"
             + " SET locked_at = ?"
             + " WHERE uuid = ? AND locked_by = ? AND fencing_token = ?"
-            + " AND (lock_session_id = ? OR lock_session_id IS NULL)";
+            + " AND lock_session_id = ?";
 
         try (Connection conn = dataSource.getConnection();
              java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -1089,139 +820,6 @@ public class DatabaseManager {
                 .fetchOne(COMPONENT_BITMAP_FIELD);
             return bitmap != null ? bitmap : 0L;
         }
-    }
-
-    /**
-     * Update the {@code component_bitmap} column for a player.
-     *
-     * <p><b>DEPRECATED &amp; DANGEROUS.</b> This method writes
-     * {@code component_bitmap} directly with no fencing validation, no version
-     * bump, no transaction, and no {@code component_generation} update. Any
-     * caller could use it to mark components as migrated without actually
-     * writing them — causing the load path to look for component rows that do
-     * not exist (silent fall-back to Blob) or, worse, to skip the Blob's value
-     * for a component that was never persisted to the component table.
-     *
-     * <p>The only safe way to update {@code component_bitmap} is inside
-     * {@link #upsertComponentsIfLockHeld}, which does it atomically with the
-     * component row writes, the version bump, and the fencing validation.
-     *
-     * @deprecated since 1.0.0, for removal. Use
-     *             {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map, String, long, long)}.
-     * @throws UnsupportedOperationException always.
-     */
-    @Deprecated(since = "1.0.0", forRemoval = true)
-    public void setComponentBitmap(UUID uuid, long bitmap) throws SQLException {
-        throw new UnsupportedOperationException(
-            "setComponentBitmap() is unsafe — it writes component_bitmap directly with no fencing "
-            + "validation, no version bump, and no component row write. Use upsertComponentsIfLockHeld() "
-            + "instead, which updates component_bitmap atomically with the component rows.");
-    }
-
-    /**
-     * Load all migrated components for a player in a single round-trip.
-     *
-     * <p><b>DEPRECATED &amp; DANGEROUS.</b> This overload does NOT filter by
-     * {@code component_generation}, so it can return stale component rows left
-     * behind by a previous baseline (before a full Blob save incremented the
-     * generation). Loading those rows and overlaying them on the current Blob
-     * silently rolls back the player's state to whenever the component was
-     * last written.
-     *
-     * <p>Use {@link #loadComponentsWithGeneration(UUID, java.util.Set, long)}
-     * instead, which takes the current {@code component_generation} from
-     * {@code player_data} and only returns rows matching that generation.
-     *
-     * @deprecated since 1.0.0, for removal. Use
-     *             {@link #loadComponentsWithGeneration(UUID, java.util.Set, long)}.
-     * @throws UnsupportedOperationException always — this method exists only to
-     *         produce a clear compile-time deprecation and a loud runtime error
-     *         if any caller still references it.
-     */
-    @Deprecated(since = "1.0.0", forRemoval = true)
-    public java.util.Map<String, ComponentData> loadComponents(UUID uuid,
-            java.util.Set<String> componentNames) throws SQLException {
-        throw new UnsupportedOperationException(
-            "loadComponents() is deprecated and unsafe — it does not filter by component_generation. "
-            + "Use loadComponentsWithGeneration(uuid, names, generation) instead, where generation "
-            + "is the current component_generation from player_data.");
-    }
-
-    /**
-     * Upsert a single component: INSERT if not present, UPDATE if present.
-     *
-     * <p><b>DEPRECATED &amp; DANGEROUS.</b> This method has three correctness gaps:
-     * <ol>
-     *   <li>No {@code locked_by} / {@code fencing_token} validation — a stale
-     *       lock holder can write component rows that later override the fresh
-     *       full Blob on load.</li>
-     *   <li>No {@code generation} column written — the row would have
-     *       generation=0 (or NULL) and never match the current generation
-     *       filter on load, so it would be silently invisible — OR if a
-     *       previous valid row existed, it would corrupt the bitmap without
-     *       bumping version.</li>
-     *   <li>No {@code player_data.version} bump and no {@code component_bitmap}
-     *       update — the playerVersions map drifts out of sync, and the next
-     *       full Blob save CAS-fails with a stale-version conflict.</li>
-     * </ol>
-     *
-     * <p>Use {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map,
-     * String, long, long)} instead — it does SELECT FOR UPDATE + fencing
-     * validation + per-generation upsert + bitmap/version update all in one
-     * transaction.
-     *
-     * @deprecated since 1.0.0, for removal. Use
-     *             {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map, String, long, long)}.
-     * @throws UnsupportedOperationException always.
-     */
-    @Deprecated(since = "1.0.0", forRemoval = true)
-    public long upsertComponent(UUID uuid, String componentName, byte[] data, long checksum)
-            throws SQLException {
-        throw new UnsupportedOperationException(
-            "upsertComponent() is deprecated and unsafe — it has no fencing/generation/bitmap update. "
-            + "Use upsertComponentsIfLockHeld(uuid, componentsWithData, componentsWithChecksum, "
-            + "serverName, fencingToken, dirtyBits) instead.");
-    }
-
-    /**
-     * Upsert multiple components in a single transaction.
-     *
-     * <p><b>DEPRECATED &amp; DANGEROUS.</b> Although this overload validates
-     * {@code locked_by} + {@code fencing_token}, it still has two correctness gaps:
-     * <ol>
-     *   <li>It does NOT write the {@code generation} column on component rows —
-     *       rows would be written with generation=0 (or NULL) and never match
-     *       the current generation filter on load, so they would be invisible
-     *       — OR if a previous valid row existed at the current generation, it
-     *       would be overwritten with a wrong generation, corrupting the load
-     *       path.</li>
-     *   <li>It does NOT bump {@code player_data.version} and does NOT update
-     *       {@code component_bitmap} in the same transaction. The local
-     *       playerVersions map drifts out of sync with the DB, and components
-     *       that were just written are not marked as migrated in the bitmap —
-     *       so the next load would not even attempt to read them.</li>
-     * </ol>
-     *
-     * <p>Use {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map,
-     * String, long, long)} instead — it does SELECT FOR UPDATE + fencing
-     * validation + per-generation upsert + bitmap/version update all in one
-     * transaction.
-     *
-     * @deprecated since 1.0.0, for removal. Use
-     *             {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map, String, long, long)}.
-     * @throws UnsupportedOperationException always.
-     */
-    @Deprecated(since = "1.0.0", forRemoval = true)
-    public java.util.Map<String, Long> upsertComponentsBatch(UUID uuid,
-            java.util.Map<String, byte[]> componentsWithData,
-            java.util.Map<String, Long> componentsWithChecksum,
-            String serverName,
-            long fencingToken) throws SQLException {
-        throw new UnsupportedOperationException(
-            "upsertComponentsBatch() is deprecated and unsafe — it does not write generation "
-            + "or update player_data.version/component_bitmap. Use upsertComponentsIfLockHeld("
-            + "uuid, componentsWithData, componentsWithChecksum, serverName, fencingToken, "
-            + "dirtyBits) instead.");
     }
 
     /**

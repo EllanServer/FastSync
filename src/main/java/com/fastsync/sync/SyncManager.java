@@ -682,17 +682,9 @@ public class SyncManager {
 
         } catch (Exception e) {
         logger.log(Level.SEVERE, "Failed to load data for " + uuid, e);
-        // Release lock on error — use token version if we have a valid token
-        try {
-            if (fencingToken > 0) {
-                databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, lockSessionId);
-            } else {
-                databaseManager.releaseLock(uuid, config.getServerName());
-            }
-            notifyLockReleased(uuid);
-        } catch (SQLException ex) {
-            logger.log(Level.WARNING, "Failed to release lock after load error for " + uuid, ex);
-        }
+        // Release lock on error — fail-closed: require both fencingToken and lockSessionId.
+        // No tokenless release fallback (the 2-arg releaseLock was deleted).
+        releaseOwnedLockAndNotify(uuid, fencingToken, lockSessionId, "load error");
         return LoadResult.error(e.getMessage());
     }
     }
@@ -1075,40 +1067,9 @@ public class SyncManager {
             }
             playerVersions.remove(uuid);
             playersWithBaseline.remove(uuid);
-            // Release lock without saving — use token version if available
-            pendingSaveCount.incrementAndGet();
-            try {
-                asyncExecutor.execute(() -> {
-                    try {
-                        if (ft != null && ft > 0) {
-                            databaseManager.releaseLock(uuid, config.getServerName(), ft, lockSession);
-                        } else {
-                            databaseManager.releaseLock(uuid, config.getServerName());
-                        }
-                        notifyLockReleased(uuid);
-                        if (config.isDebug()) {
-                            logger.info("Released lock for " + uuid + " (never joined)");
-                        }
-                    } catch (SQLException e) {
-                        logger.log(Level.WARNING, "Failed to release lock for " + uuid, e);
-                    } finally {
-                        pendingSaveCount.decrementAndGet();
-                    }
-                });
-            } catch (java.util.concurrent.RejectedExecutionException e) {
-                // Executor shut down — release lock synchronously
-                pendingSaveCount.decrementAndGet();
-                try {
-                    if (ft != null && ft > 0) {
-                        databaseManager.releaseLock(uuid, config.getServerName(), ft, lockSession);
-                    } else {
-                        databaseManager.releaseLock(uuid, config.getServerName());
-                    }
-                    notifyLockReleased(uuid);
-                } catch (SQLException ex) {
-                    logger.log(Level.WARNING, "Failed to release lock for " + uuid + " (sync fallback)", ex);
-                }
-            }
+            // Release lock without saving — fail-closed: require both ft and lockSession.
+            // No tokenless release fallback (the 2-arg releaseLock was deleted).
+            releaseLockAsyncBestEffort(uuid, ft, lockSession, "pending but never joined");
             return;
         }
 
@@ -1152,7 +1113,7 @@ public class SyncManager {
                     // lock was acquired, fail the CAS, and release the lock
                     // without saving — losing the player's final state.
                     refreshVersionAndFencingToken(uuid, data);
-                    persistCollectedData(uuid, data, SaveKind.QUIT);
+                    persistCollectedData(uuid, data, SaveKind.QUIT, com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
                 } finally {
                     saveLock.unlock();
                     // Do NOT remove lock from map — prevents lock-object split if
@@ -1173,7 +1134,7 @@ public class SyncManager {
             saveLock.lock();
             try {
                 refreshVersionAndFencingToken(uuid, data);
-                persistCollectedData(uuid, data, SaveKind.QUIT);
+                persistCollectedData(uuid, data, SaveKind.QUIT, com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
             } finally {
                 saveLock.unlock();
                 playerVersions.remove(uuid);
@@ -1216,17 +1177,8 @@ public class SyncManager {
         }
         playerVersions.remove(uuid);
         playersWithBaseline.remove(uuid);
-        try {
-            if (ft != null && ft > 0) {
-                databaseManager.releaseLock(uuid, config.getServerName(), ft, lockSession);
-            } else {
-                databaseManager.releaseLock(uuid, config.getServerName());
-            }
-            notifyLockReleased(uuid);
-            logger.info("Released lock for " + uuid + " (never joined, sync fallback)");
-        } catch (SQLException e) {
-            logger.log(Level.WARNING, "Failed to release lock for " + uuid, e);
-        }
+        // Fail-closed: require both ft and lockSession. No tokenless release.
+        releaseOwnedLockAndNotify(uuid, ft, lockSession, "never joined, sync fallback");
         return;
     }
 
@@ -1277,7 +1229,7 @@ public class SyncManager {
             // Refresh version/fencingToken after acquiring lock — same rationale
             // as the async QUIT path: an in-flight save may have advanced the version.
             refreshVersionAndFencingToken(uuid, data);
-            persistCollectedData(uuid, data, SaveKind.QUIT);
+            persistCollectedData(uuid, data, SaveKind.QUIT, com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
         } finally {
             saveLock.unlock();
             playerVersions.remove(uuid);
@@ -2086,11 +2038,6 @@ public class SyncManager {
         return new SaveAllResult(total, success, failed, failures);
     }
 
-    /** Backward-compatible overload: defaults to BULK (keep lock, for /saveall command). */
-    public SaveAllResult saveAllOnlinePlayers() {
-        return saveAllOnlinePlayers(SaveKind.BULK);
-    }
-
     /**
      * Save a single player's data asynchronously (for periodic/death/world_save saves).
      *
@@ -2792,19 +2739,6 @@ public class SyncManager {
      *
      * @return SaveResult on success, null to fall back to full save
      */
-    private SaveResult persistComponentsOnly(UUID uuid, PlayerData data, SaveKind kind) {
-        // Backward-compatible overload: takes the snapshot inside the method.
-        // Callers on the save path should use the 4-arg overload and pass a
-        // snapshot taken BEFORE collectPlayerData, so the epoch protection
-        // covers the collect window too. This overload is kept for safety
-        // (any future caller that forgets the snapshot still gets serialize+
-        // DB-write window protection, just not collect-window protection).
-        com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot snapshot =
-            dirtyMask != null ? dirtyMask.snapshotDirty(uuid)
-                              : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
-        return persistComponentsOnly(uuid, data, kind, snapshot);
-    }
-
     /**
      * Component-only save with an explicit pre-collect dirty snapshot.
      *
@@ -3011,34 +2945,6 @@ public class SyncManager {
      *       attempt to acquire the lock while the player is still online on this server.</li>
      * </ul>
      */
-    private SaveResult persistCollectedData(UUID uuid, PlayerData data, SaveKind kind) {
-        // For online saves (releaseLock=false), the dirty mask snapshot MUST be
-        // taken BEFORE collectPlayerData() runs — otherwise a dirty signal
-        // produced by an event between collect and DB commit would already be
-        // in the mask when we snapshot, and clearDirty(snapshot) would
-        // correctly preserve it (epoch mismatch). But a signal produced
-        // BEFORE collect started but whose Bukkit event already fired would
-        // be captured in the pre-collect snapshot and could be cleared.
-        //
-        // The correct ordering is: snapshot dirty → collect PlayerData →
-        // serialize → DB write → clearDirty(snapshot). Any markDirty that
-        // arrives after the snapshot (i.e. during collect/serialize/DB write)
-        // bumps the epoch and is preserved.
-        //
-        // For QUIT/SHUTDOWN (releaseLock=true), the player is leaving and will
-        // not produce more changes, so clearAll() is safe and correct.
-        //
-        // This overload takes the snapshot inside the method — it provides
-        // epoch protection for changes during serialize/DB write, but NOT for
-        // changes during collectPlayerData. Callers that have already taken
-        // a pre-collect snapshot should use the 4-arg overload below.
-        com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot =
-            (dirtyMask != null && !kind.releaseLock)
-                ? dirtyMask.snapshotDirty(uuid)
-                : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
-        return persistCollectedData(uuid, data, kind, preSaveSnapshot);
-    }
-
     /**
      * Full-Blob save with an explicit pre-collect dirty snapshot.
      *
