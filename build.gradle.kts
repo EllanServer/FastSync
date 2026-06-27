@@ -1,4 +1,5 @@
 import org.gradle.api.file.DuplicatesStrategy
+import java.time.Duration
 
 plugins {
     java
@@ -138,7 +139,7 @@ val stressTest = tasks.register<Test>("stressTest") {
         includeTestsMatching("com.fastsync.stress.*")
     }
     // Stress tests are slow + need Docker; give them room.
-    timeout.set(java.time.Duration.ofMinutes(30))
+    timeout.set(Duration.ofMinutes(30))
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = true
