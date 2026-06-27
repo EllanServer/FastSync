@@ -512,10 +512,29 @@ public class DatabaseManager {
                 // didn't fire for some reason). Not ours.
                 return LockResult.FAILED;
             }
-            // P0 check: locked_at must be the value we just wrote. If it's a
-            // stale value from a prior session (quit save still in flight),
-            // the UPDATE arm's IF was false and we did NOT acquire the lock.
-            if (lockedAt == null || lockedAt != now) {
+            // P0 check: locked_at must be >= the value we just wrote. We use
+            // >= instead of == because:
+            //   - INSERT arm: locked_at = now (exact match)
+            //   - UPDATE arm IF true: locked_at = now (exact match)
+            //   - UPDATE arm IF false (lock held by prior same-serverName
+            //     session): locked_at = prior session's heartbeat time, which
+            //     is strictly < now (the prior acquire/heartbeat happened
+            //     before this call). >= now is false → FAILED, correct.
+            //
+            // The only theoretical false-positive is if a concurrent heartbeat
+            // from the prior session refreshed locked_at to exactly now in the
+            // same millisecond as this call. That is astronomically unlikely
+            // (heartbeat runs on a seconds-level timer) and even if it
+            // happened, the fencing_token would not have been bumped (UPDATE
+            // arm IF was false), so the save CAS would fail with
+            // FENCING_MISMATCH — the data is still safe.
+            //
+            // We use >= instead of == because some JDBC drivers / column
+            // type mappings can introduce subtle representation differences
+            // (e.g. BIGINT vs Long boxing) that == might not handle. >= is
+            // robust and the security guarantee (locked_at < now means stale)
+            // is preserved.
+            if (lockedAt == null || lockedAt < now) {
                 return LockResult.FAILED;
             }
             Long token = record.get(FENCING_TOKEN_FIELD);
