@@ -120,7 +120,9 @@ tasks.withType<Test>().configureEach {
     // Round 16: exclude `stress` tag from the default test task — these tests
     // need Docker + several minutes and are run by the dedicated stress.yml
     // workflow. The `stressTest` task below re-includes them.
-    excludeTags("stress")
+    filter {
+        excludeTestsMatching("com.fastsync.stress.*")
+    }
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = true
@@ -132,9 +134,11 @@ val stressTest = tasks.register<Test>("stressTest") {
     group = "verification"
     description = "Runs the @Tag(\"stress\") tests (requires Docker)."
     useJUnitPlatform()
-    includeTags("stress")
+    filter {
+        includeTestsMatching("com.fastsync.stress.*")
+    }
     // Stress tests are slow + need Docker; give them room.
-    timeout.set(java.time.Duration.ofMinutes(30))
+    timeout = java.time.Duration.ofMinutes(30)
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = true
