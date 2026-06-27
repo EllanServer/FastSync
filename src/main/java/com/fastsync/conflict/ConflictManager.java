@@ -19,7 +19,11 @@ import java.util.logging.Logger;
  * - The manager decides what to do with the stale data based on config:
  *   "snapshot": Save the stale data as a conflict snapshot for manual recovery
  *   "discard": Simply discard the stale data (the newer DB version wins)
- *   "overwrite": Force overwrite (dangerous, only for specific scenarios)
+ *
+ * <p>Clean-slate: the dangerous "overwrite" recovery strategy was removed. It
+ * let an online save clobber a newer DB version, which is exactly the data-loss
+ * case optimistic concurrency exists to prevent. Manual recovery of stale data
+ * should go through the offline snapshot tool, not the live save path.
  *
  * In all cases, the lock is released so other servers can proceed.
  */
@@ -27,18 +31,16 @@ public class ConflictManager {
 
     public enum RecoveryStrategy {
         SNAPSHOT,   // Save stale data as a conflict snapshot
-        DISCARD,    // Discard stale data (newer DB version wins)
-        OVERWRITE;  // Force overwrite (dangerous)
+        DISCARD;    // Discard stale data (newer DB version wins)
 
         /**
-         * Parse a config string ("snapshot", "discard", "overwrite") into a
+         * Parse a config string ("snapshot", "discard") into a
          * {@link RecoveryStrategy}. Unknown/null values fall back to SNAPSHOT.
          */
         public static RecoveryStrategy fromConfig(String value) {
             if (value == null) return SNAPSHOT;
             return switch (value.toLowerCase(java.util.Locale.ROOT)) {
                 case "discard" -> DISCARD;
-                case "overwrite" -> OVERWRITE;
                 default -> SNAPSHOT;
             };
         }
@@ -73,10 +75,6 @@ public class ConflictManager {
         switch (strategy) {
             case SNAPSHOT -> saveConflictSnapshot(uuid, staleData, expectedVersion, actualVersion);
             case DISCARD -> logger.info("[Conflict] Stale data for " + uuid + " discarded. DB version " + actualVersion + " preserved.");
-            case OVERWRITE -> {
-                // This is handled by the caller using forceSaveData
-                logger.warning("[Conflict] OVERWRITE strategy requested for " + uuid + " - caller must force-save.");
-            }
         }
     }
 

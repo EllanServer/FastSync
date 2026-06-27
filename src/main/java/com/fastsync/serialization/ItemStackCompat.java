@@ -29,20 +29,6 @@ public class ItemStackCompat {
     private ItemStackCompat() {}
 
     /**
-     * Whether the Paper native NBT byte[] serialization API is available.
-     *
-     * <p>Always {@code true} on the supported target (Paper 1.21.11+). Retained
-     * as a constant internal flag rather than a runtime probe, since the plugin
-     * no longer carries a Bukkit fallback path — if the API is missing the
-     * class will fail to load with a {@link NoSuchMethodError} at startup, by
-     * design. The {@link FastSync} startup / status code no longer branches on
-     * this value.
-     */
-    public static boolean isPaperNativeAvailable() {
-        return true;
-    }
-
-    /**
      * Serialize an ItemStack to byte[].
      *
      * @param item the ItemStack to serialize ({@code null} or air returns an

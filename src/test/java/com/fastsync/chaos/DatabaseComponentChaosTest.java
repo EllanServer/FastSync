@@ -346,8 +346,8 @@ class DatabaseComponentChaosTest {
     //     "new player, no baseline, component-only save, then crash" scenario
     //     the playersWithBaseline gate in SyncManager is designed to prevent.
     //     This DB-level test confirms that if component rows exist without a
-    //     non-empty Blob baseline, loadData() returns EMPTY — which is exactly
-    //     the orphan state the gate protects against.
+    //     non-empty Blob baseline, loadPlayerDataRow() returns hasData()=false —
+    //     which is exactly the orphan state the gate protects against.
     //   - testComponentSaveFollowedByQuitFullSave_blobWins: verifies invariant
     //     #7 from the review — after a component save writes INVENTORY at
     //     generation G, a subsequent QUIT full Blob save bumps to G+1 and
@@ -410,13 +410,14 @@ class DatabaseComponentChaosTest {
      *   <li>Bypass the gate (this is a DB-level test, not SyncManager) and
      *       write a component row directly via upsertComponentsIfLockHeld.</li>
      *   <li>Simulate crash: do NOT write a full Blob, do NOT release lock.</li>
-     *   <li>Reload via loadData(uuid) — the load path used by SyncManager.</li>
+     *   <li>Reload via loadPlayerDataRow(uuid) — the load path used by SyncManager.</li>
      * </ol>
      *
-     * <p>Expected: loadData() returns VersionedData.EMPTY because player_data.data
-     * is null/empty. The component row exists in player_component but is NOT
-     * loaded by loadData() (which only reads the Blob). This is the exact
-     * "orphaned component rows" state the gate prevents.
+     * <p>Expected: loadPlayerDataRow() returns a row whose hasData() is false
+     * because player_data.data is null/empty. The component row exists in
+     * player_component but is NOT loaded by loadPlayerDataRow() (which only
+     * reads the Blob). This is the exact "orphaned component rows" state the
+     * gate prevents.
      *
      * <p>The test confirms the gate is necessary: without it, the component
      * row would be silently orphaned and the player's state lost.
@@ -447,16 +448,16 @@ class DatabaseComponentChaosTest {
         // The lock will expire naturally; we just don't write the Blob.
 
         // Now reload via the same path SyncManager uses.
-        var loaded = databaseManager.loadData(uuid);
+        var loaded = databaseManager.loadPlayerDataRow(uuid);
         assertFalse(loaded.hasData(),
-            "loadData() must return EMPTY when player_data.data is null — "
+            "loadPlayerDataRow() must return hasData()=false when player_data.data is null — "
             + "this is the orphan state the playersWithBaseline gate prevents. "
             + "If this assertion ever fails, the gate's premise is broken.");
 
-        // The component row DOES exist in player_component, but loadData()
+        // The component row DOES exist in player_component, but loadPlayerDataRow()
         // does not look there. This is by design — component overlay only
-        // happens after loadData() succeeds AND component_bitmap != 0.
-        // Since loadData() returned EMPTY, SyncManager treats the player as
+        // happens after loadPlayerDataRow() returns data AND component_bitmap != 0.
+        // Since hasData() is false, SyncManager treats the player as
         // brand new and the component row is orphaned.
         long bitmap = databaseManager.getComponentBitmap(uuid);
         assertEquals(1L, bitmap,
@@ -468,7 +469,7 @@ class DatabaseComponentChaosTest {
             uuid, java.util.Set.of("INVENTORY"), gen);
         assertFalse(orphanedComponents.isEmpty(),
             "The component row IS in the table — it's just orphaned because "
-            + "loadData() returns EMPTY and the load path never gets to the "
+            + "loadPlayerDataRow() returns hasData()=false and the load path never gets to the "
             + "component overlay step. This proves the gate is necessary.");
     }
 
@@ -522,7 +523,7 @@ class DatabaseComponentChaosTest {
         // Step 3: Simulate next login — load data and try component overlay
         // at the current generation. The stale INVENTORY component at
         // generation 0 must NOT be returned.
-        var loaded = databaseManager.loadData(uuid);
+        var loaded = databaseManager.loadPlayerDataRow(uuid);
         assertTrue(loaded.hasData(), "Full Blob should be loadable");
         assertEquals(finalChecksum, loaded.checksum(), "Loaded Blob should be the QUIT save's Blob");
 

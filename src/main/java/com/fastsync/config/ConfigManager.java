@@ -2,22 +2,20 @@ package com.fastsync.config;
 
 import net.momirealms.sparrow.yaml.SparrowYaml;
 import net.momirealms.sparrow.yaml.YamlDocument;
-import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
  * Manages FastSync configuration loading and access.
  *
  * <p>Configuration is loaded from {@code config.yml} using the sparrow-yaml
- * library (which preserves comments and supports config version migration). If
- * sparrow-yaml fails to parse the file for any reason, the loader transparently
- * falls back to Bukkit's {@link FileConfiguration} as a safety net so the plugin
- * can still start.</p>
+ * library (which preserves comments). Clean-slate: there is no Bukkit
+ * {@link FileConfiguration} fallback — a parse failure is a hard error and the
+ * plugin refuses to start. The bundled sample values are additionally vetted by
+ * {@link #validateProductionSafety()} before the database is opened.</p>
  */
 public class ConfigManager {
 
@@ -44,6 +42,11 @@ public class ConfigManager {
     private long maxLifetime;
     private long leakDetectionThreshold;
     private String dbParameters;
+    // Explicit opt-in for plaintext JDBC to a non-localhost host. Default
+    // false: validateProductionSafety() refuses to start when sslMode=DISABLED
+    // is used against a remote DB. Operators on a fully trusted LAN can set
+    // database.allow-insecure-remote: true to downgrade that to a warning.
+    private boolean allowInsecureRemote;
 
     // Redis
     private boolean redisEnabled;
@@ -96,7 +99,6 @@ public class ConfigManager {
     private boolean syncFlight;
     private boolean syncPDC;
     private boolean syncLocation;
-    private boolean syncLockedMaps;
 
     // PDC strategy config
     private String pdcMode;                    // off | safe-all-paper | registered-only
@@ -146,7 +148,7 @@ public class ConfigManager {
     private boolean logTiming;
 
     // Dynamo-style conflict recovery
-    private String conflictRecoveryStrategy; // "snapshot", "discard", "overwrite"
+    private String conflictRecoveryStrategy; // "snapshot", "discard"
     private boolean verifyChecksum;
     private int latencyWindowSize;
     private boolean latencyTrackingEnabled;
@@ -186,24 +188,21 @@ public class ConfigManager {
         plugin.saveDefaultConfig();
         File configFile = new File(plugin.getDataFolder(), "config.yml");
 
-        // Primary path: parse with sparrow-yaml (preserves comments, typed access)
-        YamlDocument loaded = null;
+        // Single path: parse with sparrow-yaml (preserves comments, typed access).
+        // Clean-slate: there is NO Bukkit FileConfiguration fallback. A parse
+        // failure is a hard error — the plugin cannot start with an unreadable
+        // config. Previously a silent Bukkit fallback masked schema drift and
+        // old-config migration residue; refusing to load surfaces it instead.
+        YamlDocument loaded;
         try {
             loaded = yaml.load(configFile);
         } catch (IOException e) {
-            plugin.getLogger().log(Level.SEVERE,
-                "Failed to parse config.yml with sparrow-yaml. Falling back to Bukkit config.", e);
+            throw new RuntimeException("Failed to parse config.yml with sparrow-yaml: "
+                + e.getMessage(), e);
         }
         this.doc = loaded;
 
-        // Safety net: if sparrow-yaml could not parse the file, use Bukkit's FileConfiguration
-        ConfigSource source;
-        if (loaded != null) {
-            source = new SparrowConfigSource(loaded);
-        } else {
-            source = new BukkitConfigSource(plugin.getConfig());
-        }
-        assignValues(source);
+        assignValues(new SparrowConfigSource(loaded));
     }
 
     public void reload() {
@@ -212,9 +211,88 @@ public class ConfigManager {
     }
 
     /**
+     * Refuses to let the plugin start when the loaded config still carries the
+     * insecure bundled sample values. This is a clean-slate production guard:
+     * the shipped {@code config.yml} uses {@code root/password} and
+     * {@code sslMode=DISABLED} as *samples*, and silently running with them in
+     * production is a footgun (open DB creds, plaintext DB traffic over the
+     * network).
+     *
+     * <p>Rules (any violation throws {@link RuntimeException}):
+     * <ul>
+     *   <li>{@code database.username == "root"} <em>and</em>
+     *       {@code database.password == "password"} — both still the sample
+     *       defaults. The operator has not configured real credentials.</li>
+     *   <li>{@code database.host} is not localhost/loopback <em>and</em> the
+     *       JDBC {@code parameters} contain {@code sslMode=DISABLED} —
+     *       plaintext auth over the network. Suppressed only when the operator
+     *       explicitly sets {@code database.allow-insecure-remote: true}.</li>
+     * </ul>
+     *
+     * <p>Called from {@link com.fastsync.FastSync#onEnable()} after
+     * {@link #load()} succeeds and before the database is opened.
+     */
+    public void validateProductionSafety() {
+        // 1) Sample credentials still in place. Checking BOTH fields avoids
+        //    false positives for an operator who legitimately uses root with a
+        //    real password, or "password" as a placeholder while changing the
+        //    username.
+        if ("root".equals(dbUsername) && "password".equals(dbPassword)) {
+            throw new RuntimeException(
+                "Insecure default database credentials detected (username='root', "
+                    + "password='password'). Edit database.username and "
+                    + "database.password in config.yml to real values before "
+                    + "starting FastSync.");
+        }
+
+        // 2) Plaintext JDBC to a non-loopback host. sslMode=DISABLED (and its
+        //    deprecated alias useSSL=false) is fine for a same-machine DB;
+        //    over the network it leaks credentials.
+        if (!isLoopbackHost(dbHost) && hasPlaintextSsl(dbParameters)) {
+            if (allowInsecureRemote) {
+                logger.warning("[Config] database.allow-insecure-remote=true: "
+                    + "starting with plaintext DB TLS (sslMode=DISABLED / "
+                    + "useSSL=false) against non-localhost host '"
+                    + dbHost + "'. This sends DB credentials in plaintext. "
+                    + "Use sslMode=REQUIRED or VERIFY_IDENTITY in production.");
+            } else {
+                throw new RuntimeException(
+                    "Refusing to start: database.host='" + dbHost + "' is not "
+                        + "loopback and database.parameters disables DB TLS "
+                        + "(sslMode=DISABLED / useSSL=false). Set "
+                        + "sslMode=REQUIRED (or VERIFY_IDENTITY) in "
+                        + "database.parameters, or explicitly set "
+                        + "database.allow-insecure-remote: true only if you are "
+                        + "on a fully trusted network.");
+            }
+        }
+    }
+
+    private static boolean isLoopbackHost(String host) {
+        if (host == null) return false;
+        String h = host.trim().toLowerCase(java.util.Locale.ROOT);
+        return h.isEmpty() || h.equals("localhost")
+            || h.equals("127.0.0.1") || h.equals("::1") || h.equals("[::1]");
+    }
+
+    private static boolean hasPlaintextSsl(String parameters) {
+        if (parameters == null || parameters.isEmpty()) return false;
+        // Match the whole parameter, case-insensitively, so sslMode=REQUIRED /
+        // VERIFY_IDENTITY and useSSL=true do not match.
+        String p = parameters.toLowerCase(java.util.Locale.ROOT);
+        for (String token : p.split("&")) {
+            String t = token.trim();
+            if (t.equals("sslmode=disabled") || t.equals("usessl=false")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean isAllowInsecureRemote() { return allowInsecureRemote; }
+
+    /**
      * Reads every configuration value through the provided {@link ConfigSource}.
-     * This keeps the sparrow-yaml and Bukkit fallback paths identical without
-     * duplicating the field assignments.
      */
     private void assignValues(ConfigSource source) {
         // Server
@@ -239,8 +317,12 @@ public class ConfigManager {
         idleTimeout = source.getLong("database.idle-timeout", 300000);
         maxLifetime = source.getLong("database.max-lifetime", 1800000);
         leakDetectionThreshold = source.getLong("database.leak-detection-threshold", 60000);
+        // Default mirrors the bundled config.yml exactly so the
+        // validateProductionSafety() sslMode check sees the same value whether
+        // the operator removed the key or left the sample value.
         dbParameters = source.getString("database.parameters",
-            "useUnicode=true&characterEncoding=UTF-8");
+            "sslMode=DISABLED&useUnicode=true&characterEncoding=UTF-8");
+        allowInsecureRemote = source.getBoolean("database.allow-insecure-remote", false);
 
         // Redis
         redisEnabled = source.getBoolean("redis.enabled", false);
@@ -347,11 +429,6 @@ public class ConfigManager {
         syncFlight = source.getBoolean("sync.sync-flight", true);
         syncPDC = source.getBoolean("sync.sync-pdc", true);
         syncLocation = source.getBoolean("sync.sync-location", false);
-        // sync-locked-maps is reserved / not implemented. Default MUST be false
-        // to match the bundled config.yml and to avoid the status command
-        // showing "Enabled" for a feature that does nothing. Old config files
-        // missing this key previously got true, which was misleading.
-        syncLockedMaps = source.getBoolean("sync.sync-locked-maps", false);
 
         // PDC strategy
         pdcMode = source.getString("pdc.mode", "registered-only");
@@ -487,7 +564,6 @@ public class ConfigManager {
     public boolean isSyncFlight() { return syncFlight; }
     public boolean isSyncPDC() { return syncPDC; }
     public boolean isSyncLocation() { return syncLocation; }
-    public boolean isSyncLockedMaps() { return syncLockedMaps; }
 
     public String getPdcMode() { return pdcMode; }
     public boolean isPdcClearBeforeRestore() { return pdcClearBeforeRestore; }
@@ -539,9 +615,9 @@ public class ConfigManager {
     // ==================== Internal config access abstraction ====================
 
     /**
-     * Minimal read-only abstraction over a configuration source, so the value
-     * assignment logic can be shared between the sparrow-yaml primary path and
-     * the Bukkit fallback path.
+     * Minimal read-only abstraction over the configuration source (sparrow-yaml
+     * {@link YamlDocument}). Dotted keys are split into the varargs route that
+     * sparrow-yaml expects.
      */
     private interface ConfigSource {
         String getString(String key, String def);
@@ -549,12 +625,6 @@ public class ConfigManager {
         long getLong(String key, long def);
         boolean getBoolean(String key, boolean def);
         java.util.List<String> getStringList(String key);
-        /**
-         * Returns {@code true} only if a value is explicitly present at the
-         * given path in the user's config (i.e. not merely a default). This is
-         * the semantics required by old-config migration detection.
-         */
-        boolean contains(String key);
     }
 
     /**
@@ -602,62 +672,9 @@ public class ConfigManager {
                     route(key));
                 return list == null ? java.util.Collections.emptyList() : list;
             } catch (Exception e) {
-                // Non-list value at path (or parse failure) -> treat as empty list,
-                // mirroring Bukkit's getStringList() behavior.
+                // Non-list value at path (or parse failure) -> treat as empty list.
                 return java.util.Collections.emptyList();
             }
-        }
-
-        @Override
-        public boolean contains(String key) {
-            // sparrow-yaml does not merge config defaults, so a non-null node
-            // means the key is explicitly present in the user's file.
-            return document.getNodeOrNull(route(key)) != null;
-        }
-    }
-
-    /**
-     * {@link ConfigSource} backed by Bukkit's {@link FileConfiguration}. Used
-     * only as a safety net when sparrow-yaml cannot parse the file.
-     */
-    private static final class BukkitConfigSource implements ConfigSource {
-        private final FileConfiguration config;
-
-        BukkitConfigSource(FileConfiguration config) {
-            this.config = config;
-        }
-
-        @Override
-        public String getString(String key, String def) {
-            return config.getString(key, def);
-        }
-
-        @Override
-        public int getInt(String key, int def) {
-            return config.getInt(key, def);
-        }
-
-        @Override
-        public long getLong(String key, long def) {
-            return config.getLong(key, def);
-        }
-
-        @Override
-        public boolean getBoolean(String key, boolean def) {
-            return config.getBoolean(key, def);
-        }
-
-        @Override
-        public java.util.List<String> getStringList(String key) {
-            return config.getStringList(key);
-        }
-
-        @Override
-        public boolean contains(String key) {
-            // isSet() returns true only when the key is explicitly present in
-            // the user's file (not from the bundled default config), which is
-            // what migration detection needs.
-            return config.isSet(key);
         }
     }
 }

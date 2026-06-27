@@ -94,8 +94,9 @@ public class PlayerDataSerializer {
         //                               (may be empty list = "no effects")
         // potionEffectsPresent=false → data.potionEffects was null at serialize
         //                               time (not collected)
-        // field absent               → legacy payload, preserve null (do not
-        //                               touch target effects for backward compat)
+        // The flag is ALWAYS written, so its absence on read is treated as an
+        // unsupported/legacy payload (deserialize throws) rather than silently
+        // preserving a stale default.
         if (data.getPotionEffects() != null) {
             root.putBoolean("potionEffectsPresent", true);
             ListTag effectList = NBT.createList();
@@ -274,37 +275,37 @@ public class PlayerDataSerializer {
         playerData.setAllowFlight(root.getBoolean("allowFlight"));
 
         // Potion effects
-        // See serialize() for the presence-flag rationale:
+        // The presence flag is ALWAYS written by the current serializer (true
+        // or false), so an absent flag means the Blob was not produced by the
+        // current code path. Clean-slate: treat that as an unsupported/corrupt
+        // payload rather than silently preserving a legacy default, which could
+        // mask a stale effect set on the target server.
         //   potionEffectsPresent=true  → set effects (may be empty list = "no effects")
         //   potionEffectsPresent=false → set null (not collected)
-        //   field absent               → legacy payload, leave whatever the
-        //                                default is (null) — do not touch target
-        if (root.get("potionEffectsPresent") != null) {
-            if (root.getBoolean("potionEffectsPresent")) {
-                List<PlayerData.PotionEffectData> effects = new ArrayList<>();
-                if (root.get("potionEffects") instanceof ListTag effectList) {
-                    for (int i = 0; i < effectList.size(); i++) {
-                        if (effectList.get(i) instanceof CompoundTag effectTag) {
-                            String typeKey = effectTag.getString("type");
-                            int duration = effectTag.getInt("duration");
-                            int amplifier = effectTag.getInt("amplifier");
-                            byte flags = effectTag.getByte("flags");
-                            effects.add(new PlayerData.PotionEffectData(typeKey, duration, amplifier,
-                                (flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0));
-                        }
+        if (root.get("potionEffectsPresent") == null) {
+            throw new IOException("Missing 'potionEffectsPresent' flag — unsupported/legacy payload");
+        }
+        if (root.getBoolean("potionEffectsPresent")) {
+            List<PlayerData.PotionEffectData> effects = new ArrayList<>();
+            if (root.get("potionEffects") instanceof ListTag effectList) {
+                for (int i = 0; i < effectList.size(); i++) {
+                    if (effectList.get(i) instanceof CompoundTag effectTag) {
+                        String typeKey = effectTag.getString("type");
+                        int duration = effectTag.getInt("duration");
+                        int amplifier = effectTag.getInt("amplifier");
+                        byte flags = effectTag.getByte("flags");
+                        effects.add(new PlayerData.PotionEffectData(typeKey, duration, amplifier,
+                            (flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0));
                     }
                 }
-                // Explicitly set, even if effects is empty — empty means
-                // "clear all target effects" on apply.
-                playerData.setPotionEffects(effects);
-            } else {
-                // potionEffectsPresent=false: data was null at serialize time
-                playerData.setPotionEffects(null);
             }
+            // Explicitly set, even if effects is empty — empty means
+            // "clear all target effects" on apply.
+            playerData.setPotionEffects(effects);
+        } else {
+            // potionEffectsPresent=false: data was null at serialize time
+            playerData.setPotionEffects(null);
         }
-        // else: legacy payload without potionEffectsPresent. Leave
-        // playerData.potionEffects at its default (null) — preserves
-        // backward compat with Blobs written before this flag existed.
 
         // Advancements
         if (root.get("advancements") instanceof CompoundTag advancementsTag) {
@@ -527,7 +528,9 @@ public class PlayerDataSerializer {
                 //
                 // offhandPresent=true  → offhand field is meaningful (may be null/empty)
                 // offhandPresent=false → offhand was explicitly cleared to null
-                // (field absent)       → legacy baseline Blob path; do not touch offhand
+                // The flag is ALWAYS written; an absent flag on read is treated
+                // as a corrupt/unsupported component (deserializeComponentFields
+                // throws) rather than silently preserving a stale baseline offhand.
                 if (data.getOffhand() != null) {
                     c.putBoolean("offhandPresent", true);
                     c.putByteArray("offhand", ItemStackCompat.serialize(data.getOffhand()));
@@ -679,18 +682,22 @@ public class PlayerDataSerializer {
                 // flag, a player who cleared their offhand would have no offhand
                 // field written, and the baseline Blob's stale offhand item
                 // would silently persist on next load.
-                if (c.get("offhandPresent") != null) {
-                    if (c.getBoolean("offhandPresent")) {
-                        data.setOffhand(ItemStackCompat.deserialize(c.getByteArray("offhand")));
-                    } else {
-                        // Explicit empty state — clear the offhand slot.
-                        data.setOffhand(null);
-                    }
+                //
+                // The current serializer ALWAYS writes offhandPresent (true or
+                // false), so an absent flag means the component was not produced
+                // by the current code path. Clean-slate: treat that as a corrupt
+                // component rather than silently preserving the baseline Blob's
+                // offhand (which could re-apply a stale item the source cleared).
+                if (c.get("offhandPresent") == null) {
+                    throw new IOException("INVENTORY component missing 'offhandPresent' flag "
+                        + "— unsupported/legacy component payload");
                 }
-                // else: legacy payload without offhandPresent. Leave data.offhand
-                // untouched so the baseline Blob's offhand (if any) is preserved
-                // — this maintains backward compatibility with components written
-                // before the offhandPresent flag was introduced.
+                if (c.getBoolean("offhandPresent")) {
+                    data.setOffhand(ItemStackCompat.deserialize(c.getByteArray("offhand")));
+                } else {
+                    // Explicit empty state — clear the offhand slot.
+                    data.setOffhand(null);
+                }
             }
             case "ENDER_CHEST" -> {
                 if (c.get("enderChest") instanceof ListTag ec) data.setEnderChest(fromItemStackList(ec));

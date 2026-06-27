@@ -142,7 +142,7 @@ class DatabaseManagerTest {
         // Save with newer data, using the current DB version as expectedVersion
         byte[] data2 = new byte[]{4, 5, 6};
         long checksum2 = DatabaseManager.computeChecksum(data2);
-        VersionedData current = databaseManager.loadData(uuid);
+        DatabaseManager.PlayerDataRow current = databaseManager.loadPlayerDataRow(uuid);
         assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data2, checksum2, current.version(), lock2.fencingToken(), "server-b", "session-b"));
 
         // Now the original server tries to write with stale version 0
@@ -153,7 +153,7 @@ class DatabaseManagerTest {
         assertFalse(saved, "Stale version write should be rejected (Dynamo OCC)");
 
         // Verify DB still has the newer data
-        VersionedData loaded = databaseManager.loadData(uuid);
+        DatabaseManager.PlayerDataRow loaded = databaseManager.loadPlayerDataRow(uuid);
         assertArrayEquals(data2, loaded.data(), "DB should retain the newer data");
     }
 
@@ -172,12 +172,12 @@ class DatabaseManagerTest {
         LockResult lockB = databaseManager.acquireLock(uuid, "server-b", "session-b");
         byte[] dataB = new byte[]{4, 5, 6};
         long checksumB = DatabaseManager.computeChecksum(dataB);
-        VersionedData current = databaseManager.loadData(uuid);
+        DatabaseManager.PlayerDataRow current = databaseManager.loadPlayerDataRow(uuid);
         assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, dataB, checksumB, current.version(), lockB.fencingToken(), "server-b", "session-b"));
 
         // Server A (token 1) tries to write again with the current version —
         // should still be rejected because the stored fencing token (2) > lockA's token (1)
-        VersionedData afterB = databaseManager.loadData(uuid);
+        DatabaseManager.PlayerDataRow afterB = databaseManager.loadPlayerDataRow(uuid);
         byte[] dataA2 = new byte[]{7, 8, 9};
         long checksumA2 = DatabaseManager.computeChecksum(dataA2);
         boolean saved = databaseManager.saveDataKeepLockClearComponents(uuid, dataA2, checksumA2, afterB.version(), lockA.fencingToken(), "server-a", "session-a");
@@ -193,7 +193,7 @@ class DatabaseManagerTest {
         LockResult lock = databaseManager.acquireLock(uuid, "server-a", "session-a");
         assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data, checksum, 0, lock.fencingToken(), "server-a", "session-a"));
 
-        VersionedData loaded = databaseManager.loadData(uuid);
+        DatabaseManager.PlayerDataRow loaded = databaseManager.loadPlayerDataRow(uuid);
         assertArrayEquals(data, loaded.data());
         assertEquals(1, loaded.version(), "Version should be incremented to 1 after save");
         assertTrue(loaded.fencingToken() >= lock.fencingToken(),

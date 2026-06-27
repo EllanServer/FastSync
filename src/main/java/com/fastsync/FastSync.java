@@ -78,7 +78,28 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         // Initialize config
         saveDefaultConfig();
         configManager = new ConfigManager(this);
-        configManager.load();
+        try {
+            configManager.load();
+        } catch (RuntimeException e) {
+            // Clean-slate: config parse failure is a hard error (no Bukkit
+            // fallback). Fail startup explicitly rather than letting the
+            // RuntimeException propagate into Bukkit's loader.
+            getLogger().log(Level.SEVERE, "Failed to load config.yml — refusing to start: " + e.getMessage(), e);
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
+        // Validate insecure default configuration before touching the DB.
+        // Clean-slate: the bundled config ships sample (root/password,
+        // sslMode=DISABLED) values; running with those in production is a
+        // footgun. Fail startup unless the operator has explicitly opted in.
+        try {
+            configManager.validateProductionSafety();
+        } catch (RuntimeException e) {
+            getLogger().log(Level.SEVERE, "Refusing to start: " + e.getMessage(), e);
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
 
         // Initialize database
         databaseManager = new DatabaseManager(getLogger(), configManager);

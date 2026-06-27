@@ -43,6 +43,15 @@ database:
   # encrypted + verified). Avoid bare useSSL= which is deprecated.
   parameters: "sslMode=DISABLED&useUnicode=true&characterEncoding=UTF-8"
 
+  # Production safety: the plugin refuses to start when database.host is not
+  # loopback (localhost / 127.0.0.1 / ::1) AND parameters contain
+  # sslMode=DISABLED, because that sends DB credentials in plaintext over the
+  # network. Set this to true ONLY on a fully trusted LAN where you accept
+  # that risk; otherwise switch parameters to sslMode=REQUIRED or
+  # VERIFY_IDENTITY. The bundled root/password sample is also rejected at
+  # startup regardless of this flag.
+  allow-insecure-remote: false
+
 # ------------------------------------------------------------
 # Redis Settings (for cross-server lock coordination via pub/sub)
 # ------------------------------------------------------------
@@ -193,7 +202,6 @@ sync:
     require-same-world-name: true   # World name must match (avoid cross-world teleport)
     require-same-world-uuid: true   # World UUID must match (prevent same-name different-world)
     fallback-to-spawn: true         # If validation fails, teleport to spawn instead
-  sync-locked-maps: false          # Reserved / not implemented. Map item and map view data sync is not yet wired into collectPlayerData/applyPlayerData.
 
   # Save on death
   save-on-death: false
@@ -330,7 +338,8 @@ conflict:
   # Recovery strategy when a write conflict is detected:
   #   "snapshot" - Save the stale data as a conflict snapshot for manual recovery (recommended)
   #   "discard"  - Discard the stale data (the newer DB version is kept)
-  #   "overwrite" - Force overwrite the newer data (DANGEROUS - can cause data loss)
+  # The dangerous "overwrite" option was removed; recover stale data via the
+  # offline snapshot tool instead of clobbering a newer DB version online.
   recovery-strategy: "snapshot"
 
   # Whether to verify data checksum on load (detects database corruption)

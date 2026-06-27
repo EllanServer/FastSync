@@ -14,7 +14,10 @@ database:
   idle-timeout: 300000
   max-lifetime: 1800000
   leak-detection-threshold: 60000
-  parameters: "useSSL=false&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&allowPublicKeyRetrieval=true"
+  parameters: "sslMode=DISABLED&useUnicode=true&characterEncoding=UTF-8&allowPublicKeyRetrieval=true"
+  # docker-compose internal network: mysql service is non-loopback, so the
+  # production safety guard requires this explicit opt-in for plaintext TLS.
+  allow-insecure-remote: true
 
 redis:
   enabled: true
@@ -45,7 +48,6 @@ sync:
   sync-flight: true
   sync-pdc: true
   sync-location: false
-  sync-locked-maps: true
 
   lock-timeout: 30
   lock-retry-interval-ms: 1000

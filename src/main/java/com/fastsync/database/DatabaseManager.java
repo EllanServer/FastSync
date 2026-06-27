@@ -68,9 +68,7 @@ public class DatabaseManager {
      * clause and could clear/overwrite another session's lock — exactly the
      * race that lock_session_id was added to prevent.
      *
-     * <p>Test/migration compatibility is handled by the deprecated overload
-     * (e.g. {@link #releaseLock(UUID, String)}) which does not call this
-     * guard. Production callers (SyncManager) must always track and pass the
+     * <p>Production callers (SyncManager) must always track and pass the
      * session id from {@code playerLockSessions}.
      *
      * @throws IllegalArgumentException if lockSessionId is null or blank
@@ -380,46 +378,6 @@ public class DatabaseManager {
             }
             return readToken > 0 ? LockResult.success(readToken) : LockResult.FAILED;
         }
-    }
-
-    /**
-     * Load player data from the database along with its version and checksum.
-     * Returns VersionedData.EMPTY if no data exists or data is empty.
-     */
-    public VersionedData loadData(UUID uuid) throws SQLException {
-        try (Connection conn = dataSource.getConnection()) {
-            Record record = dsl(conn)
-                .select(DATA_FIELD, VERSION_FIELD, CHECKSUM_FIELD, FENCING_TOKEN_FIELD)
-                .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
-                .fetchOne();
-
-            if (record != null) {
-                byte[] data = record.get(DATA_FIELD);
-                // Return real version/checksum/fencing_token even when data is
-                // empty — see loadPlayerDataRow() for the full rationale.
-                // Callers that depend on hasData() (which checks data.length>0)
-                // still treat empty data as "no data", but the version is
-                // preserved so the next save CAS-succeeds.
-                if (data != null && data.length > 0) {
-                    return new VersionedData(
-                        data,
-                        record.get(VERSION_FIELD),
-                        record.get(CHECKSUM_FIELD),
-                        record.get(FENCING_TOKEN_FIELD));
-                }
-                // Empty data but row exists — return a VersionedData with the
-                // real version/fencing_token but empty data. hasData() returns
-                // false, so callers treat this as "new player" for apply
-                // purposes, but the version is correct for save CAS.
-                return new VersionedData(
-                    new byte[0],
-                    record.get(VERSION_FIELD) != null ? record.get(VERSION_FIELD) : 0L,
-                    record.get(CHECKSUM_FIELD) != null ? record.get(CHECKSUM_FIELD) : 0L,
-                    record.get(FENCING_TOKEN_FIELD) != null ? record.get(FENCING_TOKEN_FIELD) : 0L);
-            }
-        }
-        return VersionedData.EMPTY;
     }
 
     // ==================== Phase 2: Full Blob Save + Component Cleanup ====================
@@ -826,11 +784,11 @@ public class DatabaseManager {
      *
      * <p>Each bit corresponds to one {@link com.fastsync.sync.dirty.ComponentDirtyMask.Component}
      * (bit position = {@code Component.ordinal()}). A set bit means that
-     * component has been migrated to the {@code player_component} table and
-     * should be read from there instead of the legacy single-Blob column.
+     * component has a row in the {@code player_component} table at the current
+     * generation and should be overlaid on top of the full Blob baseline.
      *
-     * <p>Returns 0 for new players (no components migrated yet) or if the
-     * column is not yet present (legacy installs before phase 2 migration).
+     * <p>Returns 0 for new players (no components written yet) or when the
+     * column is null.
      */
     public long getComponentBitmap(UUID uuid) throws SQLException {
         try (Connection conn = dataSource.getConnection()) {
@@ -892,9 +850,9 @@ public class DatabaseManager {
     /**
      * Full player_data row for load path, including component storage metadata.
      *
-     * <p>Extends {@link VersionedData} with component_bitmap and component_generation,
-     * needed by the load path to decide whether to read component rows and at
-     * which generation.
+     * <p>Carries the data Blob plus version/checksum/fencing_token (for OCC +
+     * fencing) and component_bitmap/component_generation (so the load path can
+     * decide whether to read component rows and at which generation).
      */
     public record PlayerDataRow(
             byte[] data,
@@ -913,9 +871,8 @@ public class DatabaseManager {
     /**
      * Load the full player_data row including component storage metadata.
      *
-     * <p>This is the phase-3 replacement for {@link #loadData(UUID)} — it returns
-     * component_bitmap and component_generation so the caller can decide whether
-     * to load component rows and at which generation.
+     * <p>Returns component_bitmap and component_generation so the caller can
+     * decide whether to load component rows and at which generation.
      */
     public PlayerDataRow loadPlayerDataRow(UUID uuid) throws SQLException {
         try (Connection conn = dataSource.getConnection()) {
@@ -927,30 +884,14 @@ public class DatabaseManager {
                 .fetchOne();
 
             if (record != null) {
-                // CRITICAL: return the row's real metadata even when the data
-                // Blob is empty. The previous code fell through to
-                // PlayerDataRow.EMPTY (all zeros) when data was null/empty,
-                // which lost the row's actual version/checksum/fencing_token/
-                // bitmap/generation.
-                //
-                // This matters for several real scenarios:
-                //   - Migration residue: a row exists with empty data but
-                //     version=5 from a previous plugin version. Returning
-                //     version=0 would cause the next save to CAS-fail.
-                //   - Manual clear: an operator cleared the data column but
-                //     left version intact. Same CAS-fail risk.
-                //   - Conflict recovery: a recovery script may have nulled
-                //     the Blob but kept the version/fencing_token for audit.
-                //   - Empty Blob after acquireLock INSERT: the INSERT arm of
-                //     acquireLock seeds a row with data='' and version=0,
-                //     which is correct here (version IS 0). But if a prior
-                //     save had bumped version and then a full Blob save with
-                //     empty data happened (shouldn't, but defensive), we'd
-                //     want the real version.
-                //
+                // Return the row's real metadata even when the data Blob is
+                // empty. The INSERT arm of acquireLock seeds a row with
+                // data='' and version=0; loadPlayerDataRow must hand back that
+                // real version (0) so the first save CAS-succeeds. Falling
+                // through to PlayerDataRow.EMPTY (all zeros) would lose the
+                // row's actual version/checksum/fencing_token/bitmap/generation.
                 // hasData() still returns false for empty data, so the load
-                // path treats the player as "new" — but playerVersions gets
-                // the REAL version, so the first save CAS-succeeds.
+                // path treats the player as "new".
                 byte[] data = record.get(DATA_FIELD);
                 long realVersion = record.get(VERSION_FIELD) != null
                     ? record.get(VERSION_FIELD) : 0L;

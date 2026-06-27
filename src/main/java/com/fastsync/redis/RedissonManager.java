@@ -213,11 +213,26 @@ public class RedissonManager {
             // IMPORTANT: create dispatcher BEFORE starting the consumer loop.
             // If messages exist in the stream, the consumer may immediately try to
             // dispatch them via messageDispatcher — if it's null, that's an NPE.
-            messageDispatcher = Executors.newFixedThreadPool(2, r -> {
-                Thread t = new Thread(r, "FastSync-Stream-Dispatcher");
-                t.setDaemon(true);
-                return t;
-            });
+            //
+            // Bounded ThreadPoolExecutor: a fixed pool of 2 with a bounded
+            // ArrayBlockingQueue and CallerRunsPolicy. This is deliberately
+            // consistent with the main AsyncExecutor's bounded-queue strategy —
+            // the previous Executors.newFixedThreadPool(2) used an UNBOUNDED
+            // linked queue, which could grow without limit if the stream
+            // backlogged (slow listener / DB stall) and OOM the heap. With
+            // CallerRunsPolicy, once the queue fills the consumer thread itself
+            // runs the task inline, providing backpressure that slows reads
+            // instead of buffering indefinitely.
+            messageDispatcher = new java.util.concurrent.ThreadPoolExecutor(
+                2, 2,
+                30L, TimeUnit.SECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(1024),
+                r -> {
+                    Thread t = new Thread(r, "FastSync-Stream-Dispatcher");
+                    t.setDaemon(true);
+                    return t;
+                },
+                new java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy());
 
             running.set(true);
             consumerExecutor = Executors.newSingleThreadExecutor(r -> {

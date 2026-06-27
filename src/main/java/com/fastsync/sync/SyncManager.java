@@ -11,7 +11,6 @@ import com.fastsync.conflict.ConflictManager;
 import com.fastsync.data.PlayerData;
 import com.fastsync.database.DatabaseManager;
 import com.fastsync.database.LockResult;
-import com.fastsync.database.VersionedData;
 import com.fastsync.log.OperationLog;
 import com.fastsync.log.FileOperationLogManager;
 import com.fastsync.log.OperationType;
@@ -157,7 +156,7 @@ public class SyncManager {
     // WITHOUT touching the {@code player_data.data} Blob. If a brand-new player
     // (whose Blob is still empty because no full save has run yet) hits a
     // component-only save path, the component rows will be persisted but the
-    // Blob baseline remains empty — and on the NEXT login, {@code loadData()}
+    // Blob baseline remains empty — and on the NEXT login, {@code loadPlayerDataRow()}
     // sees {@code data == null} and treats the player as brand new again,
     // completely skipping the component overlay. The player's components are
     // silently orphaned in the DB until the next full Blob save.
@@ -589,12 +588,10 @@ public class SyncManager {
                     "Checksum mismatch: stored=" + loaded.checksum());
 
                 if (loadLatency != null) loadLatency.recordError();
-            try {
-                databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, lockSessionId);
-                notifyLockReleased(uuid);
-            } catch (SQLException ex) {
-                logger.log(Level.WARNING, "Failed to release lock after checksum failure for " + uuid, ex);
-            }
+            // Release the lock via the unified helper (fail-closed on null
+            // token/session; catches SQLException AND RuntimeException so a
+            // defensive IllegalArgumentException can't escape the load path).
+            releaseOwnedLockAndNotify(uuid, fencingToken, lockSessionId, "checksum failure");
             return LoadResult.error("Data checksum mismatch - possible corruption");
             }
 
@@ -621,24 +618,43 @@ public class SyncManager {
                     // Load only components matching the current generation
                     java.util.Map<String, com.fastsync.database.DatabaseManager.ComponentData> components =
                         databaseManager.loadComponentsWithGeneration(uuid, migratedNames, generation);
+                    // FAIL-CLOSED: any component checksum mismatch / unwrap
+                    // failure / deserialize failure makes the WHOLE load fail.
+                    // The old behavior (warn + continue) silently applied the
+                    // stale full-Blob baseline while a component row that was
+                    // supposed to override it was corrupt — then the next save
+                    // could rewrite the stale baseline, causing a silent
+                    // rollback. Instead: release the lock, reject the login,
+                    // and do NOT apply baseline / allow a save.
                     for (var entry : components.entrySet()) {
                         String name = entry.getKey();
-                        byte[] compData = entry.getValue().data();
-                        if (entry.getValue().hasData()) {
-                            try {
-                                byte[] decompressedComp = CompressionUtil.unwrap(compData);
-                                // Verify component checksum before deserializing
-                                if (config.isVerifyChecksum()
-                                        && !DatabaseManager.verifyChecksum(decompressedComp, entry.getValue().checksum())) {
-                                    logger.warning("[Load] Component checksum mismatch for "
-                                        + name + " on " + uuid + " — skipping component override");
-                                    continue;
-                                }
-                                PlayerDataSerializer.deserializeComponent(name, decompressedComp, data);
-                            } catch (Exception e) {
-                                logger.warning("[Load] Failed to deserialize component "
-                                    + name + " for " + uuid + ": " + e.getMessage());
-                            }
+                        com.fastsync.database.DatabaseManager.ComponentData cd = entry.getValue();
+                        if (!cd.hasData()) {
+                            // Empty component row with a set bitmap bit is itself
+                            // a corrupt/inconsistent state — treat it the same way.
+                            throw new IOException("Component '" + name + "' for " + uuid
+                                + " has a set bitmap bit but no data row (gen=" + generation + ")");
+                        }
+                        byte[] decompressedComp;
+                        try {
+                            decompressedComp = CompressionUtil.unwrap(cd.data());
+                        } catch (com.fastsync.serialization.CorruptDataException e) {
+                            throw new IOException("Corrupt component '" + name + "' for " + uuid
+                                + ": unwrap failed — " + e.getMessage(), e);
+                        }
+                        if (config.isVerifyChecksum()
+                                && !DatabaseManager.verifyChecksum(decompressedComp, cd.checksum())) {
+                            throw new IOException("Component checksum mismatch for '"
+                                + name + "' on " + uuid + " (stored=" + cd.checksum()
+                                + ") — refusing to apply baseline over a corrupt override");
+                        }
+                        try {
+                            PlayerDataSerializer.deserializeComponent(name, decompressedComp, data);
+                        } catch (Exception e) {
+                            // Includes ItemSerializationException from a corrupt
+                            // item inside the component.
+                            throw new IOException("Failed to deserialize component '"
+                                + name + "' for " + uuid + ": " + e.getMessage(), e);
                         }
                     }
                     if (config.isDebug()) {
@@ -921,30 +937,13 @@ public class SyncManager {
             if (dirtyMask != null) {
                 dirtyMask.remove(uuid);
             }
-            if (ft != null && ft > 0) {
-                final long fencingToken = ft;
-                pendingSaveCount.incrementAndGet();
-                try {
-                    asyncExecutor.execute(() -> {
-                        try {
-                            databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, lockSession);
-                            notifyLockReleased(uuid);
-                        } catch (SQLException e) {
-                            logger.log(Level.WARNING, "Failed to release lock after apply failure for " + uuid, e);
-                        } finally {
-                            pendingSaveCount.decrementAndGet();
-                        }
-                    });
-                } catch (java.util.concurrent.RejectedExecutionException e) {
-                    pendingSaveCount.decrementAndGet();
-                    try {
-                        databaseManager.releaseLock(uuid, config.getServerName(), fencingToken, lockSession);
-                        notifyLockReleased(uuid);
-                    } catch (SQLException ex) {
-                        logger.log(Level.WARNING, "Failed to release lock after apply failure for " + uuid, ex);
-                    }
-                }
-            }
+            // Release via the unified async helper. It is fail-closed on null
+            // ft/lockSession (logs + refuses tokenless release) and catches
+            // SQLException | RuntimeException, so a defensive
+            // IllegalArgumentException from releaseLock can no longer leak the
+            // lock. We do NOT bypass the helper even when ft looks valid — the
+            // helper's guards are the single source of truth for safe release.
+            releaseLockAsyncBestEffort(uuid, ft, lockSession, "apply failure");
             player.kick(net.kyori.adventure.text.Component.text(
                 "[FastSync] Failed to apply your data. Please reconnect.",
                 net.kyori.adventure.text.format.NamedTextColor.RED));
@@ -1016,42 +1015,32 @@ public class SyncManager {
             }
             playerVersions.remove(uuid);
             playersWithBaseline.remove(uuid);
-            if (ft != null && ft > 0) {
-                pendingSaveCount.incrementAndGet();
-                try {
-                    asyncExecutor.execute(() -> {
-                        try {
-                            databaseManager.releaseLock(uuid, config.getServerName(), ft, lockSession);
-                            notifyLockReleased(uuid);
-                        } catch (SQLException e) {
-                            logger.log(Level.WARNING, "Failed to release lock for failed-join player " + uuid, e);
-                        } finally {
-                            pendingSaveCount.decrementAndGet();
-                        }
-                    });
-                } catch (java.util.concurrent.RejectedExecutionException e) {
-                    pendingSaveCount.decrementAndGet();
-                    try {
-                        databaseManager.releaseLock(uuid, config.getServerName(), ft, lockSession);
-                        notifyLockReleased(uuid);
-                    } catch (SQLException ex) {
-                        logger.log(Level.WARNING, "Failed to release lock for failed-join player " + uuid, ex);
-                    }
-                }
-            }
+            // Release via the unified async helper (fail-closed on null
+            // ft/lockSession; catches SQLException | RuntimeException). A
+            // failed-join player may legitimately have a null session if the
+            // apply failed before the session was recorded — the helper logs
+            // and refuses tokenless release rather than throwing.
+            releaseLockAsyncBestEffort(uuid, ft, lockSession, "failed-join quit");
             return;
         }
 
         // Skip save for players who are not active, not pending, and not quarantined.
         // This catches edge cases where a quit event fires for a player who was
-        // already cleaned up by another path.
+        // already cleaned up by another path. We still best-effort release any
+        // lock metadata they hold (fencingToken + lockSession) — failing to do
+        // so would leak the DB lock until it times out.
         if (!activePlayers.containsKey(uuid)
             && !pendingData.containsKey(uuid)
             && !pendingEmptyData.contains(uuid)
             && !quarantinedPlayers.contains(uuid)) {
             logger.warning("[Quit] Skipping save for inactive/untracked player " + uuid);
             playerVersions.remove(uuid);
-            playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
+            // Best-effort release if lock metadata is present; the helper is
+            // fail-closed (logs + refuses tokenless release) so a null session
+            // is safe. Without this, a player who joined without preloaded data
+            // but somehow acquired a lock would leak it.
+            releaseLockAsyncBestEffort(uuid, ft, lockSession, "inactive/untracked quit");
             return;
         }
 
@@ -1283,7 +1272,13 @@ public class SyncManager {
                     logger.warning("[LockRelease] " + reason + " for " + uuid
                         + " did not release anything; no Redis RELEASED will be sent.");
                 }
-            } catch (SQLException e) {
+            } catch (SQLException | RuntimeException e) {
+                // Catch RuntimeException too: releaseLock can throw
+                // IllegalArgumentException on null/blank session ids (defensive
+                // guards). Without catching it here, the pendingSaveCount
+                // decrement in finally would still run, but the exception
+                // would escape the async task and be swallowed by the
+                // executor — better to log it explicitly.
                 logger.log(Level.WARNING, "[LockRelease] Failed to release lock for " + uuid
                     + " (" + reason + ")", e);
             } finally {
@@ -1338,7 +1333,11 @@ public class SyncManager {
                 logger.warning("[LockRelease] " + reason + " for " + uuid
                     + " did not release anything; no Redis RELEASED will be sent.");
             }
-        } catch (SQLException e) {
+        } catch (SQLException | RuntimeException e) {
+            // Catch RuntimeException too: releaseLock can throw
+            // IllegalArgumentException when a session id is null/blank (defensive
+            // guards), and we must not let that escape the release helper and
+            // skip the surrounding finally / pendingSaveCount decrement.
             logger.log(Level.WARNING, "[LockRelease] Failed to release lock for " + uuid
                 + " (" + reason + ")", e);
         }
@@ -1669,13 +1668,19 @@ public class SyncManager {
                 }
             }
 
-            // Apply typed stats via strategy (if enabled) or inline
+            // Apply typed stats via strategy (if enabled). The inline backward-
+            // compat path that applied typed stats without a strategy was
+            // removed (clean-slate): a payload should only carry typed stats
+            // when the strategy was enabled at save time. If typed stats are
+            // present but no strategy is active, warn and ignore rather than
+            // silently re-applying them through a legacy code path.
             if (!typedStatsData.isEmpty()) {
                 if (typedStatsStrategy != null) {
                     typedStatsStrategy.restore(player, typedStatsData);
                 } else {
-                    // Typed stats present but strategy not enabled — apply inline (backward compat)
-                    applyTypedStatsInline(player, typedStatsData);
+                    logger.warning("[Stats] Typed statistics present in payload for " + player.getUniqueId()
+                        + " but typed-stats strategy is disabled — ignoring " + typedStatsData.size()
+                        + " typed categories. Enable the strategy or resave the player.");
                 }
             }
 
@@ -1692,33 +1697,6 @@ public class SyncManager {
             }
         } catch (Exception e) {
             if (config.isDebug()) logger.warning("Failed to apply statistics: " + e.getMessage());
-        }
-    }
-
-    /** Inline typed stats restore for backward compat (when no strategy is active). */
-    private void applyTypedStatsInline(Player player, Map<String, Map<String, Integer>> typedStatsData) {
-        for (Map.Entry<String, Map<String, Integer>> cat : typedStatsData.entrySet()) {
-            String category = cat.getKey();
-            try {
-                if (category.startsWith("ITEM_") || category.startsWith("BLOCK_")) {
-                    String prefix = category.startsWith("ITEM_") ? "ITEM_" : "BLOCK_";
-                    Statistic statistic = Statistic.valueOf(category.substring(prefix.length()));
-                    for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
-                        try {
-                            org.bukkit.Material mat = org.bukkit.Material.matchMaterial(stat.getKey());
-                            if (mat != null) player.setStatistic(statistic, mat, stat.getValue());
-                        } catch (Exception ignored) {}
-                    }
-                } else if (category.startsWith("ENTITY_")) {
-                    Statistic statistic = Statistic.valueOf(category.substring("ENTITY_".length()));
-                    for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
-                        try {
-                            org.bukkit.entity.EntityType ent = org.bukkit.entity.EntityType.valueOf(stat.getKey());
-                            player.setStatistic(statistic, ent, stat.getValue());
-                        } catch (Exception ignored) {}
-                    }
-                }
-            } catch (Exception ignored) {}
         }
     }
 
@@ -2519,17 +2497,13 @@ public class SyncManager {
             playersWithBaseline.remove(uuid);
             asyncExecutor.execute(() -> {
                 try {
-                    if (ft != null && ft > 0) {
-                        boolean released = databaseManager.releaseLock(uuid, config.getServerName(), ft, lockSession);
-                        if (released) {
-                            notifyLockReleased(uuid);
-                        }
-                    } else {
-                        logger.warning("Stale pending data for " + uuid
-                            + " has no fencing token; not releasing lock or notifying release.");
-                    }
+                    // Release via the unified sync helper (already on the async
+                    // thread). Fail-closed on null ft/lockSession; catches
+                    // SQLException | RuntimeException so no defensive guard
+                    // can leak the lock.
+                    releaseOwnedLockAndNotify(uuid, ft, lockSession, "stale pending cleanup");
                     logger.warning("Cleaned up stale pending data for " + uuid);
-                } catch (SQLException e) {
+                } catch (Exception e) {
                     logger.log(Level.WARNING, "Failed to release stale lock for " + uuid, e);
                 }
             });
@@ -2761,7 +2735,7 @@ public class SyncManager {
             //
             // Without this gate, a brand-new player (whose player_data.data is
             // still empty because no full save has run yet) would have component
-            // rows written successfully, but on next login loadData() sees
+            // rows written successfully, but on next login loadPlayerDataRow() sees
             // data == null and treats the player as brand new — the component
             // overlay is skipped, and the player's state is silently lost.
             //
@@ -3228,22 +3202,16 @@ public class SyncManager {
                 if (quarantinedPlayers.contains(uuid)) {
                     logger.info("[Quit] Releasing lock for quarantined player " + uuid
                         + " after save failure (lock already lost).");
-                    try {
-                        Long ft = playerFencingTokens.get(uuid);
-                        String qSession = playerLockSessions.get(uuid);
-                        if (ft != null && qSession != null) {
-                            boolean released = databaseManager.releaseLock(uuid, config.getServerName(), ft, qSession);
-                            if (released) notifyLockReleased(uuid);
-                        } else if (ft != null) {
-                            // No session — fail-closed would be safer, but this
-                            // is the quarantined path (lock already lost). Log
-                            // and skip release to avoid clearing another session.
-                            logger.warning("[Quit] Quarantined player " + uuid
-                                + " has no lockSessionId; skipping release to avoid clearing another session's lock.");
-                        }
-                    } catch (SQLException ex) {
-                        logger.log(Level.WARNING, "Failed to release lock for quarantined player " + uuid, ex);
-                    }
+                    // Release via the unified sync helper. It is fail-closed on
+                    // null ft/lockSession (logs + refuses tokenless release)
+                    // and catches SQLException | RuntimeException, so the
+                    // defensive guards in releaseLock can no longer leak the
+                    // lock here. We snapshot the current values (not remove)
+                    // because the surrounding save-failure path may still need
+                    // them for the lock-timeout fallback below.
+                    Long ft = playerFencingTokens.get(uuid);
+                    String qSession = playerLockSessions.get(uuid);
+                    releaseOwnedLockAndNotify(uuid, ft, qSession, "quarantined save failure");
                 } else {
                     logger.warning("[Quit] NOT releasing lock for " + uuid + " after " + kind
                         + " save failure — lock will expire after lock-timeout ("
