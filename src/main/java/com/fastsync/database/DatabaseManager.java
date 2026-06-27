@@ -210,41 +210,110 @@ public class DatabaseManager {
      * it, logging anything else as a migration note.
      */
     private void migrateSchema() throws SQLException {
-        // Add columns if they don't exist (MySQL 8+ supports IF NOT EXISTS).
-        // The trailing DROP COLUMN removes the orphaned `op_seq` column left over
-        // from old installations; MySQL 8+ honours DROP COLUMN IF NOT EXISTS, so it
-        // is a no-op on fresh installs (and on tables that never had the column).
-        String[] migrations = {
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `version` BIGINT NOT NULL DEFAULT 0", dataTable),
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `checksum` BIGINT NOT NULL DEFAULT 0", dataTable),
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `fencing_token` BIGINT NOT NULL DEFAULT 0", dataTable),
+        // CRITICAL: MySQL 8.0/8.4 does NOT support `ALTER TABLE ... ADD COLUMN
+        // IF NOT EXISTS` (that is a MariaDB extension). The previous code used
+        // IF NOT EXISTS unconditionally, which produced a SQL syntax error on
+        // every startup of MySQL 8.x. The error was caught and logged as a
+        // "migration note", so the column was NEVER actually added on MySQL 8.x
+        // — meaning upgrades from old versions that lacked the column would
+        // silently fail, and subsequent INSERT/UPDATE queries would error at
+        // runtime with "Unknown column 'component_bitmap'".
+        //
+        // The fix: probe information_schema.columns first, and only emit the
+        // ALTER if the column is actually missing. This works on every MySQL
+        // version (5.7+, 8.0, 8.4) and produces no warnings on fresh installs
+        // (where CREATE TABLE already added every column).
+        try (Connection conn = dataSource.getConnection()) {
+            DSLContext dsl = dsl(conn);
+
+            // player_data column additions (idempotent — skipped if column exists)
+            addColumnIfMissing(dsl, conn, dataTable, "version",
+                "BIGINT NOT NULL DEFAULT 0");
+            addColumnIfMissing(dsl, conn, dataTable, "checksum",
+                "BIGINT NOT NULL DEFAULT 0");
+            addColumnIfMissing(dsl, conn, dataTable, "fencing_token",
+                "BIGINT NOT NULL DEFAULT 0");
             // Phase 2: component_bitmap tracks which components have been
             // migrated from the legacy single-Blob to the per-component table.
             // Default 0 = no components migrated yet (pure Blob mode).
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `component_bitmap` BIGINT NOT NULL DEFAULT 0", dataTable),
+            addColumnIfMissing(dsl, conn, dataTable, "component_bitmap",
+                "BIGINT NOT NULL DEFAULT 0");
             // component_generation: incremented on every full Blob save. Component
             // rows are only read if their generation matches player_data.component_generation.
             // This prevents stale component rows from overriding a fresh full Blob.
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `component_generation` BIGINT NOT NULL DEFAULT 0", dataTable),
+            addColumnIfMissing(dsl, conn, dataTable, "component_generation",
+                "BIGINT NOT NULL DEFAULT 0");
+
             // player_component: add generation column for baseline tracking
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `generation` BIGINT NOT NULL DEFAULT 0", componentTable),
-            String.format("ALTER TABLE `%s` DROP COLUMN IF NOT EXISTS `op_seq`", dataTable)
-        };
-        try (Connection conn = dataSource.getConnection()) {
-            DSLContext dsl = dsl(conn);
-            for (String sql : migrations) {
-                try {
-                    dsl.execute(sql);
-                } catch (DataAccessException e) {
-                    // ADD COLUMN: column may already exist on MySQL versions that
-                    // don't support IF NOT EXISTS. DROP COLUMN: the column may not
-                    // exist, or the server may not support DROP COLUMN IF NOT EXISTS.
-                    // Either way the cause chain is walked and benign cases are
-                    // suppressed; anything else is logged as a migration note.
-                    if (!isDuplicateColumnError(e) && !isCannotDropColumnError(e)) {
-                        logger.warning("Schema migration note: " + e.getMessage());
-                    }
-                }
+            addColumnIfMissing(dsl, conn, componentTable, "generation",
+                "BIGINT NOT NULL DEFAULT 0");
+
+            // The orphaned `op_seq` column from old installations — drop if present.
+            dropColumnIfPresent(dsl, conn, dataTable, "op_seq");
+        }
+    }
+
+    /**
+     * Probe {@code information_schema.columns} and only run the ALTER if the
+     * column is missing. Works on every MySQL version (no IF NOT EXISTS needed).
+     */
+    private void addColumnIfMissing(DSLContext dsl, Connection conn,
+            String tableName, String columnName, String columnDef) throws SQLException {
+        if (columnExists(conn, tableName, columnName)) {
+            return;
+        }
+        String sql = String.format("ALTER TABLE `%s` ADD COLUMN `%s` %s",
+            tableName, columnName, columnDef);
+        try {
+            dsl.execute(sql);
+            logger.info("Schema migration: added column " + tableName + "." + columnName);
+        } catch (DataAccessException e) {
+            // Race: another server may have added the column concurrently.
+            // Treat duplicate-column as benign; anything else is a real problem.
+            if (!isDuplicateColumnError(e)) {
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Probe {@code information_schema.columns} and only run the ALTER if the
+     * column is present. Works on every MySQL version (no IF EXISTS needed).
+     */
+    private void dropColumnIfPresent(DSLContext dsl, Connection conn,
+            String tableName, String columnName) throws SQLException {
+        if (!columnExists(conn, tableName, columnName)) {
+            return;
+        }
+        String sql = String.format("ALTER TABLE `%s` DROP COLUMN `%s`",
+            tableName, columnName);
+        try {
+            dsl.execute(sql);
+            logger.info("Schema migration: dropped column " + tableName + "." + columnName);
+        } catch (DataAccessException e) {
+            // Race or unsupported DROP. Log and continue — this is best-effort
+            // cleanup of a legacy column, not a correctness requirement.
+            if (!isCannotDropColumnError(e)) {
+                logger.warning("Schema migration note (DROP " + columnName + "): " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Check whether a column exists in the given table via information_schema.
+     * Database name is read from the connection's catalog so this works
+     * regardless of which database the connection is bound to.
+     */
+    private boolean columnExists(Connection conn, String tableName, String columnName) throws SQLException {
+        String dbName = conn.getCatalog();
+        String sql = "SELECT 1 FROM information_schema.columns " +
+            "WHERE table_schema = ? AND table_name = ? AND column_name = ?";
+        try (var ps = conn.prepareStatement(sql)) {
+            ps.setString(1, dbName);
+            ps.setString(2, tableName);
+            ps.setString(3, columnName);
+            try (var rs = ps.executeQuery()) {
+                return rs.next();
             }
         }
     }
@@ -1182,7 +1251,7 @@ public class DatabaseManager {
             String sql = String.format(
                 "SELECT `component`, `data`, `version`, `checksum` FROM `%s` " +
                 "WHERE `uuid` = ? AND `generation` = ? AND `component` IN (%s)",
-                componentTable);
+                componentTable, placeholders);
 
             try (var ps = conn.prepareStatement(sql)) {
                 ps.setString(1, uuid.toString());
