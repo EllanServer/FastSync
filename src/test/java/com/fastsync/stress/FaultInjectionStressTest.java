@@ -90,7 +90,7 @@ class FaultInjectionStressTest {
 
         synchronized boolean saveKeepLock(String uuid, byte[] data, long checksum,
                 long expectedVersion, long fencingToken, String serverName, String sessionId) {
-            PlayerRecord rec = data.get(uuid);
+            PlayerRecord rec = this.data.get(uuid);
             if (rec == null) return false;
 
             // CAS check: version + fencing_token + locked_by + session_id
@@ -122,7 +122,7 @@ class FaultInjectionStressTest {
 
         synchronized boolean saveAndReleaseLock(String uuid, byte[] data, long checksum,
                 long expectedVersion, long fencingToken, String serverName, String sessionId) {
-            PlayerRecord rec = data.get(uuid);
+            PlayerRecord rec = this.data.get(uuid);
             if (rec == null) return false;
 
             if (rec.version != expectedVersion
@@ -153,7 +153,7 @@ class FaultInjectionStressTest {
         }
 
         synchronized boolean releaseLock(String uuid, String serverName, long fencingToken) {
-            PlayerRecord rec = data.get(uuid);
+            PlayerRecord rec = this.data.get(uuid);
             if (rec == null) return false;
             if (!serverName.equals(rec.lockedBy) || rec.fencingToken != fencingToken) {
                 return false;
@@ -165,17 +165,17 @@ class FaultInjectionStressTest {
         }
 
         synchronized long getVersion(String uuid) {
-            PlayerRecord rec = data.get(uuid);
+            PlayerRecord rec = this.data.get(uuid);
             return rec != null ? rec.version : 0;
         }
 
         synchronized long getFencingToken(String uuid) {
-            PlayerRecord rec = data.get(uuid);
+            PlayerRecord rec = this.data.get(uuid);
             return rec != null ? rec.fencingToken : 0;
         }
 
         synchronized String getLockedBy(String uuid) {
-            PlayerRecord rec = data.get(uuid);
+            PlayerRecord rec = this.data.get(uuid);
             return rec != null ? rec.lockedBy : null;
         }
     }
@@ -422,7 +422,7 @@ class FaultInjectionStressTest {
         for (int i = 0; i < numPlayers; i++) {
             final String uuid = "player-storm-" + i;
             futures.add(pool.submit(() -> {
-                start.await();
+                try { start.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
                 Long ft = db.acquireLock(uuid, "server-a", "session-" + uuid);
                 if (ft == null) return;
                 sync.playerVersions.put(uuid, 0L);
@@ -567,7 +567,7 @@ class FaultInjectionStressTest {
         for (int i = 0; i < numPlayers; i++) {
             final String uuid = "player-hc-" + i;
             futures.add(pool.submit(() -> {
-                start.await();
+                try { start.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
                 Long ft = db.acquireLock(uuid, "server-a", "session-" + uuid);
                 if (ft == null) { totalFail.incrementAndGet(); return; }
                 sync.playerVersions.put(uuid, 0L);
