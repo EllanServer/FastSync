@@ -547,7 +547,16 @@ public class RedissonManager {
         // Loop until no more pending entries to reclaim. Previously this only
         // ran once with MAX_RECLAIM_PER_CYCLE=10, leaving entries unprocessed
         // if a crash accumulated more than 10 pending messages.
-        while (true) {
+        //
+        // S3 fix (round 13): add a hard iteration cap to prevent infinite
+        // loops when handleStreamMessage persistently fails for every message
+        // in the PEL. In that case autoClaim keeps returning the same unacked
+        // batch and messages.size() == MAX_RECLAIM_PER_CYCLE never breaks.
+        // The cap is generous (100 iterations × 10 messages = 1000 entries)
+        // so normal recovery is unaffected; only pathological cases are bounded.
+        final int MAX_RECLAIM_ITERATIONS = 100;
+        int iterations = 0;
+        while (iterations++ < MAX_RECLAIM_ITERATIONS) {
             try {
                 AutoClaimResult<String, String> claimed = stream.autoClaim(
                     consumerGroupName, serverName,
@@ -563,6 +572,7 @@ public class RedissonManager {
                     LOGGER.info("[Redisson] Recovering pending entries from previous crash...");
                 }
 
+                int failedInBatch = 0;
                 for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
                     try {
                         handleStreamMessage(entry.getKey(), entry.getValue());
@@ -570,9 +580,20 @@ public class RedissonManager {
                         stream.ack(consumerGroupName, entry.getKey());
                         totalRecovered++;
                     } catch (Exception e) {
+                        failedInBatch++;
                         LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entry " + entry.getKey()
                             + " — will retry on next autoClaim cycle", e);
                     }
+                }
+
+                // If ALL messages in this batch failed, break to avoid
+                // re-claiming the same unacked messages in an infinite loop.
+                // They will be retried on the next periodic autoClaim tick.
+                if (failedInBatch == messages.size()) {
+                    LOGGER.warning("[Redisson] All " + failedInBatch
+                        + " pending entries failed in this batch — stopping recovery to avoid infinite loop. "
+                        + "Entries will be retried on next periodic autoClaim.");
+                    break;
                 }
 
                 // If we got fewer than MAX_RECLAIM_PER_CYCLE, there are no more
@@ -585,6 +606,10 @@ public class RedissonManager {
                 }
                 break;
             }
+        }
+        if (iterations > MAX_RECLAIM_ITERATIONS) {
+            LOGGER.warning("[Redisson] Recovery loop hit iteration cap (" + MAX_RECLAIM_ITERATIONS
+                + ") — some pending entries may remain in PEL and will be retried on next periodic autoClaim.");
         }
         if (totalRecovered > 0) {
             LOGGER.info("[Redisson] Recovered " + totalRecovered

@@ -1839,6 +1839,16 @@ public class SyncManager {
         if (kind == SaveKind.SHUTDOWN) {
             shuttingDown = true;
         }
+        // S4 fix (round 13): reject /saveall (BULK) during shutdown to avoid
+        // racing with the SHUTDOWN save path. The SHUTDOWN path already
+        // dispatches saves for all online players; a concurrent /saveall
+        // would duplicate work and could overwrite the SHUTDOWN save's
+        // final state with a stale BULK snapshot.
+        if (shuttingDown && kind != SaveKind.SHUTDOWN) {
+            logger.warning("[FastSync] /saveall rejected — server is shutting down. "
+                + "The shutdown save path will persist all online players.");
+            return new SaveAllResult(0, 0, 0, new HashMap<>());
+        }
         return savePlayersSnapshot(new ArrayList<>(Bukkit.getOnlinePlayers()), kind);
     }
 
