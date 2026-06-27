@@ -126,15 +126,15 @@ class DatabaseComponentChaosTest {
         String serverB = "server-B";
 
         // Server A acquires lock
-        var lockA = databaseManager.acquireLock(uuid, serverA);
+        var lockA = databaseManager.acquireLock(uuid, serverA, "session-a");
         assertTrue(lockA.acquired());
         long tokenA = lockA.fencingToken();
 
         // Server B acquires lock (A's lock is released because B called acquireLock
         // and the lock was free for B — but in our implementation, B would need A
         // to release first. Let's simulate A releasing then B acquiring.)
-        databaseManager.releaseLock(uuid, serverA);
-        var lockB = databaseManager.acquireLock(uuid, serverB);
+        databaseManager.releaseLock(uuid, serverA, lockA != null ? lockA.fencingToken() : 0, "session-a");
+        var lockB = databaseManager.acquireLock(uuid, serverB, "session-b");
         assertTrue(lockB.acquired());
         long tokenB = lockB.fencingToken();
         assertTrue(tokenB > tokenA, "B's fencing token should be higher than A's");
@@ -254,8 +254,8 @@ class DatabaseComponentChaosTest {
     void testConcurrentLockAcquisitionOnlyOneSucceeds() throws SQLException {
         UUID uuid = UUID.randomUUID();
 
-        var lockA = databaseManager.acquireLock(uuid, "server-A");
-        var lockB = databaseManager.acquireLock(uuid, "server-B");
+        var lockA = databaseManager.acquireLock(uuid, "server-A", "session-A");
+        var lockB = databaseManager.acquireLock(uuid, "server-B", "session-B");
 
         // Both can't hold the lock simultaneously (unless A's lock expired)
         // Since we call them sequentially and A hasn't released, B should fail
