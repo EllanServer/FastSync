@@ -242,6 +242,7 @@ public class DatabaseManager {
      * @return LockResult with acquired=true and the fencing token, or acquired=false
      */
     public LockResult acquireLock(UUID uuid, String serverName, String lockSessionId) throws SQLException {
+        requireLockSession(lockSessionId, "acquireLock");
         long now = System.currentTimeMillis();
         long expiredTime = now - (config.getLockTimeout() * 1000L);
 
