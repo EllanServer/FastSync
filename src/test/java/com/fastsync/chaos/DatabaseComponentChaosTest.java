@@ -146,7 +146,7 @@ class DatabaseComponentChaosTest {
         checksums.put("INVENTORY", 999L);
 
         var result = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, serverA, tokenA, null, -1, 1L);
+            uuid, components, checksums, serverA, tokenA, "session-a", -1, 1L);
 
         assertFalse(result.success(), "Stale fencing token save MUST be rejected");
         assertTrue(result.errorMessage().contains("mismatch"),
@@ -165,7 +165,7 @@ class DatabaseComponentChaosTest {
         checksums.put("INVENTORY", 12345L);
 
         var result = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, 1L, null, -1, 1L);
+            uuid, components, checksums, server, 1L, "fake-session", -1, 1L);
 
         assertFalse(result.success(), "Save without lock MUST be rejected");
     }

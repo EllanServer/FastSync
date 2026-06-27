@@ -352,7 +352,7 @@ public class DatabaseManager {
             // nonce. Strict equality — no NULL-tolerant fallback. Rows are
             // always seeded with a lock_session_id by the INSERT arm of the
             // ON DUPLICATE KEY UPDATE statement above.
-            String dbSessionId = record.get(LOCK_SESSION_ID_FIELD);
+            String dbSessionId = record.get("lock_session_id", String.class);
             if (!lockSessionId.equals(dbSessionId)) {
                 return LockResult.FAILED;
             }
