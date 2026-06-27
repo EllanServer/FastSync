@@ -2,6 +2,7 @@ package com.fastsync.stress;
 
 import com.fastsync.config.ConfigManager;
 import com.fastsync.database.DatabaseManager;
+import com.fastsync.database.LockResult;
 import com.fastsync.testutil.TestConfigBuilder;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -168,7 +169,7 @@ class FastSyncStressTest {
                     }
                     long t0 = System.nanoTime();
                     try {
-                        DatabaseManager.LockResult lock = databaseManager.acquireLock(uuid, server, session);
+                        LockResult lock = databaseManager.acquireLock(uuid, server, session);
                         if (!lock.acquired()) {
                             failures.incrementAndGet();
                             return;
@@ -236,7 +237,7 @@ class FastSyncStressTest {
             String server = (i % 2 == 0) ? "server-A" : "server-B";
             String session = "session-" + i + "-" + server;
 
-            DatabaseManager.LockResult lock = databaseManager.acquireLock(uuid, server, session);
+            LockResult lock = databaseManager.acquireLock(uuid, server, session);
             assertTrue(lock.acquired(), "Cycle " + i + ": server " + server + " failed to acquire lock");
 
             long checksum = DatabaseManager.computeChecksum(blob);
@@ -274,7 +275,7 @@ class FastSyncStressTest {
         // Server A acquires the lock.
         String serverA = "server-A";
         String sessionA = "session-A-1";
-        DatabaseManager.LockResult lockA = databaseManager.acquireLock(uuid, serverA, sessionA);
+        LockResult lockA = databaseManager.acquireLock(uuid, serverA, sessionA);
         assertTrue(lockA.acquired(), "Server A failed to acquire lock");
 
         // Simulate DB latency spike: server A holds the lock longer than usual.
@@ -283,7 +284,7 @@ class FastSyncStressTest {
         // Server B tries to acquire while A still holds (lock not expired).
         String serverB = "server-B";
         String sessionB = "session-B-1";
-        DatabaseManager.LockResult lockB = databaseManager.acquireLock(uuid, serverB, sessionB);
+        LockResult lockB = databaseManager.acquireLock(uuid, serverB, sessionB);
         assertTrue(!lockB.acquired(),
                 "Server B acquired lock while server A still held it — lock expiry broken");
 
@@ -294,7 +295,7 @@ class FastSyncStressTest {
         assertTrue(savedA, "Server A save failed after latency spike");
 
         // Now server B can acquire.
-        DatabaseManager.LockResult lockB2 = databaseManager.acquireLock(uuid, serverB, sessionB);
+        LockResult lockB2 = databaseManager.acquireLock(uuid, serverB, sessionB);
         assertTrue(lockB2.acquired(), "Server B failed to acquire lock after A released");
 
         // Server A's stale session must NOT save (lock now held by B).
