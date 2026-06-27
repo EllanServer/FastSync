@@ -1142,7 +1142,7 @@ public class SyncManager {
         // thread. Only if the finalSaveExecutor is ALSO saturated do we fall
         // back to synchronous execution on the current thread — and that
         // fallback is now logged at SEVERE so operators see it.
-        java.util.Runnable quitSaveTask = () -> {
+        Runnable quitSaveTask = () -> {
             saveLock.lock(); // must wait — quit save must persist final state
             try {
                 // CRITICAL: refresh version/fencingToken after acquiring the lock.
