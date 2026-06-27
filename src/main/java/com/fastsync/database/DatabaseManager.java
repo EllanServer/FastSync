@@ -327,37 +327,34 @@ public class DatabaseManager {
                 lockSessionId     // lock_session_id new value
             );
 
-            // Read back fencing_token, locked_by, AND lock_session_id.
-            // We hold the lock iff ALL THREE match:
-            //   - locked_by == serverName (lock is ours, not another server's)
-            //   - lock_session_id == lockSessionId (THIS acquire, not a prior
-            //     same-serverName session whose quit save is still in flight)
-            // The fencing_token is the one we just wrote (PK point lookup;
-            // no other server can bump it before our read-back because we
-            // hold the row's X lock via the just-completed
-            // INSERT...ON DUPLICATE KEY UPDATE).
-            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD, LOCK_SESSION_ID_FIELD)
-                .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
-                .fetchOne();
+            // Read back fencing_token, locked_by, AND lock_session_id using
+            // raw JDBC (not jOOQ) to avoid Field type resolution issues that
+            // caused null returns on CI MySQL.
+            String readSql = String.format(
+                "SELECT `fencing_token`, `locked_by`, `lock_session_id` FROM `%s` WHERE `uuid` = ?",
+                dataTable);
+            long readToken = 0;
+            String readLockedBy = null;
+            String readSessionId = null;
+            try (var ps = conn.prepareStatement(readSql)) {
+                ps.setString(1, uuid.toString());
+                try (var rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return LockResult.FAILED;
+                    }
+                    readToken = rs.getLong("fencing_token");
+                    readLockedBy = rs.getString("locked_by");
+                    readSessionId = rs.getString("lock_session_id");
+                }
+            }
 
-            if (record == null) {
+            if (!serverName.equals(readLockedBy)) {
                 return LockResult.FAILED;
             }
-            if (!serverName.equals(record.get(LOCKED_BY_FIELD))) {
+            if (!lockSessionId.equals(readSessionId)) {
                 return LockResult.FAILED;
             }
-            // P0 check: lock_session_id must match THIS acquire's nonce.
-            // A prior same-serverName session's lock would have a different
-            // nonce. Strict equality — no NULL-tolerant fallback. Rows are
-            // always seeded with a lock_session_id by the INSERT arm of the
-            // ON DUPLICATE KEY UPDATE statement above.
-            String dbSessionId = record.get("lock_session_id", String.class);
-            if (!lockSessionId.equals(dbSessionId)) {
-                return LockResult.FAILED;
-            }
-            Long token = record.get(FENCING_TOKEN_FIELD);
-            return token != null ? LockResult.success(token) : LockResult.FAILED;
+            return readToken > 0 ? LockResult.success(readToken) : LockResult.FAILED;
         }
     }
 
