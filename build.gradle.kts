@@ -38,7 +38,12 @@ dependencies {
     // Compile-only: provided by Paper/Folia at runtime
     compileOnly("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
 
-    // Velocity proxy API
+    // Velocity proxy API. Velocity publishes ONLY snapshot artifacts (no stable
+    // releases) — 3.5.0-SNAPSHOT is the current version on PaperMC's Maven repo
+    // and is the one shipped by the official Velocity download page. This is
+    // compile-only: the proxy plugin is optional, and operators should test
+    // against their production Velocity build. If API breaks occur, pin to a
+    // specific build number (e.g. 3.5.0-SNAPSHOT-599).
     compileOnly("com.velocitypowered:velocity-api:3.5.0-SNAPSHOT")
     compileOnly("org.slf4j:slf4j-api:2.0.18")
     // Netty BOM must be declared with platform(...) so Gradle treats it as a

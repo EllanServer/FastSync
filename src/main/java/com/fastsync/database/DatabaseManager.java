@@ -170,9 +170,30 @@ public class DatabaseManager {
     }
 
     /**
-     * Create the player data table if it doesn't exist.
-     * Uses LONGBLOB to support large compressed data without the 64KB BLOB limit.
-     * Includes version and checksum columns for optimistic concurrency control.
+     * Get the current time from the MySQL server, in milliseconds since epoch.
+     *
+     * <p>Used for lock expiry calculations instead of {@code System.currentTimeMillis()}
+     * to eliminate clock-skew issues between Paper/Folia nodes. All nodes share
+     * the same MySQL instance, so using DB time ensures consistent expiry
+     * evaluation regardless of individual node clock drift.
+     *
+     * @param conn an open JDBC connection
+     * @return DB server time in milliseconds since Unix epoch
+     */
+    private long getDatabaseTimeMs(Connection conn) throws SQLException {
+        try (var ps = conn.prepareStatement("SELECT UNIX_TIMESTAMP() * 1000");
+             var rs = ps.executeQuery()) {
+            if (rs.next()) {
+                return rs.getLong(1);
+            }
+        }
+        // Fallback: if the query somehow fails, use JVM time rather than
+        // crashing the lock acquire path. This is a safety net, not the norm.
+        return System.currentTimeMillis();
+    }
+
+    /**
+     * Create the player data and component tables if they don't exist.
      *
      * <p>DDL is issued as raw SQL via {@link DSLContext#execute(String)} because
      * jOOQ's DDL DSL is far more verbose than the equivalent CREATE TABLE
@@ -307,7 +328,14 @@ public class DatabaseManager {
      */
     public LockResult acquireLock(UUID uuid, String serverName, String lockSessionId) throws SQLException {
         requireLockSession(lockSessionId, "acquireLock");
-        long now = System.currentTimeMillis();
+        // Use DB server time for lock expiry calculation, NOT JVM local time.
+        // This eliminates clock-skew issues between Paper/Folia nodes: if node A's
+        // clock is ahead, it won't prematurely consider node B's lock expired.
+        // The extra SELECT is one round-trip but only on the login path (not hot).
+        long now;
+        try (Connection timeConn = dataSource.getConnection()) {
+            now = getDatabaseTimeMs(timeConn);
+        }
         long expiredTime = now - (config.getLockTimeout() * 1000L);
 
         // INSERT ... ON DUPLICATE KEY UPDATE merges row creation and conditional
@@ -723,18 +751,17 @@ public class DatabaseManager {
      */
     public boolean refreshLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
         requireLockSession(lockSessionId, "refreshLock");
-        long now = System.currentTimeMillis();
+        // Use DB time for locked_at — consistent with acquireLock's expiry check.
         String sql = String.format(
-            "UPDATE `%s` SET `locked_at` = ? " +
+            "UPDATE `%s` SET `locked_at` = (SELECT UNIX_TIMESTAMP() * 1000) " +
             "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
             dataTable);
         try (Connection conn = dataSource.getConnection();
              var ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, now);
-            ps.setString(2, uuid.toString());
-            ps.setString(3, serverName);
-            ps.setLong(4, fencingToken);
-            ps.setString(5, lockSessionId);
+            ps.setString(1, uuid.toString());
+            ps.setString(2, serverName);
+            ps.setLong(3, fencingToken);
+            ps.setString(4, lockSessionId);
             return ps.executeUpdate() > 0;
         }
     }
@@ -760,18 +787,10 @@ public class DatabaseManager {
                                   String serverName,
                                   java.util.Set<UUID> failedPlayers) throws SQLException {
         if (playersToRefresh.isEmpty()) return;
-        long now = System.currentTimeMillis();
-
-        // Use raw JDBC for batch — jOOQ's batch API is more verbose for this use case.
-        // P0 (round 10): WHERE includes lock_session_id, so a stale session's
-        // heartbeat cannot refresh a lock that a new session has already
-        // acquired. The session id is REQUIRED (not optional): a missing id
-        // means we have no in-memory record of owning this lock, so refreshing
-        // would be unsound. Such players are added to failedPlayers up front
-        // and skipped, which is fail-closed (heartbeat treats them as lost and
-        // quarantines them) rather than silently no-op'ing.
+        // Use DB time inline — no need for a separate time query since
+        // all rows in the batch share the same timestamp.
         String sql = "UPDATE `" + dataTable + "`"
-            + " SET locked_at = ?"
+            + " SET locked_at = (SELECT UNIX_TIMESTAMP() * 1000)"
             + " WHERE uuid = ? AND locked_by = ? AND fencing_token = ?"
             + " AND lock_session_id = ?";
 
@@ -789,11 +808,10 @@ public class DatabaseManager {
                     failedPlayers.add(uuid);
                     continue;
                 }
-                ps.setLong(1, now);
-                ps.setString(2, uuid.toString());
-                ps.setString(3, serverName);
-                ps.setLong(4, entry.getValue());
-                ps.setString(5, sessionId);
+                ps.setString(1, uuid.toString());
+                ps.setString(2, serverName);
+                ps.setLong(3, entry.getValue());
+                ps.setString(4, sessionId);
                 ps.addBatch();
             }
 

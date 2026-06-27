@@ -116,11 +116,11 @@ sync:
 
   # Lock timeout in seconds (how long before a lock from another server is considered stale)
   #
-  # CLOCK REQUIREMENT: lock expiry uses System.currentTimeMillis() on each
-  # backend. All Paper/Folia nodes MUST run NTP/chrony with max clock drift
-  # < 100ms. A fast clock may prematurely steal another server's lock; a
-  # slow clock may hold a lock past expiry. If you cannot guarantee clock
-  # sync, raise lock-timeout to absorb the drift (e.g. 120s for ±30s drift).
+  # Lock expiry uses MySQL server time (UNIX_TIMESTAMP), NOT JVM local time.
+  # This eliminates clock-skew issues between Paper/Folia nodes — all nodes
+  # share the same MySQL clock for lock expiry. NTP/chrony is still
+  # recommended for MySQL and Redis, but is no longer a hard requirement
+  # for Paper/Folia nodes.
   lock-timeout: 60
 
   # Heartbeat interval for online lock refresh (seconds).
