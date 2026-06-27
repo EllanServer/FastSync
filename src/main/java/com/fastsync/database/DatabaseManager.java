@@ -443,32 +443,29 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
-                // CAS update player_data with new Blob + clear lock + reset bitmap
-                // + increment component_generation. The generation increment
-                // invalidates all old component rows without deleting them —
-                // on load, only rows where generation == current generation are read.
-                // Old rows can be GC'd later by a background task.
-                //
-                // P0 (round 10): WHERE now includes lock_session_id so a stale
-                // session's quit save (whose lock was superseded by a new acquire)
-                // cannot release the new session's lock or overwrite its data.
-                int updated = dsl(conn).update(playerData)
-                    .set(DATA_FIELD, data)
-                    .set(VERSION_FIELD, VERSION_FIELD.plus(1))
-                    .set(CHECKSUM_FIELD, checksum)
-                    .set(LOCKED_BY_FIELD, (String) null)
-                    .set(LOCKED_AT_FIELD, (Long) null)
-                    .set(LOCK_SESSION_ID_FIELD, (String) null)
-                    .set(LAST_SERVER_FIELD, serverName)
-                    .set(LAST_UPDATED_FIELD, now)
-                    .set(COMPONENT_BITMAP_FIELD, 0L)
-                    .set(COMPONENT_GENERATION_FIELD, COMPONENT_GENERATION_FIELD.plus(1))
-                    .where(UUID_FIELD.eq(uuid.toString())
-                        .and(VERSION_FIELD.eq(expectedVersion))
-                        .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                        .and(LOCKED_BY_FIELD.eq(serverName))
-                        .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
-                    .execute();
+                // Raw JDBC for the CAS update — jOOQ Field type resolution
+                // caused lock_session_id WHERE mismatches on CI MySQL.
+                String sql = String.format(
+                    "UPDATE `%s` SET `data` = ?, `version` = `version` + 1, `checksum` = ?, " +
+                    "`locked_by` = NULL, `locked_at` = NULL, `lock_session_id` = NULL, " +
+                    "`last_server` = ?, `last_updated` = ?, " +
+                    "`component_bitmap` = 0, `component_generation` = `component_generation` + 1 " +
+                    "WHERE `uuid` = ? AND `version` = ? AND `fencing_token` = ? " +
+                    "AND `locked_by` = ? AND `lock_session_id` = ?",
+                    dataTable);
+                int updated;
+                try (var ps = conn.prepareStatement(sql)) {
+                    ps.setBytes(1, data);
+                    ps.setLong(2, checksum);
+                    ps.setString(3, serverName);
+                    ps.setLong(4, now);
+                    ps.setString(5, uuid.toString());
+                    ps.setLong(6, expectedVersion);
+                    ps.setLong(7, fencingToken);
+                    ps.setString(8, serverName);
+                    ps.setString(9, lockSessionId);
+                    updated = ps.executeUpdate();
+                }
 
                 if (updated <= 0) {
                     conn.rollback();
@@ -504,22 +501,27 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
-                int updated = dsl(conn).update(playerData)
-                    .set(DATA_FIELD, data)
-                    .set(VERSION_FIELD, VERSION_FIELD.plus(1))
-                    .set(CHECKSUM_FIELD, checksum)
-                    .set(LAST_SERVER_FIELD, serverName)
-                    .set(LAST_UPDATED_FIELD, now)
-                    .set(LOCKED_AT_FIELD, now)
-                    .set(COMPONENT_BITMAP_FIELD, 0L)
-                    .set(COMPONENT_GENERATION_FIELD, COMPONENT_GENERATION_FIELD.plus(1))
-                    // locked_by and lock_session_id are NOT cleared — we still hold the lock
-                    .where(UUID_FIELD.eq(uuid.toString())
-                        .and(VERSION_FIELD.eq(expectedVersion))
-                        .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                        .and(LOCKED_BY_FIELD.eq(serverName))
-                        .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
-                    .execute();
+                String sql = String.format(
+                    "UPDATE `%s` SET `data` = ?, `version` = `version` + 1, `checksum` = ?, " +
+                    "`last_server` = ?, `last_updated` = ?, `locked_at` = ?, " +
+                    "`component_bitmap` = 0, `component_generation` = `component_generation` + 1 " +
+                    "WHERE `uuid` = ? AND `version` = ? AND `fencing_token` = ? " +
+                    "AND `locked_by` = ? AND `lock_session_id` = ?",
+                    dataTable);
+                int updated;
+                try (var ps = conn.prepareStatement(sql)) {
+                    ps.setBytes(1, data);
+                    ps.setLong(2, checksum);
+                    ps.setString(3, serverName);
+                    ps.setLong(4, now);
+                    ps.setLong(5, now);
+                    ps.setString(6, uuid.toString());
+                    ps.setLong(7, expectedVersion);
+                    ps.setLong(8, fencingToken);
+                    ps.setString(9, serverName);
+                    ps.setString(10, lockSessionId);
+                    updated = ps.executeUpdate();
+                }
 
                 if (updated <= 0) {
                     conn.rollback();
@@ -614,14 +616,18 @@ public class DatabaseManager {
     public boolean refreshLock(UUID uuid, String serverName, long fencingToken, String lockSessionId) throws SQLException {
         requireLockSession(lockSessionId, "refreshLock");
         long now = System.currentTimeMillis();
-        try (Connection conn = dataSource.getConnection()) {
-            return dsl(conn).update(playerData)
-                .set(LOCKED_AT_FIELD, now)
-                .where(UUID_FIELD.eq(uuid.toString())
-                    .and(LOCKED_BY_FIELD.eq(serverName))
-                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                    .and(LOCK_SESSION_ID_FIELD.eq(lockSessionId)))
-                .execute() > 0;
+        String sql = String.format(
+            "UPDATE `%s` SET `locked_at` = ? " +
+            "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
+            dataTable);
+        try (Connection conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, now);
+            ps.setString(2, uuid.toString());
+            ps.setString(3, serverName);
+            ps.setLong(4, fencingToken);
+            ps.setString(5, lockSessionId);
+            return ps.executeUpdate() > 0;
         }
     }
 
