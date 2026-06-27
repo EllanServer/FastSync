@@ -130,13 +130,13 @@ class DatabaseManagerTest {
         long checksum = DatabaseManager.computeChecksum(data);
 
         // Acquire lock and save initial data
-        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "test-session");
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "session-a");
         assertTrue(lock.acquired());
         assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data, checksum, 0, lock.fencingToken(), "server-a", "session-a"));
 
         // Another server acquires lock (fencing token increments)
         databaseManager.releaseLock(uuid, "server-a", lock.fencingToken(), "session-a");
-        LockResult lock2 = databaseManager.acquireLock(uuid, "server-b", "test-session");
+        LockResult lock2 = databaseManager.acquireLock(uuid, "server-b", "session-b");
         assertTrue(lock2.acquired());
 
         // Save with newer data, using the current DB version as expectedVersion
@@ -164,7 +164,7 @@ class DatabaseManagerTest {
         long checksum = DatabaseManager.computeChecksum(data);
 
         // Server A acquires lock (token 1) and saves
-        LockResult lockA = databaseManager.acquireLock(uuid, "server-a", "test-session");
+        LockResult lockA = databaseManager.acquireLock(uuid, "server-a", "session-a");
         assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data, checksum, 0, lockA.fencingToken(), "server-a", "session-a"));
 
         // Server B acquires lock (token 2) and saves
@@ -190,7 +190,7 @@ class DatabaseManagerTest {
         byte[] data = new byte[]{10, 20, 30};
         long checksum = DatabaseManager.computeChecksum(data);
 
-        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "test-session");
+        LockResult lock = databaseManager.acquireLock(uuid, "server-a", "session-a");
         assertTrue(databaseManager.saveDataKeepLockClearComponents(uuid, data, checksum, 0, lock.fencingToken(), "server-a", "session-a"));
 
         VersionedData loaded = databaseManager.loadData(uuid);
