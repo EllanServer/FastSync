@@ -23,7 +23,7 @@ class DatabaseLockSessionTest {
     private static final Logger LOGGER = Logger.getLogger(DatabaseLockSessionTest.class.getName());
 
     private static boolean dockerAvailable;
-    private static MySQLContainer<?> mysql;
+    private static MySQLContainer mysql;
 
     private DatabaseManager databaseManager;
     private ConfigManager config;
@@ -36,7 +36,7 @@ class DatabaseLockSessionTest {
             return;
         }
 
-        mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.4"))
+        mysql = new MySQLContainer(DockerImageName.parse("mysql:8.4"))
             .withDatabaseName("fastsync_test")
             .withUsername("test")
             .withPassword("test");
