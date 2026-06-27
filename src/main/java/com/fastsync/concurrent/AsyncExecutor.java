@@ -1,8 +1,9 @@
 package com.fastsync.concurrent;
 
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -20,17 +21,52 @@ import java.util.logging.Logger;
  * <ul>
  *   <li>Named threads for easy debugging</li>
  *   <li>Bounded pool size to prevent resource exhaustion</li>
+ *   <li><b>Bounded queue</b> — tasks beyond {@code queueCapacity} are rejected
+ *       with {@link java.util.concurrent.RejectedExecutionException}, which
+ *       callers already handle (periodic save skips, SHUTDOWN synchronous
+ *       fallback, etc.)</li>
  *   <li>Graceful shutdown with timeout</li>
  *   <li>Proper exception logging via {@link Logger} (not stderr)</li>
+ * </ul>
+ *
+ * <h2>Why not {@code Executors.newFixedThreadPool}?</h2>
+ * <p>{@code Executors.newFixedThreadPool} uses an unbounded
+ * {@code LinkedBlockingQueue}. That means tasks never get rejected — they
+ * just queue forever. Under login storms, DB latency spikes, or Redis
+ * outages, the queue grows without limit and eventually exhausts heap. The
+ * {@code RejectedExecutionException} handling in SyncManager would never
+ * fire because the queue never fills.
+ *
+ * <p>This class uses a {@link ThreadPoolExecutor} with an
+ * {@link ArrayBlockingQueue} of size {@code queueCapacity} and
+ * {@link ThreadPoolExecutor.AbortPolicy}. When the queue is full, the
+ * caller gets a {@link RejectedExecutionException} immediately, which
+ * SyncManager already handles:
+ * <ul>
+ *   <li>Periodic save: skip (next tick will retry)</li>
+ *   <li>BULK /saveall: skip with QUEUE_FULL reason</li>
+ *   <li>SHUTDOWN: synchronous fallback (must persist data)</li>
+ *   <li>QUIT: synchronous fallback</li>
  * </ul>
  */
 public class AsyncExecutor {
 
-    private final ExecutorService executor;
+    private final ThreadPoolExecutor executor;
     private final Logger logger;
     private final String poolName;
 
-    public AsyncExecutor(Logger logger, String poolName, int poolSize) {
+    /**
+     * Create an executor with a bounded queue.
+     *
+     * @param logger        logger for uncaught exceptions and lifecycle events
+     * @param poolName      prefix for worker thread names
+     * @param poolSize      core = max pool size (fixed pool)
+     * @param queueCapacity maximum number of pending tasks before rejection.
+     *                      Must be {@code >= 1}. Caller is responsible for
+     *                      handling {@link java.util.concurrent.RejectedExecutionException}
+     *                      when submitting tasks.
+     */
+    public AsyncExecutor(Logger logger, String poolName, int poolSize, int queueCapacity) {
         this.logger = logger;
         this.poolName = poolName;
 
@@ -46,17 +82,30 @@ public class AsyncExecutor {
             }
         };
 
-        this.executor = Executors.newFixedThreadPool(
-            Math.max(2, poolSize),
-            threadFactory
+        int actualPoolSize = Math.max(2, poolSize);
+        int actualQueueCapacity = Math.max(1, queueCapacity);
+
+        this.executor = new ThreadPoolExecutor(
+            actualPoolSize,
+            actualPoolSize,
+            30L,
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(actualQueueCapacity),
+            threadFactory,
+            new ThreadPoolExecutor.AbortPolicy()
         );
 
-        logger.info("Async executor '" + poolName + "' initialized with " + poolSize + " threads.");
+        logger.info("Async executor '" + poolName + "' initialized with "
+            + actualPoolSize + " threads, queue capacity " + actualQueueCapacity + ".");
     }
 
     /**
      * Submit a task for async execution.
      * Exceptions are logged via the SLF4J/j.u.l logger (not stderr).
+     *
+     * @throws java.util.concurrent.RejectedExecutionException if the queue is full.
+     *         Callers must handle this — typically by skipping (periodic save)
+     *         or falling back to synchronous execution (QUIT/SHUTDOWN).
      */
     public void execute(Runnable task) {
         executor.execute(() -> {
@@ -71,6 +120,8 @@ public class AsyncExecutor {
 
     /**
      * Submit a task and return a CompletableFuture.
+     *
+     * @throws java.util.concurrent.RejectedExecutionException if the queue is full.
      */
     public java.util.concurrent.CompletableFuture<Void> submit(Runnable task) {
         return java.util.concurrent.CompletableFuture.runAsync(task, executor);
@@ -85,8 +136,8 @@ public class AsyncExecutor {
         executor.shutdown();
         try {
             if (!executor.awaitTermination(timeoutSeconds, TimeUnit.SECONDS)) {
-                logger.warning("[" + poolName + "] Forcing shutdown after " + timeoutSeconds + "s timeout");
-                executor.shutdownNow();
+                logger.warning("[" + poolName + "] Forcing shutdown after " + timeoutSeconds + "s timeout; "
+                    + executor.shutdownNow().size() + " tasks were still pending.");
                 if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                     logger.severe("[" + poolName + "] Executor did not terminate!");
                 }
@@ -110,19 +161,20 @@ public class AsyncExecutor {
      * Get the number of active tasks.
      */
     public int getActiveCount() {
-        if (executor instanceof java.util.concurrent.ThreadPoolExecutor tpe) {
-            return tpe.getActiveCount();
-        }
-        return -1;
+        return executor.getActiveCount();
     }
 
     /**
      * Get the queue size (pending tasks).
      */
     public int getQueueSize() {
-        if (executor instanceof java.util.concurrent.ThreadPoolExecutor tpe) {
-            return tpe.getQueue().size();
-        }
-        return -1;
+        return executor.getQueue().size();
+    }
+
+    /**
+     * Get the queue capacity (max pending tasks before rejection).
+     */
+    public int getQueueCapacity() {
+        return executor.getQueue().remainingCapacity() + executor.getQueue().size();
     }
 }

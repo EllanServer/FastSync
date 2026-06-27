@@ -200,9 +200,15 @@ public class SyncManager {
      * Initialize the sync manager with async executor and optional Redis.
      */
     public void initialize() {
-        // Create dedicated thread pool (NOT ForkJoinPool.commonPool)
+        // Create dedicated thread pool (NOT ForkJoinPool.commonPool).
+        // Pool size: half of config poolSize (the other half is reserved for
+        // Redis/heartbeat/cleanup tasks). Queue capacity: from config
+        // database.queue-capacity (default 256). Bounded queue is CRITICAL —
+        // see AsyncExecutor javadoc for why an unbounded queue would let
+        // tasks pile up under DB latency / login storms and exhaust heap.
         int poolSize = Math.max(2, config.getPoolSize() / 2);
-        asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize);
+        int queueCapacity = Math.max(1, config.getQueueCapacity());
+        asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize, queueCapacity);
 
         // Login backpressure semaphore — limits concurrent pre-login loads
         loginLoadSemaphore = new java.util.concurrent.Semaphore(config.getMaxConcurrentLoads(), true);
@@ -475,11 +481,17 @@ public class SyncManager {
             return LoadResult.locked();
         }
 
-        // Step 2: Load data from database
+        // Step 2: Load data from database.
+        // Use loadPlayerDataRow() unconditionally — it returns the full row
+        // including component_bitmap and component_generation, so we avoid a
+        // second round-trip when component-storage is enabled. When
+        // component-storage is disabled, the extra two columns are read but
+        // unused (no extra cost beyond the column being in the SELECT list).
         try {
             long startTime = System.nanoTime();
 
-            VersionedData loaded = databaseManager.loadData(uuid);
+            com.fastsync.database.DatabaseManager.PlayerDataRow loaded =
+                databaseManager.loadPlayerDataRow(uuid);
             long loadElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
             if (loadLatency != null) loadLatency.record(loadElapsedMs);
 
@@ -537,51 +549,49 @@ public class SyncManager {
             PlayerData data = PlayerDataSerializer.deserialize(decompressed);
 
             // Phase 3: merge per-component overrides from player_component table.
-            // Use loadPlayerDataRow to get component_bitmap AND component_generation,
-            // then only load component rows that match the current generation.
-            // This prevents stale component rows from a previous baseline (before
-            // a full Blob save incremented generation) from overriding the fresh Blob.
-            if (config.isComponentStorageEnabled()) {
-                com.fastsync.database.DatabaseManager.PlayerDataRow row =
-                    databaseManager.loadPlayerDataRow(uuid);
-                long bitmap = row.componentBitmap();
-                long generation = row.componentGeneration();
-                if (bitmap != 0) {
-                    java.util.Set<String> migratedNames = new java.util.HashSet<>();
-                    for (com.fastsync.sync.dirty.ComponentDirtyMask.Component c :
-                            com.fastsync.sync.dirty.ComponentDirtyMask.ALL) {
-                        if ((bitmap & (1L << c.ordinal())) != 0) {
-                            migratedNames.add(c.name());
-                        }
+            // loaded already contains component_bitmap AND component_generation
+            // (from the single loadPlayerDataRow call above), so no second
+            // round-trip is needed. Only load component rows that match the
+            // current generation — this prevents stale component rows from a
+            // previous baseline (before a full Blob save incremented generation)
+            // from overriding the fresh Blob.
+            long bitmap = loaded.componentBitmap();
+            long generation = loaded.componentGeneration();
+            if (config.isComponentStorageEnabled() && bitmap != 0) {
+                java.util.Set<String> migratedNames = new java.util.HashSet<>();
+                for (com.fastsync.sync.dirty.ComponentDirtyMask.Component c :
+                        com.fastsync.sync.dirty.ComponentDirtyMask.ALL) {
+                    if ((bitmap & (1L << c.ordinal())) != 0) {
+                        migratedNames.add(c.name());
                     }
-                    if (!migratedNames.isEmpty()) {
-                        // Load only components matching the current generation
-                        java.util.Map<String, com.fastsync.database.DatabaseManager.ComponentData> components =
-                            databaseManager.loadComponentsWithGeneration(uuid, migratedNames, generation);
-                        for (var entry : components.entrySet()) {
-                            String name = entry.getKey();
-                            byte[] compData = entry.getValue().data();
-                            if (entry.getValue().hasData()) {
-                                try {
-                                    byte[] decompressedComp = CompressionUtil.unwrap(compData);
-                                    // Verify component checksum before deserializing
-                                    if (config.isVerifyChecksum()
-                                            && !DatabaseManager.verifyChecksum(decompressedComp, entry.getValue().checksum())) {
-                                        logger.warning("[Load] Component checksum mismatch for "
-                                            + name + " on " + uuid + " — skipping component override");
-                                        continue;
-                                    }
-                                    PlayerDataSerializer.deserializeComponent(name, decompressedComp, data);
-                                } catch (Exception e) {
-                                    logger.warning("[Load] Failed to deserialize component "
-                                        + name + " for " + uuid + ": " + e.getMessage());
+                }
+                if (!migratedNames.isEmpty()) {
+                    // Load only components matching the current generation
+                    java.util.Map<String, com.fastsync.database.DatabaseManager.ComponentData> components =
+                        databaseManager.loadComponentsWithGeneration(uuid, migratedNames, generation);
+                    for (var entry : components.entrySet()) {
+                        String name = entry.getKey();
+                        byte[] compData = entry.getValue().data();
+                        if (entry.getValue().hasData()) {
+                            try {
+                                byte[] decompressedComp = CompressionUtil.unwrap(compData);
+                                // Verify component checksum before deserializing
+                                if (config.isVerifyChecksum()
+                                        && !DatabaseManager.verifyChecksum(decompressedComp, entry.getValue().checksum())) {
+                                    logger.warning("[Load] Component checksum mismatch for "
+                                        + name + " on " + uuid + " — skipping component override");
+                                    continue;
                                 }
+                                PlayerDataSerializer.deserializeComponent(name, decompressedComp, data);
+                            } catch (Exception e) {
+                                logger.warning("[Load] Failed to deserialize component "
+                                    + name + " for " + uuid + ": " + e.getMessage());
                             }
                         }
-                        if (config.isDebug()) {
-                            logger.info("Merged " + components.size() + " component overrides for " + uuid
-                                + " (gen=" + generation + ", bitmap=0x" + Long.toHexString(bitmap) + ")");
-                        }
+                    }
+                    if (config.isDebug()) {
+                        logger.info("Merged " + components.size() + " component overrides for " + uuid
+                            + " (gen=" + generation + ", bitmap=0x" + Long.toHexString(bitmap) + ")");
                     }
                 }
             }
@@ -712,7 +722,18 @@ public class SyncManager {
         }
 
         // Offhand
-        if (config.isSyncInventory() && data.getOffhand() != null) {
+        // When sync-inventory is enabled, the offhand slot is owned by FastSync.
+        // We must apply the data's offhand state even when it is null (= empty),
+        // otherwise the player's previous offhand item silently persists.
+        // This matters even when clear-before-apply=false: without this, a
+        // player who cleared their offhand on server A and saved (offhand=null)
+        // would still see the old offhand on server B if server B's loaded data
+        // came from a full Blob that did not contain an offhand field.
+        //
+        // The component-storage path's offhandPresent flag (see PlayerDataSerializer)
+        // distinguishes "explicitly empty" from "legacy/no data" at serialize time;
+        // here we just apply whatever data.getOffhand() returns, including null.
+        if (config.isSyncInventory()) {
             player.getInventory().setItemInOffHand(data.getOffhand());
         }
 
@@ -749,7 +770,23 @@ public class SyncManager {
         }
 
         // Potion effects
+        // When sync-potion-effects is enabled, the player's effect list is owned
+        // by FastSync. We must clear existing effects BEFORE applying the data's
+        // effects, otherwise effects that were present on the target server but
+        // not in the loaded data would silently persist. This matters even when
+        // clear-before-apply=false — the clear-before-apply block above only
+        // runs when that config is true, so without this local clear, the
+        // effect list would be a union of (target server's effects) ∪ (data's
+        // effects) instead of exactly (data's effects).
+        //
+        // Note: data.getPotionEffects() == null means "not collected / unknown";
+        // in that case we do NOT touch the player's effects (preserve target
+        // state). data.getPotionEffects() == empty list means "explicitly no
+        // effects" and we clear all.
         if (config.isSyncPotionEffects() && data.getPotionEffects() != null) {
+            for (PotionEffect effect : new ArrayList<>(player.getActivePotionEffects())) {
+                player.removePotionEffect(effect.getType());
+            }
             for (PlayerData.PotionEffectData effectData : data.getPotionEffects()) {
                 PotionEffect effect = PlayerDataSerializer.toPotionEffect(effectData);
                 if (effect != null) {

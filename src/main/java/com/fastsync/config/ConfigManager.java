@@ -328,7 +328,11 @@ public class ConfigManager {
         syncFlight = source.getBoolean("sync.sync-flight", true);
         syncPDC = source.getBoolean("sync.sync-pdc", true);
         syncLocation = source.getBoolean("sync.sync-location", false);
-        syncLockedMaps = source.getBoolean("sync.sync-locked-maps", true);
+        // sync-locked-maps is reserved / not implemented. Default MUST be false
+        // to match the bundled config.yml and to avoid the status command
+        // showing "Enabled" for a feature that does nothing. Old config files
+        // missing this key previously got true, which was misleading.
+        syncLockedMaps = source.getBoolean("sync.sync-locked-maps", false);
 
         // PDC strategy
         pdcMode = source.getString("pdc.mode",
