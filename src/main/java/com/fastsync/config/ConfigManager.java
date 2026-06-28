@@ -130,6 +130,18 @@ public class ConfigManager {
     // Cluster
     private String clusterId;
 
+    // Production mode
+    private boolean productionEnabled;
+    private boolean productionRequireRedis;
+    private boolean productionRequireClusterId;
+    private boolean productionAllowFinalSaveSyncFallback;
+
+    // Final-save executor
+    private int finalSaveThreads;
+    private int finalSaveQueueCapacity;
+    private int finalSaveShutdownTimeoutSeconds;
+    private boolean finalSaveAllowSyncFallback;
+
     // Locked commands while loading
     private boolean cancelCommandsWhileLocked;
 
@@ -269,24 +281,30 @@ public class ConfigManager {
             }
         }
 
-        // 3) Multi-cluster DB isolation (round 16, P0 #1). cluster-id only
-        //    isolates Redis pub/sub streams; the DB tables key on uuid with
-        //    no cluster_id column. A non-empty cluster-id paired with the
-        //    default table-prefix is almost always a misconfiguration: the
-        //    operator intends to run multiple clusters against one MySQL
-        //    instance, but the DB rows would silently collide. Force them to
-        //    pick a distinct table-prefix (or database) per cluster.
-        if (clusterId != null && !clusterId.isBlank()
-                && "fastsync_".equals(tablePrefix)) {
-            throw new RuntimeException(
-                "Refusing to start: cluster-id='" + clusterId + "' is set but "
-                    + "database.table-prefix is still the default 'fastsync_'. "
-                    + "cluster-id only isolates Redis messaging, NOT database "
-                    + "rows — two clusters sharing the same MySQL database + "
-                    + "table-prefix would silently overwrite each other's "
-                    + "player data. Set a distinct database.table-prefix per "
-                    + "cluster (e.g. '" + clusterId.toLowerCase() + "_'), or "
-                    + "leave cluster-id empty for a single-cluster deploy.");
+        // 3) Multi-cluster DB isolation. v2 schema uses (cluster_id, uuid) PK,
+        //    so different clusters sharing the same table-prefix is now safe
+        //    at the DB level. But Redis pub/sub still needs distinct cluster-ids
+        //    for namespace isolation. Warn if cluster-id is empty in a multi-server setup.
+        if (clusterId == null || clusterId.isBlank()) {
+            logger.warning("[Config] cluster-id is empty. Redis pub/sub will use the default namespace. "
+                + "If running multiple server clusters on the same Redis, set a distinct cluster-id per cluster.");
+        }
+
+        // 4) Production mode checks (round 14)
+        if (productionEnabled) {
+            if (productionRequireClusterId && (clusterId == null || clusterId.isBlank())) {
+                throw new RuntimeException(
+                    "production.require-cluster-id=true but cluster-id is empty. "
+                        + "Set a non-empty cluster-id in config.yml.");
+            }
+            if (productionRequireRedis && !redisEnabled) {
+                throw new RuntimeException(
+                    "production.require-redis=true but redis.enabled=false. "
+                        + "Redis is mandatory in production mode for real-time lock coordination.");
+            }
+            logger.info("[Config] Production mode enabled. Redis required=" + productionRequireRedis
+                + ", cluster-id required=" + productionRequireClusterId
+                + ", final-save sync fallback allowed=" + productionAllowFinalSaveSyncFallback);
         }
     }
 
@@ -501,6 +519,18 @@ public class ConfigManager {
         // Cluster
         clusterId = source.getString("cluster-id", "");
 
+        // Production mode
+        productionEnabled = source.getBoolean("production.enabled", false);
+        productionRequireRedis = source.getBoolean("production.require-redis", true);
+        productionRequireClusterId = source.getBoolean("production.require-cluster-id", true);
+        productionAllowFinalSaveSyncFallback = source.getBoolean("production.allow-final-save-sync-fallback", false);
+
+        // Final-save executor
+        finalSaveThreads = source.getInt("final-save.threads", 4);
+        finalSaveQueueCapacity = source.getInt("final-save.queue-capacity", 8192);
+        finalSaveShutdownTimeoutSeconds = source.getInt("final-save.shutdown-timeout-seconds", 60);
+        finalSaveAllowSyncFallback = source.getBoolean("final-save.allow-sync-fallback", false);
+
         // Locked commands while loading
         cancelCommandsWhileLocked = source.getBoolean("sync.cancel-commands-while-locked", false);
 
@@ -632,6 +662,18 @@ public class ConfigManager {
     public boolean isSaveOnWorldSave() { return saveOnWorldSave; }
 
     public String getClusterId() { return clusterId; }
+
+    // Production mode
+    public boolean isProductionEnabled() { return productionEnabled; }
+    public boolean isProductionRequireRedis() { return productionRequireRedis; }
+    public boolean isProductionRequireClusterId() { return productionRequireClusterId; }
+    public boolean isProductionAllowFinalSaveSyncFallback() { return productionAllowFinalSaveSyncFallback; }
+
+    // Final-save executor
+    public int getFinalSaveThreads() { return finalSaveThreads; }
+    public int getFinalSaveQueueCapacity() { return finalSaveQueueCapacity; }
+    public int getFinalSaveShutdownTimeoutSeconds() { return finalSaveShutdownTimeoutSeconds; }
+    public boolean isFinalSaveAllowSyncFallback() { return finalSaveAllowSyncFallback; }
 
     public boolean isCancelCommandsWhileLocked() { return cancelCommandsWhileLocked; }
 

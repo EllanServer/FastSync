@@ -285,8 +285,10 @@ public class SyncManager {
         // stuck save on one thread does not head-of-line block the next QUIT
         // save; queue is 4x the main queue so QUIT saves rarely fall back to
         // synchronous execution on the event thread.
-        int finalSaveQueueCapacity = Math.max(8, queueCapacity * 4);
-        finalSaveExecutor = new AsyncExecutor(logger, "FastSync-FinalSave", 2, finalSaveQueueCapacity);
+        // Round 14: final-save executor uses configurable threads + queue capacity.
+        int finalThreads = Math.max(2, config.getFinalSaveThreads());
+        int finalQueue = Math.max(1024, config.getFinalSaveQueueCapacity());
+        finalSaveExecutor = new AsyncExecutor(logger, "FastSync-FinalSave", finalThreads, finalQueue);
 
         // Login backpressure semaphore — limits concurrent pre-login loads
         loginLoadSemaphore = new java.util.concurrent.Semaphore(config.getMaxConcurrentLoads(), true);
@@ -326,6 +328,11 @@ public class SyncManager {
                 redissonManager.initialize();
                 logger.info("Redis coordination enabled (Redisson: Pub/Sub + Streams).");
             } catch (Exception e) {
+                if (config.isProductionEnabled() && config.isProductionRequireRedis()) {
+                    throw new RuntimeException(
+                        "Redis is required in production mode (production.require-redis=true) "
+                            + "but initialization failed. Refusing to start. Error: " + e.getMessage(), e);
+                }
                 logger.log(Level.SEVERE, "Failed to connect to Redis! Falling back to database polling.", e);
                 redissonManager = null;
             }
@@ -2703,6 +2710,11 @@ public class SyncManager {
         if (finalSaveExecutor != null) {
             finalSaveExecutor.shutdown(config.getShutdownFinalSaveExecutorTimeoutSeconds());
             finalSaveExecutor = null;
+        }
+
+        // Round 14: close SnapshotManager's dedicated executor
+        if (snapshotManager != null) {
+            snapshotManager.close();
         }
     }
 

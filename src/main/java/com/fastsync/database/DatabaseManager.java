@@ -43,6 +43,7 @@ public class DatabaseManager {
     // Column names are prefix-independent; only the table name carries the
     // configured prefix, so the column Fields can be static constants while the
     // Table is resolved once the prefix is known in initialize().
+    private static final Field<String> CLUSTER_ID_FIELD = field(name("cluster_id"), String.class);
     private static final Field<String> UUID_FIELD = field(name("uuid"), String.class);
     private static final Field<byte[]> DATA_FIELD = field(name("data"), byte[].class);
     private static final Field<Long> VERSION_FIELD = field(name("version"), Long.class);
@@ -80,11 +81,20 @@ public class DatabaseManager {
         }
     }
 
+    /**
+     * Required schema version for this build of FastSync. The v2 schema adds
+     * a {@code cluster_id} column to every table's PRIMARY KEY and introduces
+     * a {@code schema_version} bookkeeping table. FastSync refuses to start
+     * against a database whose schema_version is older (or newer) than this.
+     */
+    private static final int REQUIRED_SCHEMA_VERSION = 2;
+
     private final Logger logger;
     private final ConfigManager config;
     private HikariDataSource dataSource;
     private String dataTable;
     private String componentTable;
+    private String clusterId;
     private Table<Record> playerData;
     private Table<Record> playerComponent;
 
@@ -103,6 +113,37 @@ public class DatabaseManager {
     }
 
     /**
+     * Validate and normalize the configured cluster-id.
+     *
+     * <p>The cluster-id is a short opaque identifier (e.g. {@code "prod-eu-1"})
+     * that becomes part of every PRIMARY KEY in the v2 schema. It MUST be
+     * explicitly set — empty is rejected, because a missing cluster-id silently
+     * collapses multiple clusters onto the same {@code cluster_id = ""} key
+     * space and reintroduces exactly the cross-cluster collision the v2 schema
+     * was designed to prevent.
+     *
+     * <p>The charset is restricted to filename-safe ASCII (letters, digits,
+     * {@code _}, {@code .}, {@code -}) and capped at 64 characters — the same
+     * width as the {@code VARCHAR(64)} column it lands in. There is no default
+     * and no fallback; callers must configure {@code cluster-id} explicitly.
+     *
+     * @param raw the raw configured value (may be null/blank)
+     * @return the trimmed, validated cluster-id
+     * @throws IllegalArgumentException if {@code raw} is null/blank or contains
+     *         characters outside the allowed set
+     */
+    private static String normalizeClusterId(String raw) {
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalArgumentException("cluster-id must be explicitly set.");
+        }
+        String value = raw.trim();
+        if (!value.matches("[A-Za-z0-9_.-]{1,64}")) {
+            throw new IllegalArgumentException("Invalid cluster-id '" + raw + "'. Allowed: A-Z a-z 0-9 _ . - , max 64 chars.");
+        }
+        return value;
+    }
+
+    /**
      * Initialize the database connection pool and create tables.
      */
     public void initialize() throws SQLException {
@@ -118,6 +159,13 @@ public class DatabaseManager {
         playerData = table(name(dataTable));
         componentTable = config.getTablePrefix() + "player_component";
         playerComponent = table(name(componentTable));
+
+        // Normalize the cluster-id BEFORE any DB work. This MUST be set
+        // explicitly — the v2 schema keys every row by cluster_id, so an empty
+        // value would silently collapse multiple clusters onto the same key
+        // space. Throws IllegalArgumentException (propagates out of initialize)
+        // if missing or malformed.
+        clusterId = normalizeClusterId(config.getClusterId());
 
         HikariConfig hikariConfig = new HikariConfig();
 
@@ -153,6 +201,14 @@ public class DatabaseManager {
         hikariConfig.addDataSourceProperty("maintainTimeStats", "false");
 
         dataSource = new HikariDataSource(hikariConfig);
+
+        // Validate the existing schema state BEFORE issuing any DDL.
+        // This either (a) greenlights a fresh install (no old tables, no
+        // schema_version table) — createTables() will then create everything,
+        // or (b) greenlights an existing v2 install (schema_version row == 2),
+        // or (c) refuses to start against an old v1 schema (no cluster_id) or
+        // a mismatched schema_version.
+        validateSchemaVersion();
 
         createTables();
         // P1 (round 15): greenfield schema self-check. Verifies that the DDL
@@ -193,7 +249,13 @@ public class DatabaseManager {
     }
 
     /**
-     * Create the player data and component tables if they don't exist.
+     * Create the player_data, player_component, and schema_version tables.
+     *
+     * <p>v2 schema: every table's PRIMARY KEY starts with {@code cluster_id},
+     * so multiple FastSync clusters can share the same MySQL database without
+     * colliding on the same UUID. The {@code schema_version} table records
+     * which schema generation this database is on; {@link #validateSchemaVersion()}
+     * refuses to start against an incompatible generation.
      *
      * <p>DDL is issued as raw SQL via {@link DSLContext#execute(String)} because
      * jOOQ's DDL DSL is far more verbose than the equivalent CREATE TABLE
@@ -202,6 +264,7 @@ public class DatabaseManager {
     private void createTables() throws SQLException {
         String sql = String.format("""
             CREATE TABLE IF NOT EXISTS `%s` (
+                `cluster_id` VARCHAR(64) NOT NULL,
                 `uuid` VARCHAR(36) NOT NULL,
                 `data` LONGBLOB NOT NULL,
                 `version` BIGINT NOT NULL DEFAULT 0,
@@ -214,8 +277,9 @@ public class DatabaseManager {
                 `last_updated` BIGINT NOT NULL DEFAULT 0,
                 `component_bitmap` BIGINT NOT NULL DEFAULT 0,
                 `component_generation` BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (`uuid`),
-                INDEX idx_locked (`locked_by`, `locked_at`)
+                PRIMARY KEY (`cluster_id`, `uuid`),
+                INDEX `idx_locked` (`cluster_id`, `locked_by`, `locked_at`),
+                INDEX `idx_uuid` (`uuid`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """, dataTable);
 
@@ -225,8 +289,10 @@ public class DatabaseManager {
 
         // Per-component storage table (phase 2). Each row holds one component
         // (inventory, vitals, food, etc.) for one player, with its own version
-        // and checksum. The composite PK (uuid, component) gives O(1) point
-        // lookups and lets us UPDATE only the changed component on save.
+        // and checksum. The composite PK (cluster_id, uuid, component) gives
+        // O(1) point lookups and lets us UPDATE only the changed component on
+        // save. cluster_id is the first PK column so multiple clusters can
+        // share the table without colliding.
         //
         // The `generation` column tracks which full-Blob baseline this component
         // row belongs to. On load, only rows where generation == player_data.component_generation
@@ -234,6 +300,7 @@ public class DatabaseManager {
         // baseline that has been superseded by a full Blob save).
         String componentTableSql = String.format("""
             CREATE TABLE IF NOT EXISTS `%s` (
+                `cluster_id` VARCHAR(64) NOT NULL,
                 `uuid` VARCHAR(36) NOT NULL,
                 `component` VARCHAR(32) NOT NULL,
                 `generation` BIGINT NOT NULL DEFAULT 0,
@@ -241,13 +308,135 @@ public class DatabaseManager {
                 `version` BIGINT NOT NULL DEFAULT 0,
                 `checksum` BIGINT NOT NULL DEFAULT 0,
                 `updated_at` BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (`uuid`, `component`),
-                INDEX idx_uuid_generation (`uuid`, `generation`)
+                PRIMARY KEY (`cluster_id`, `uuid`, `component`),
+                INDEX `idx_uuid_generation` (`cluster_id`, `uuid`, `generation`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """, componentTable);
 
         try (Connection conn = dataSource.getConnection()) {
             dsl(conn).execute(componentTableSql);
+        }
+
+        // schema_version bookkeeping table. Single row (id=1) carrying the
+        // schema generation this database was initialized with. Future
+        // migrations would bump this; for v2 there is no migration path —
+        // a mismatched version is a hard refusal (drop & re-init).
+        String schemaVersionTable = dataTable.replace("player_data", "schema_version");
+        String schemaVersionSql = String.format("""
+            CREATE TABLE IF NOT EXISTS `%s` (
+                `id` TINYINT NOT NULL PRIMARY KEY,
+                `version` INT NOT NULL,
+                `updated_at` BIGINT NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """, schemaVersionTable);
+
+        try (Connection conn = dataSource.getConnection()) {
+            dsl(conn).execute(schemaVersionSql);
+            // Seed the version row if the table is empty. ON DUPLICATE KEY
+            // UPDATE keeps this idempotent across restarts without bumping
+            // updated_at on every boot — the row is only written once, when
+            // the table is freshly created.
+            String seedSql = String.format(
+                "INSERT INTO `%s` (id, version, updated_at) VALUES (1, ?, ?)",
+                schemaVersionTable);
+            try (var ps = conn.prepareStatement(seedSql)) {
+                ps.setInt(1, REQUIRED_SCHEMA_VERSION);
+                ps.setLong(2, System.currentTimeMillis());
+                ps.executeUpdate();
+            }
+        }
+    }
+
+    /**
+     * Validate the existing schema state before issuing any DDL.
+     *
+     * <p>Three branches:
+     * <ol>
+     *   <li>No {@code schema_version} table AND no {@code player_data} table —
+     *       fresh install. {@link #createTables()} will create everything.</li>
+     *   <li>No {@code schema_version} table but {@code player_data} exists
+     *       without a {@code cluster_id} column — old v1 schema. Refuse to
+     *       start: this is a greenfield v2 deploy, the operator must DROP the
+     *       stale tables first.</li>
+     *   <li>{@code schema_version} table exists with a row — check the version
+     *       matches {@link #REQUIRED_SCHEMA_VERSION}. Older or newer both refuse.</li>
+     * </ol>
+     *
+     * <p>This is read-only: it never ALTERs or DROPs anything. The refusal
+     * messages tell the operator exactly what to drop.
+     */
+    private void validateSchemaVersion() throws SQLException {
+        String schemaVersionTable = dataTable.replace("player_data", "schema_version");
+        String checkOldSql = "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?";
+        String checkVersionSql = "SELECT version FROM `" + schemaVersionTable + "` WHERE id = 1";
+
+        try (Connection conn = dataSource.getConnection()) {
+            // Check if schema_version table exists.
+            boolean schemaVersionExists = false;
+            try (var ps = conn.prepareStatement(checkOldSql)) {
+                ps.setString(1, conn.getCatalog());
+                ps.setString(2, schemaVersionTable);
+                try (var rs = ps.executeQuery()) {
+                    schemaVersionExists = rs.next();
+                }
+            }
+
+            if (!schemaVersionExists) {
+                // Check if old player_data table exists (without cluster_id).
+                boolean oldPlayerDataExists = false;
+                try (var ps = conn.prepareStatement(checkOldSql)) {
+                    ps.setString(1, conn.getCatalog());
+                    ps.setString(2, dataTable);
+                    try (var rs = ps.executeQuery()) {
+                        oldPlayerDataExists = rs.next();
+                    }
+                }
+
+                if (oldPlayerDataExists) {
+                    // Check if it has cluster_id column.
+                    boolean hasClusterId = false;
+                    try (var ps = conn.prepareStatement(
+                        "SELECT 1 FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = 'cluster_id'")) {
+                        ps.setString(1, conn.getCatalog());
+                        ps.setString(2, dataTable);
+                        try (var rs = ps.executeQuery()) {
+                            hasClusterId = rs.next();
+                        }
+                    }
+                    if (!hasClusterId) {
+                        throw new SQLException("Old database tables detected (without cluster_id). " +
+                            "This is a greenfield v2 deployment. Please DROP all fastsync tables first:\n" +
+                            "DROP TABLE IF EXISTS " + componentTable + ";\n" +
+                            "DROP TABLE IF EXISTS " + dataTable + ";\n" +
+                            "DROP TABLE IF EXISTS " + dataTable.replace("player_data", "snapshots") + ";\n" +
+                            "DROP TABLE IF EXISTS " + schemaVersionTable + ";");
+                    }
+                }
+                // No old tables, no schema_version — fresh install.
+                // createTables() will create everything.
+                return;
+            }
+
+            // schema_version table exists — check version.
+            try (var ps = conn.prepareStatement(checkVersionSql)) {
+                try (var rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        int version = rs.getInt("version");
+                        if (version < REQUIRED_SCHEMA_VERSION) {
+                            throw new SQLException("Database schema version " + version + " is older than required version " +
+                                REQUIRED_SCHEMA_VERSION + ". Please DROP all fastsync tables and restart.");
+                        }
+                        if (version > REQUIRED_SCHEMA_VERSION) {
+                            throw new SQLException("Database schema version " + version + " is newer than supported version " +
+                                REQUIRED_SCHEMA_VERSION + ". Downgrade not supported. Please update FastSync.");
+                        }
+                        // Version matches — OK.
+                        return;
+                    }
+                }
+            }
+            // schema_version table exists but no row — fresh schema_version
+            // table, will be populated by createTables().
         }
     }
 
@@ -269,12 +458,12 @@ public class DatabaseManager {
      */
     private void validateGreenfieldSchemaStrict() throws SQLException {
         requireColumns(dataTable,
-            "uuid", "data", "version", "checksum",
+            "cluster_id", "uuid", "data", "version", "checksum",
             "fencing_token", "locked_by", "locked_at", "lock_session_id",
             "last_server", "last_updated",
             "component_bitmap", "component_generation");
         requireColumns(componentTable,
-            "uuid", "component", "generation",
+            "cluster_id", "uuid", "component", "generation",
             "data", "version", "checksum", "updated_at");
     }
 
@@ -408,8 +597,8 @@ public class DatabaseManager {
         // on locked_by here, so the same-serverName quick-reconnect guard
         // continues to come from the read-back's lock_session_id check.
         String sql = String.format("""
-            INSERT INTO `%s` (uuid, data, version, checksum, fencing_token, locked_by, locked_at, lock_session_id, last_server, last_updated)
-            VALUES (?, '', 0, 0, 1, ?, ?, ?, NULL, 0)
+            INSERT INTO `%s` (cluster_id, uuid, data, version, checksum, fencing_token, locked_by, locked_at, lock_session_id, last_server, last_updated)
+            VALUES (?, ?, '', 0, 0, 1, ?, ?, ?, NULL, 0)
             ON DUPLICATE KEY UPDATE
                 fencing_token = IF(locked_at IS NULL OR locked_at < ?,
                                    LAST_INSERT_ID(fencing_token + 1),
@@ -429,6 +618,7 @@ public class DatabaseManager {
             DSLContext dsl = dsl(conn);
 
             dsl.execute(sql,
+                clusterId,        // INSERT: cluster_id
                 uuid.toString(),  // INSERT: uuid
                 serverName,       // INSERT: locked_by
                 now,              // INSERT: locked_at
@@ -446,13 +636,14 @@ public class DatabaseManager {
             // raw JDBC (not jOOQ) to avoid Field type resolution issues that
             // caused null returns on CI MySQL.
             String readSql = String.format(
-                "SELECT `fencing_token`, `locked_by`, `lock_session_id` FROM `%s` WHERE `uuid` = ?",
+                "SELECT `fencing_token`, `locked_by`, `lock_session_id` FROM `%s` WHERE `cluster_id` = ? AND `uuid` = ?",
                 dataTable);
             long readToken = 0;
             String readLockedBy = null;
             String readSessionId = null;
             try (var ps = conn.prepareStatement(readSql)) {
-                ps.setString(1, uuid.toString());
+                ps.setString(1, clusterId);
+                ps.setString(2, uuid.toString());
                 try (var rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         return LockResult.FAILED;
@@ -525,7 +716,7 @@ public class DatabaseManager {
                     "`locked_by` = NULL, `locked_at` = NULL, `lock_session_id` = NULL, " +
                     "`last_server` = ?, `last_updated` = ?, " +
                     "`component_bitmap` = 0, `component_generation` = `component_generation` + 1 " +
-                    "WHERE `uuid` = ? AND `version` = ? AND `fencing_token` = ? " +
+                    "WHERE `cluster_id` = ? AND `uuid` = ? AND `version` = ? AND `fencing_token` = ? " +
                     "AND `locked_by` = ? AND `lock_session_id` = ?",
                     dataTable);
                 int updated;
@@ -534,11 +725,12 @@ public class DatabaseManager {
                     ps.setLong(2, checksum);
                     ps.setString(3, serverName);
                     ps.setLong(4, now);
-                    ps.setString(5, uuid.toString());
-                    ps.setLong(6, expectedVersion);
-                    ps.setLong(7, fencingToken);
-                    ps.setString(8, serverName);
-                    ps.setString(9, lockSessionId);
+                    ps.setString(5, clusterId);
+                    ps.setString(6, uuid.toString());
+                    ps.setLong(7, expectedVersion);
+                    ps.setLong(8, fencingToken);
+                    ps.setString(9, serverName);
+                    ps.setString(10, lockSessionId);
                     updated = ps.executeUpdate();
                 }
 
@@ -580,7 +772,7 @@ public class DatabaseManager {
                     "UPDATE `%s` SET `data` = ?, `version` = `version` + 1, `checksum` = ?, " +
                     "`last_server` = ?, `last_updated` = ?, `locked_at` = ?, " +
                     "`component_bitmap` = 0, `component_generation` = `component_generation` + 1 " +
-                    "WHERE `uuid` = ? AND `version` = ? AND `fencing_token` = ? " +
+                    "WHERE `cluster_id` = ? AND `uuid` = ? AND `version` = ? AND `fencing_token` = ? " +
                     "AND `locked_by` = ? AND `lock_session_id` = ?",
                     dataTable);
                 int updated;
@@ -590,11 +782,12 @@ public class DatabaseManager {
                     ps.setString(3, serverName);
                     ps.setLong(4, now);
                     ps.setLong(5, now);
-                    ps.setString(6, uuid.toString());
-                    ps.setLong(7, expectedVersion);
-                    ps.setLong(8, fencingToken);
-                    ps.setString(9, serverName);
-                    ps.setString(10, lockSessionId);
+                    ps.setString(6, clusterId);
+                    ps.setString(7, uuid.toString());
+                    ps.setLong(8, expectedVersion);
+                    ps.setLong(9, fencingToken);
+                    ps.setString(10, serverName);
+                    ps.setString(11, lockSessionId);
                     updated = ps.executeUpdate();
                 }
 
@@ -620,7 +813,7 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             Long token = dsl(conn).select(FENCING_TOKEN_FIELD)
                 .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
+                .where(UUID_FIELD.eq(uuid.toString()).and(CLUSTER_ID_FIELD.eq(clusterId)))
                 .fetchOne(FENCING_TOKEN_FIELD);
             return token != null ? token : -1;
         }
@@ -634,7 +827,7 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             Long version = dsl(conn).select(VERSION_FIELD)
                 .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
+                .where(UUID_FIELD.eq(uuid.toString()).and(CLUSTER_ID_FIELD.eq(clusterId)))
                 .fetchOne(VERSION_FIELD);
             return version != null ? version : -1;
         }
@@ -685,7 +878,7 @@ public class DatabaseManager {
             Record r = dsl(conn)
                 .select(VERSION_FIELD, FENCING_TOKEN_FIELD, LOCKED_BY_FIELD, LOCK_SESSION_ID_FIELD)
                 .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
+                .where(UUID_FIELD.eq(uuid.toString()).and(CLUSTER_ID_FIELD.eq(clusterId)))
                 .fetchOne();
             if (r == null) {
                 return new LockState(-1, -1, null, null, false);
@@ -721,14 +914,15 @@ public class DatabaseManager {
         // lock_session_id column on CI MySQL.
         String sql = String.format(
             "UPDATE `%s` SET `locked_by` = NULL, `locked_at` = NULL, `lock_session_id` = NULL " +
-            "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
+            "WHERE `cluster_id` = ? AND `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
             dataTable);
         try (Connection conn = dataSource.getConnection();
              var ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
-            ps.setString(2, serverName);
-            ps.setLong(3, fencingToken);
-            ps.setString(4, lockSessionId);
+            ps.setString(1, clusterId);
+            ps.setString(2, uuid.toString());
+            ps.setString(3, serverName);
+            ps.setLong(4, fencingToken);
+            ps.setString(5, lockSessionId);
             return ps.executeUpdate() > 0;
         }
     }
@@ -754,14 +948,15 @@ public class DatabaseManager {
         // Use DB time for locked_at — consistent with acquireLock's expiry check.
         String sql = String.format(
             "UPDATE `%s` SET `locked_at` = (SELECT UNIX_TIMESTAMP() * 1000) " +
-            "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
+            "WHERE `cluster_id` = ? AND `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
             dataTable);
         try (Connection conn = dataSource.getConnection();
              var ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
-            ps.setString(2, serverName);
-            ps.setLong(3, fencingToken);
-            ps.setString(4, lockSessionId);
+            ps.setString(1, clusterId);
+            ps.setString(2, uuid.toString());
+            ps.setString(3, serverName);
+            ps.setLong(4, fencingToken);
+            ps.setString(5, lockSessionId);
             return ps.executeUpdate() > 0;
         }
     }
@@ -791,7 +986,7 @@ public class DatabaseManager {
         // all rows in the batch share the same timestamp.
         String sql = "UPDATE `" + dataTable + "`"
             + " SET locked_at = (SELECT UNIX_TIMESTAMP() * 1000)"
-            + " WHERE uuid = ? AND locked_by = ? AND fencing_token = ?"
+            + " WHERE cluster_id = ? AND uuid = ? AND locked_by = ? AND fencing_token = ?"
             + " AND lock_session_id = ?";
 
         try (Connection conn = dataSource.getConnection();
@@ -808,10 +1003,11 @@ public class DatabaseManager {
                     failedPlayers.add(uuid);
                     continue;
                 }
-                ps.setString(1, uuid.toString());
-                ps.setString(2, serverName);
-                ps.setLong(3, entry.getValue());
-                ps.setString(4, sessionId);
+                ps.setString(1, clusterId);
+                ps.setString(2, uuid.toString());
+                ps.setString(3, serverName);
+                ps.setLong(4, entry.getValue());
+                ps.setString(5, sessionId);
                 ps.addBatch();
             }
 
@@ -860,7 +1056,7 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             return dsl(conn).select(LOCKED_BY_FIELD)
                 .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
+                .where(UUID_FIELD.eq(uuid.toString()).and(CLUSTER_ID_FIELD.eq(clusterId)))
                 .fetchOne(LOCKED_BY_FIELD);
         }
     }
@@ -938,7 +1134,7 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             Long bitmap = dsl(conn).select(COMPONENT_BITMAP_FIELD)
                 .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
+                .where(UUID_FIELD.eq(uuid.toString()).and(CLUSTER_ID_FIELD.eq(clusterId)))
                 .fetchOne(COMPONENT_BITMAP_FIELD);
             return bitmap != null ? bitmap : 0L;
         }
@@ -950,7 +1146,7 @@ public class DatabaseManager {
     public void deleteAllComponents(UUID uuid) throws SQLException {
         try (Connection conn = dataSource.getConnection()) {
             dsl(conn).deleteFrom(playerComponent)
-                .where(UUID_FIELD.eq(uuid.toString()))
+                .where(UUID_FIELD.eq(uuid.toString()).and(CLUSTER_ID_FIELD.eq(clusterId)))
                 .execute();
         }
     }
@@ -1064,7 +1260,7 @@ public class DatabaseManager {
                 .select(DATA_FIELD, VERSION_FIELD, CHECKSUM_FIELD, FENCING_TOKEN_FIELD,
                         COMPONENT_BITMAP_FIELD, COMPONENT_GENERATION_FIELD)
                 .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
+                .where(UUID_FIELD.eq(uuid.toString()).and(CLUSTER_ID_FIELD.eq(clusterId)))
                 .fetchOne();
 
             if (record != null) {
@@ -1122,13 +1318,14 @@ public class DatabaseManager {
             String placeholders = String.join(",", java.util.Collections.nCopies(componentNames.size(), "?"));
             String sql = String.format(
                 "SELECT `component`, `data`, `version`, `checksum` FROM `%s` " +
-                "WHERE `uuid` = ? AND `generation` = ? AND `component` IN (%s)",
+                "WHERE `cluster_id` = ? AND `uuid` = ? AND `generation` = ? AND `component` IN (%s)",
                 componentTable, placeholders);
 
             try (var ps = conn.prepareStatement(sql)) {
-                ps.setString(1, uuid.toString());
-                ps.setLong(2, generation);
-                int i = 3;
+                ps.setString(1, clusterId);
+                ps.setString(2, uuid.toString());
+                ps.setLong(3, generation);
+                int i = 4;
                 for (String name : componentNames) {
                     ps.setString(i++, name);
                 }
@@ -1153,7 +1350,7 @@ public class DatabaseManager {
         try (Connection conn = dataSource.getConnection()) {
             Long gen = dsl(conn).select(COMPONENT_GENERATION_FIELD)
                 .from(playerData)
-                .where(UUID_FIELD.eq(uuid.toString()))
+                .where(UUID_FIELD.eq(uuid.toString()).and(CLUSTER_ID_FIELD.eq(clusterId)))
                 .fetchOne(COMPONENT_GENERATION_FIELD);
             return gen != null ? gen : 0L;
         }
@@ -1210,7 +1407,7 @@ public class DatabaseManager {
                 // 1. Lock player_data row and read metadata (including lock_session_id)
                 String lockSql = String.format(
                     "SELECT `version`, `fencing_token`, `locked_by`, `lock_session_id`, `component_bitmap`, `component_generation` " +
-                    "FROM `%s` WHERE `uuid` = ? FOR UPDATE", dataTable);
+                    "FROM `%s` WHERE `cluster_id` = ? AND `uuid` = ? FOR UPDATE", dataTable);
 
                 long currentVersion;
                 long currentBitmap;
@@ -1220,7 +1417,8 @@ public class DatabaseManager {
                 long dbFencing;
 
                 try (var ps = conn.prepareStatement(lockSql)) {
-                    ps.setString(1, uuid.toString());
+                    ps.setString(1, clusterId);
+                    ps.setString(2, uuid.toString());
                     try (var rs = ps.executeQuery()) {
                         if (!rs.next()) {
                             conn.rollback();
@@ -1273,8 +1471,8 @@ public class DatabaseManager {
 
                 // 3. Upsert component rows with current generation
                 String upsertSql = String.format("""
-                    INSERT INTO `%s` (uuid, component, generation, data, version, checksum, updated_at)
-                    VALUES (?, ?, ?, ?, 1, ?, ?)
+                    INSERT INTO `%s` (cluster_id, uuid, component, generation, data, version, checksum, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                     ON DUPLICATE KEY UPDATE
                         generation = VALUES(generation),
                         data = VALUES(data),
@@ -1288,12 +1486,13 @@ public class DatabaseManager {
                         String name = entry.getKey();
                         byte[] data = entry.getValue();
                         long checksum = componentsWithChecksum.getOrDefault(name, 0L);
-                        ps.setString(1, uuid.toString());
-                        ps.setString(2, name);
-                        ps.setLong(3, generation);
-                        ps.setBytes(4, data);
-                        ps.setLong(5, checksum);
-                        ps.setLong(6, now);
+                        ps.setString(1, clusterId);
+                        ps.setString(2, uuid.toString());
+                        ps.setString(3, name);
+                        ps.setLong(4, generation);
+                        ps.setBytes(5, data);
+                        ps.setLong(6, checksum);
+                        ps.setLong(7, now);
                         ps.addBatch();
                     }
                     ps.executeBatch();
@@ -1305,7 +1504,7 @@ public class DatabaseManager {
                 String updateSql = String.format(
                     "UPDATE `%s` SET `version` = ?, `component_bitmap` = ?, `locked_at` = ?, " +
                     "`last_updated` = ?, `last_server` = ? " +
-                    "WHERE `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
+                    "WHERE `cluster_id` = ? AND `uuid` = ? AND `locked_by` = ? AND `fencing_token` = ? AND `lock_session_id` = ?",
                     dataTable);
 
                 int updated;
@@ -1315,10 +1514,11 @@ public class DatabaseManager {
                     ps.setLong(3, now);
                     ps.setLong(4, now);
                     ps.setString(5, serverName);
-                    ps.setString(6, uuid.toString());
-                    ps.setString(7, serverName);
-                    ps.setLong(8, fencingToken);
-                    ps.setString(9, lockSessionId);
+                    ps.setString(6, clusterId);
+                    ps.setString(7, uuid.toString());
+                    ps.setString(8, serverName);
+                    ps.setLong(9, fencingToken);
+                    ps.setString(10, lockSessionId);
                     updated = ps.executeUpdate();
                 }
 
@@ -1349,13 +1549,28 @@ public class DatabaseManager {
         if (currentGeneration <= 1) return 0;
         try (Connection conn = dataSource.getConnection()) {
             String sql = String.format(
-                "DELETE FROM `%s` WHERE `uuid` = ? AND `generation` < ?",
+                "DELETE FROM `%s` WHERE `cluster_id` = ? AND `uuid` = ? AND `generation` < ?",
                 componentTable);
             try (var ps = conn.prepareStatement(sql)) {
-                ps.setString(1, uuid.toString());
-                ps.setLong(2, currentGeneration - 1);
+                ps.setString(1, clusterId);
+                ps.setString(2, uuid.toString());
+                ps.setLong(3, currentGeneration - 1);
                 return ps.executeUpdate();
             }
         }
+    }
+
+    /**
+     * Return the normalized cluster-id this DatabaseManager is scoped to.
+     *
+     * <p>Every row written by this manager carries this value in its
+     * {@code cluster_id} column. Exposed so callers (e.g. cross-cluster tooling,
+     * diagnostics) can log / verify which cluster a running instance belongs
+     * to without re-reading the config.
+     *
+     * @return the validated cluster-id (never null or blank)
+     */
+    public String getClusterId() {
+        return clusterId;
     }
 }

@@ -6,7 +6,15 @@ import com.zaxxer.hikari.HikariDataSource;
 
 import java.sql.*;
 import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -33,6 +41,15 @@ public class SnapshotManager {
     private DatabaseManager databaseManager;
     private String snapshotTable;
 
+    /** Dedicated bounded executor for all snapshot DB work. Keeps snapshot
+     *  I/O off the common ForkJoinPool and bounds the queue so a flood of
+     *  snapshot creations can't OOM the JVM. */
+    private ThreadPoolExecutor snapshotExecutor;
+    private final AtomicLong rejectedSnapshotTasks = new AtomicLong();
+
+    /** Hard cap on the snapshot work queue. */
+    private static final int SNAPSHOT_QUEUE_CAPACITY = 4096;
+
     public SnapshotManager(Logger logger, ConfigManager config) {
         this.logger = logger;
         this.config = config;
@@ -47,8 +64,99 @@ public class SnapshotManager {
     public void initialize(DatabaseManager db) {
         this.databaseManager = db;
         this.snapshotTable = config.getTablePrefix() + "snapshots";
+        this.snapshotExecutor = createSnapshotExecutor();
         createTable();
-        logger.info("SnapshotManager initialized (table=" + snapshotTable + ").");
+        logger.info("SnapshotManager initialized (table=" + snapshotTable
+            + ", cluster_id=" + db.getClusterId() + ").");
+    }
+
+    /**
+     * Build the dedicated bounded executor for snapshot work.
+     *
+     * <p>Core/max pool size is fixed at 2 — snapshot operations are I/O-bound
+     * (single row INSERT/SELECT/DELETE) and largely independent, so 2 threads
+     * is enough to overlap latency without overwhelming the DB pool. The queue
+     * is bounded at {@link #SNAPSHOT_QUEUE_CAPACITY} (4096) so that a runaway
+     * producer (e.g. mass disconnect during a crash) fails fast with a logged
+     * rejection rather than OOM-ing the JVM.
+     *
+     * @return a configured, unstarted ThreadPoolExecutor
+     */
+    private ThreadPoolExecutor createSnapshotExecutor() {
+        AtomicInteger counter = new AtomicInteger();
+        ThreadFactory factory = r -> {
+            Thread t = new Thread(r, "FastSync-Snapshot-" + counter.getAndIncrement());
+            t.setDaemon(true);
+            t.setPriority(Thread.NORM_PRIORITY - 1);
+            return t;
+        };
+        return new ThreadPoolExecutor(
+            2, 2, 30L, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(SNAPSHOT_QUEUE_CAPACITY),
+            factory,
+            (task, executor) -> {
+                long rejected = rejectedSnapshotTasks.incrementAndGet();
+                if (rejected == 1 || rejected % 100 == 0) {
+                    logger.warning("[Snapshot] Queue full; rejected snapshot tasks=" + rejected);
+                }
+                throw new RejectedExecutionException("Snapshot queue full");
+            }
+        );
+    }
+
+    /**
+     * Submit a supplier to the dedicated snapshot executor. If the executor
+     * has been shut down (e.g. after {@link #close()}), the returned future
+     * completes exceptionally with an {@link IllegalStateException}.
+     *
+     * @param supplier the work to run
+     * @param <T> result type
+     * @return a future that will complete with the supplier's result
+     */
+    private <T> CompletableFuture<T> supplySnapshotAsync(Supplier<T> supplier) {
+        if (snapshotExecutor == null || snapshotExecutor.isShutdown()) {
+            CompletableFuture<T> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException("SnapshotManager is closed"));
+            return failed;
+        }
+        return CompletableFuture.supplyAsync(supplier, snapshotExecutor);
+    }
+
+    /**
+     * Shut down the snapshot executor, waiting up to 10 seconds for queued
+     * and in-flight tasks to complete. Safe to call multiple times.
+     */
+    public void close() {
+        if (snapshotExecutor == null) {
+            return;
+        }
+        snapshotExecutor.shutdown();
+        try {
+            if (!snapshotExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                int remaining = snapshotExecutor.shutdownNow().size();
+                logger.warning("[Snapshot] Executor did not terminate in 10s; "
+                    + remaining + " task(s) cancelled.");
+            }
+        } catch (InterruptedException e) {
+            snapshotExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        snapshotExecutor = null;
+    }
+
+    /** @return current depth of the snapshot work queue. */
+    public int getQueueSize() {
+        return snapshotExecutor != null ? snapshotExecutor.getQueue().size() : 0;
+    }
+
+    /** @return the configured queue capacity. */
+    public int getQueueCapacity() {
+        return SNAPSHOT_QUEUE_CAPACITY;
+    }
+
+    /** @return total number of snapshot tasks rejected since startup. */
+    public long getRejectedCount() {
+        return rejectedSnapshotTasks.get();
     }
 
     /**
@@ -70,17 +178,23 @@ public class SnapshotManager {
      * order, providing a globally consistent sequence without TrueTime.
      */
     private void createTable() {
+        // v2 schema: cluster_id is the first non-PK column and the leading
+        // column of both secondary indexes. Every WHERE clause that filters
+        // by uuid now also filters by cluster_id so the optimizer can use
+        // the composite index and so rows from other clusters are never
+        // touched by this instance.
         String sql = String.format("""
             CREATE TABLE IF NOT EXISTS `%s` (
                 `id` BIGINT NOT NULL AUTO_INCREMENT,
+                `cluster_id` VARCHAR(64) NOT NULL,
                 `uuid` VARCHAR(36) NOT NULL,
                 `data` LONGBLOB NOT NULL,
                 `timestamp` BIGINT NOT NULL,
                 `save_cause` VARCHAR(64) NOT NULL DEFAULT 'unknown',
                 `pinned` BOOLEAN NOT NULL DEFAULT FALSE,
                 PRIMARY KEY (`id`),
-                INDEX idx_snapshots_uuid (`uuid`),
-                INDEX idx_snapshots_uuid_id (`uuid`, `id`)
+                INDEX `idx_snapshots_cluster_uuid` (`cluster_id`, `uuid`),
+                INDEX `idx_snapshots_cluster_uuid_id` (`cluster_id`, `uuid`, `id`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """, snapshotTable);
 
@@ -102,19 +216,20 @@ public class SnapshotManager {
      * @return a future that completes with the newly created snapshot id
      */
     public CompletableFuture<Long> createSnapshot(UUID uuid, byte[] compressedData, String saveCause) {
-        return CompletableFuture.supplyAsync(() -> {
+        return supplySnapshotAsync(() -> {
             String sql = String.format("""
-                INSERT INTO `%s` (uuid, data, timestamp, save_cause, pinned)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO `%s` (cluster_id, uuid, data, timestamp, save_cause, pinned)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """, snapshotTable);
 
             try (Connection conn = getDataSource().getConnection();
                  PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-                ps.setString(1, uuid.toString());
-                ps.setBytes(2, compressedData);
-                ps.setLong(3, System.currentTimeMillis());
-                ps.setString(4, saveCause != null ? saveCause : "unknown");
-                ps.setBoolean(5, false);
+                ps.setString(1, databaseManager.getClusterId());
+                ps.setString(2, uuid.toString());
+                ps.setBytes(3, compressedData);
+                ps.setLong(4, System.currentTimeMillis());
+                ps.setString(5, saveCause != null ? saveCause : "unknown");
+                ps.setBoolean(6, false);
                 ps.executeUpdate();
 
                 try (ResultSet rs = ps.getGeneratedKeys()) {
@@ -145,7 +260,7 @@ public class SnapshotManager {
      * @return a future that completes with the list of snapshot metadata
      */
     public CompletableFuture<List<SnapshotInfo>> listSnapshots(UUID uuid) {
-        return CompletableFuture.supplyAsync(() -> {
+        return supplySnapshotAsync(() -> {
             // ORDER BY id DESC, NOT timestamp DESC.
             // Per Spanner: wall-clock timestamps are unreliable for ordering
             // due to cross-server clock skew. Auto-increment id is a true
@@ -153,14 +268,15 @@ public class SnapshotManager {
             String sql = String.format("""
                 SELECT id, timestamp, save_cause, pinned
                 FROM `%s`
-                WHERE uuid = ?
+                WHERE cluster_id = ? AND uuid = ?
                 ORDER BY id DESC
                 """, snapshotTable);
 
             List<SnapshotInfo> snapshots = new ArrayList<>();
             try (Connection conn = getDataSource().getConnection();
                  PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setString(1, uuid.toString());
+                ps.setString(1, databaseManager.getClusterId());
+                ps.setString(2, uuid.toString());
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         snapshots.add(new SnapshotInfo(
@@ -186,7 +302,7 @@ public class SnapshotManager {
      * @return a future that completes with the compressed data, or {@code null} if no such snapshot exists
      */
     public CompletableFuture<byte[]> loadSnapshot(long snapshotId) {
-        return CompletableFuture.supplyAsync(() -> {
+        return supplySnapshotAsync(() -> {
             String sql = String.format("""
                 SELECT data FROM `%s` WHERE id = ?
                 """, snapshotTable);
@@ -214,7 +330,7 @@ public class SnapshotManager {
      * @return a future that completes when the snapshot has been deleted
      */
     public CompletableFuture<Void> deleteSnapshot(long snapshotId) {
-        return CompletableFuture.supplyAsync(() -> {
+        return supplySnapshotAsync(() -> {
             String sql = String.format("""
                 DELETE FROM `%s` WHERE id = ?
                 """, snapshotTable);
@@ -243,7 +359,7 @@ public class SnapshotManager {
      * @return a future that completes when the pin state has been updated
      */
     public CompletableFuture<Void> pinSnapshot(long snapshotId, boolean pinned) {
-        return CompletableFuture.supplyAsync(() -> {
+        return supplySnapshotAsync(() -> {
             String sql = String.format("""
                 UPDATE `%s` SET pinned = ? WHERE id = ?
                 """, snapshotTable);
@@ -274,7 +390,7 @@ public class SnapshotManager {
      * @return a future that completes when pruning has finished
      */
     public CompletableFuture<Void> pruneSnapshots(UUID uuid, int maxSnapshots) {
-        return CompletableFuture.supplyAsync(() -> {
+        return supplySnapshotAsync(() -> {
             int keep = Math.max(0, maxSnapshots);
 
             // Fetch non-pinned snapshot ids, newest first. The newest `keep` are
@@ -283,14 +399,15 @@ public class SnapshotManager {
             // is the reliable monotonic sequence, immune to clock skew.
             String selectSql = String.format("""
                 SELECT id FROM `%s`
-                WHERE uuid = ? AND pinned = FALSE
+                WHERE cluster_id = ? AND uuid = ? AND pinned = FALSE
                 ORDER BY id DESC
                 """, snapshotTable);
 
             List<Long> toDelete = new ArrayList<>();
             try (Connection conn = getDataSource().getConnection();
                  PreparedStatement ps = conn.prepareStatement(selectSql)) {
-                ps.setString(1, uuid.toString());
+                ps.setString(1, databaseManager.getClusterId());
+                ps.setString(2, uuid.toString());
                 try (ResultSet rs = ps.executeQuery()) {
                     int kept = 0;
                     while (rs.next()) {

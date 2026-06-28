@@ -5,6 +5,38 @@
 # Unique server identifier (must be unique across all servers in the network)
 server-name: "survival-1"
 
+# Cluster identifier — isolates Redis messaging namespaces.
+# All servers in the same logical cluster MUST use the same cluster-id.
+# Different clusters sharing the same MySQL MUST use different table-prefix.
+cluster-id: "survival-main"
+
+# ------------------------------------------------------------
+# Production Mode
+# ------------------------------------------------------------
+# When enabled, enforces strict safety checks:
+# - require-redis: Redis must be enabled and healthy (no DB polling fallback)
+# - require-cluster-id: cluster-id must be non-empty
+# - allow-final-save-sync-fallback: if false, QUIT saves rejected when
+#   final-save executor queue is full (lock expires naturally instead of
+#   running DB I/O on the event thread)
+production:
+  enabled: false
+  require-redis: true
+  require-cluster-id: true
+  allow-final-save-sync-fallback: false
+
+# ------------------------------------------------------------
+# Final-Save Executor
+# ------------------------------------------------------------
+# Dedicated bounded thread pool for QUIT/SHUTDOWN saves.
+# Separated from the main async executor so that periodic saves filling
+# the main queue cannot block final saves.
+final-save:
+  threads: 4
+  queue-capacity: 8192
+  shutdown-timeout-seconds: 60
+  allow-sync-fallback: false
+
 # ------------------------------------------------------------
 # Database Settings
 # ------------------------------------------------------------
