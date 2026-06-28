@@ -86,6 +86,10 @@ public class SyncManager {
      * and that fallback now logs at SEVERE so operators see it.
      */
     private AsyncExecutor finalSaveExecutor;
+
+    // Final-save spool (WAL for queue-full events)
+    private com.fastsync.spool.FinalSaveSpool finalSaveSpool;
+    private com.fastsync.spool.FinalSaveReplayService finalSaveReplayService;
     private RedissonManager redissonManager;
     private SnapshotManager snapshotManager;
     private ConflictManager conflictManager;
@@ -289,6 +293,27 @@ public class SyncManager {
         int finalThreads = Math.max(2, config.getFinalSaveThreads());
         int finalQueue = Math.max(1024, config.getFinalSaveQueueCapacity());
         finalSaveExecutor = new AsyncExecutor(logger, "FastSync-FinalSave", finalThreads, finalQueue);
+
+        // Initialize final-save spool (WAL for queue-full events)
+        if (config.isFinalSaveSpoolEnabled()) {
+            try {
+                java.nio.file.Path spoolDir = plugin.getDataFolder().toPath()
+                    .resolve(config.getFinalSaveSpoolDir());
+                finalSaveSpool = new com.fastsync.spool.FinalSaveSpool(
+                    logger, spoolDir, config.isFinalSaveSpoolFsync());
+                if (config.isFinalSaveSpoolReplayOnStartup()) {
+                    finalSaveReplayService = new com.fastsync.spool.FinalSaveReplayService(
+                        logger, finalSaveSpool, databaseManager, plugin,
+                        config.getFinalSaveSpoolReplayBatchSize(),
+                        config.getFinalSaveSpoolReplayIntervalTicks(),
+                        config.getServerName());
+                    finalSaveReplayService.start();
+                }
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "Failed to initialize final-save spool! "
+                    + "Queue-full events will result in data loss.", e);
+            }
+        }
 
         // Login backpressure semaphore — limits concurrent pre-login loads
         loginLoadSemaphore = new java.util.concurrent.Semaphore(config.getMaxConcurrentLoads(), true);
@@ -1190,19 +1215,35 @@ public class SyncManager {
             // state will be missing until the next login triggers a full
             // save, but this is safer than blocking the game tick.
             if (!config.isFinalSaveAllowSyncFallback()) {
-                logger.log(Level.SEVERE, "[FinalSave] QUIT save for " + uuid
-                    + " rejected (final-save queue full). Sync fallback is DISABLED "
-                    + "(final-save.allow-sync-fallback=false). Lock will expire after "
-                    + config.getLockTimeout() + "s. Player's final state may be lost "
-                    + "— investigate DB latency or increase final-save.queue-capacity.");
+                // Spool the final save to disk for later replay.
+                // This prevents data loss when the final-save executor is saturated.
+                try {
+                    String session = playerLockSessions.get(uuid);
+                    if (finalSaveSpool != null) {
+                        com.fastsync.spool.EncodedFinalSave encoded = com.fastsync.spool.FinalSaveEncoder.encode(
+                            uuid, data, SaveKind.QUIT,
+                            config.getClusterId(), config.getServerName(),
+                            session, config.getCompressionMinSize());
+                        finalSaveSpool.append(encoded);
+                        logger.severe("[FinalSave] QUIT save for " + uuid
+                            + " rejected by executor, but safely spooled to disk. "
+                            + "The replay service will persist and release the lock.");
+                    } else {
+                        logger.log(Level.SEVERE, "[FinalSave] QUIT save for " + uuid
+                            + " rejected (queue full). Spool is NOT initialized — "
+                            + "final state may be lost. Lock will expire after "
+                            + config.getLockTimeout() + "s.");
+                    }
+                } catch (Exception spoolError) {
+                    logger.log(Level.SEVERE, "[FinalSave] CRITICAL: failed to spool final save for "
+                        + uuid + ". Final state may be lost. Lock will expire naturally.", spoolError);
+                }
                 recordFinalSaveSynchronousFallback(
                     "QUIT", uuid,
-                    "sync fallback BLOCKED by config (final-save.allow-sync-fallback=false). "
-                        + "Lock will expire naturally.",
+                    "queue full — spooled to disk for replay." ,
                     e);
                 pendingSaveCount.decrementAndGet();
-                // Do NOT release lock — let it expire to protect against
-                // stale reads by other servers.
+                // Do NOT release lock — replay will release it after CAS succeeds.
                 playerVersions.remove(uuid);
                 playerFencingTokens.remove(uuid);
                 playerLockSessions.remove(uuid);
@@ -2735,6 +2776,12 @@ public class SyncManager {
             finalSaveExecutor = null;
         }
 
+        // Stop the final-save replay service
+        if (finalSaveReplayService != null) {
+            finalSaveReplayService.stop();
+            finalSaveReplayService = null;
+        }
+
         // Round 14: close SnapshotManager's dedicated executor
         if (snapshotManager != null) {
             snapshotManager.close();
@@ -2774,7 +2821,7 @@ public class SyncManager {
          *  differentiate a graceful disconnect from a server stop. */
         SHUTDOWN("shutdown", true);
 
-        final String causeName;
+        public final String causeName;
         final boolean releaseLock;
 
         SaveKind(String causeName, boolean releaseLock) {
@@ -3752,6 +3799,23 @@ public class SyncManager {
 
     public boolean hasFinalSaveAlert() {
         return finalSaveSyncFallbackTotal.get() > 0;
+    }
+
+    // Final-save spool telemetry
+    public long getFinalSaveSpoolPendingCount() {
+        return finalSaveSpool != null ? finalSaveSpool.getPendingCount() : 0;
+    }
+    public long getFinalSaveSpoolFailedCount() {
+        return finalSaveSpool != null ? finalSaveSpool.getFailedCount() : 0;
+    }
+    public long getFinalSaveSpoolBytes() {
+        return finalSaveSpool != null ? finalSaveSpool.getTotalBytes() : 0;
+    }
+    public long getFinalSaveSpoolLastReplayAt() {
+        return finalSaveSpool != null ? finalSaveSpool.getLastReplayAt() : 0;
+    }
+    public String getFinalSaveSpoolLastError() {
+        return finalSaveSpool != null ? finalSaveSpool.getLastError() : null;
     }
 
     public boolean isOperationLogEnabled() {

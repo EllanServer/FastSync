@@ -64,9 +64,6 @@ jobs:
           find build/test-results/test -name "*.xml" -exec cat {} \; || true
           echo "=== End test results ==="
 
-      - name: Run gradle test
-        run: ./gradlew test --no-daemon --info
-
       - name: Upload JAR artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -200,8 +197,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            build/libs/FastSync-1.0.0.jar
-            build/libs/FastSync-Proxy-1.0.0.jar
+            build/libs/FastSync-*.jar
+            build/libs/FastSync-Proxy-*.jar
           generate_release_notes: true
           draft: false
           prerelease: false

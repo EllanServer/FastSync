@@ -451,6 +451,20 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 + (lastFallbackAt > 0 ? " at " + new java.util.Date(lastFallbackAt) : "")
                 + ". Investigate DB latency / queue sizing before scaling up.");
         }
+        // Final-save spool telemetry
+        long spoolPending = syncManager.getFinalSaveSpoolPendingCount();
+        long spoolFailed = syncManager.getFinalSaveSpoolFailedCount();
+        if (spoolPending > 0 || spoolFailed > 0 || configManager.isFinalSaveSpoolEnabled()) {
+            ChatColor spoolColor = spoolFailed > 0 ? ChatColor.RED : (spoolPending > 0 ? ChatColor.YELLOW : ChatColor.GREEN);
+            sender.sendMessage(ChatColor.YELLOW + "FinalSaveSpool: " + spoolColor +
+                "pending=" + spoolPending +
+                ", failed=" + spoolFailed +
+                ", bytes=" + syncManager.getFinalSaveSpoolBytes());
+            if (spoolFailed > 0) {
+                sender.sendMessage(ChatColor.RED + "Spool FAILED entries exist — check "
+                    + configManager.getFinalSaveSpoolDir() + "/failed/ for .reason.txt files.");
+            }
+        }
         if (configManager.isOperationLogEnabled()) {
             long dropped = syncManager.getOperationLogDroppedTotal();
             ChatColor opLogColor = dropped > 0 ? ChatColor.RED : ChatColor.GREEN;

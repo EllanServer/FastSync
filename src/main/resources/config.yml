@@ -31,7 +31,21 @@ final-save:
   threads: 4
   queue-capacity: 8192
   shutdown-timeout-seconds: 60
+  # false: queue full → spool to disk for replay (safe, no tick blocking)
+  # true: queue full → synchronous fallback on event thread (blocks tick, risky)
   allow-sync-fallback: false
+  # Disk-based WAL for final-saves that couldn't be submitted to the executor.
+  # Replay service runs periodically and on startup to flush pending saves.
+  spool:
+    enabled: true
+    dir: "final-save-spool"
+    max-files: 100000
+    max-bytes: 1073741824 # 1GB
+    fsync: true
+    replay-on-startup: true
+    replay-interval-ticks: 100
+    replay-batch-size: 64
+    retain-failed-days: 7
 
 # ------------------------------------------------------------
 # Database Settings

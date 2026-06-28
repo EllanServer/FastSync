@@ -141,6 +141,17 @@ public class ConfigManager {
     private int finalSaveShutdownTimeoutSeconds;
     private boolean finalSaveAllowSyncFallback;
 
+    // Final-save spool (WAL for queue-full events)
+    private boolean finalSaveSpoolEnabled;
+    private String finalSaveSpoolDir;
+    private int finalSaveSpoolMaxFiles;
+    private long finalSaveSpoolMaxBytes;
+    private boolean finalSaveSpoolFsync;
+    private boolean finalSaveSpoolReplayOnStartup;
+    private long finalSaveSpoolReplayIntervalTicks;
+    private int finalSaveSpoolReplayBatchSize;
+    private int finalSaveSpoolRetainFailedDays;
+
     // Locked commands while loading
     private boolean cancelCommandsWhileLocked;
 
@@ -540,6 +551,17 @@ public class ConfigManager {
         finalSaveShutdownTimeoutSeconds = source.getInt("final-save.shutdown-timeout-seconds", 60);
         finalSaveAllowSyncFallback = source.getBoolean("final-save.allow-sync-fallback", false);
 
+        // Final-save spool (WAL for queue-full events)
+        finalSaveSpoolEnabled = source.getBoolean("final-save.spool.enabled", true);
+        finalSaveSpoolDir = source.getString("final-save.spool.dir", "final-save-spool");
+        finalSaveSpoolMaxFiles = source.getInt("final-save.spool.max-files", 100000);
+        finalSaveSpoolMaxBytes = source.getLong("final-save.spool.max-bytes", 1073741824L);
+        finalSaveSpoolFsync = source.getBoolean("final-save.spool.fsync", true);
+        finalSaveSpoolReplayOnStartup = source.getBoolean("final-save.spool.replay-on-startup", true);
+        finalSaveSpoolReplayIntervalTicks = source.getLong("final-save.spool.replay-interval-ticks", 100);
+        finalSaveSpoolReplayBatchSize = source.getInt("final-save.spool.replay-batch-size", 64);
+        finalSaveSpoolRetainFailedDays = source.getInt("final-save.spool.retain-failed-days", 7);
+
         // Locked commands while loading
         cancelCommandsWhileLocked = source.getBoolean("sync.cancel-commands-while-locked", false);
 
@@ -682,6 +704,17 @@ public class ConfigManager {
     public int getFinalSaveQueueCapacity() { return finalSaveQueueCapacity; }
     public int getFinalSaveShutdownTimeoutSeconds() { return finalSaveShutdownTimeoutSeconds; }
     public boolean isFinalSaveAllowSyncFallback() { return finalSaveAllowSyncFallback; }
+
+    // Final-save spool
+    public boolean isFinalSaveSpoolEnabled() { return finalSaveSpoolEnabled; }
+    public String getFinalSaveSpoolDir() { return finalSaveSpoolDir; }
+    public int getFinalSaveSpoolMaxFiles() { return finalSaveSpoolMaxFiles; }
+    public long getFinalSaveSpoolMaxBytes() { return finalSaveSpoolMaxBytes; }
+    public boolean isFinalSaveSpoolFsync() { return finalSaveSpoolFsync; }
+    public boolean isFinalSaveSpoolReplayOnStartup() { return finalSaveSpoolReplayOnStartup; }
+    public long getFinalSaveSpoolReplayIntervalTicks() { return finalSaveSpoolReplayIntervalTicks; }
+    public int getFinalSaveSpoolReplayBatchSize() { return finalSaveSpoolReplayBatchSize; }
+    public int getFinalSaveSpoolRetainFailedDays() { return finalSaveSpoolRetainFailedDays; }
 
     public boolean isCancelCommandsWhileLocked() { return cancelCommandsWhileLocked; }
 
