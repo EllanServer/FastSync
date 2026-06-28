@@ -54,6 +54,10 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sender.sendMessage(MESSAGE_SERIALIZER.deserialize(message));
     }
 
+    private static String formatTime(long epochMillis) {
+        return epochMillis > 0 ? new java.util.Date(epochMillis).toString() : "never";
+    }
+
     private ConfigManager configManager;
     private DatabaseManager databaseManager;
     private SyncManager syncManager;
@@ -459,19 +463,22 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sendMessage(sender, YELLOW + "Async threads: " + WHITE +
             "active=" + syncManager.getAsyncActiveCount() +
             ", queue=" + syncManager.getAsyncQueueSize());
-        String finalSaveColor = syncManager.hasFinalSaveAlert() ? RED : GREEN;
-        sendMessage(sender, YELLOW + "Final-save: " + finalSaveColor +
+        String finalSaveColor = syncManager.hasFinalSaveAlert() ? RED
+            : (syncManager.hasFinalSaveWarning() ? YELLOW : GREEN);
+        sendMessage(sender, YELLOW + "Final-save executor: " + finalSaveColor +
             "active=" + syncManager.getFinalSaveActiveCount() +
             ", queue=" + syncManager.getFinalSaveQueueSize() + "/" + syncManager.getFinalSaveQueueCapacity() +
             ", queueFull=" + syncManager.getFinalSaveQueueFullTotal() +
-            ", syncFallback=" + syncManager.getFinalSaveSyncFallbackTotal());
-        if (syncManager.hasFinalSaveAlert()) {
-            long lastFallbackAt = syncManager.getFinalSaveLastFallbackAt();
-            sendMessage(sender, RED + "Final-save ALERT: synchronous fallback occurred"
-                + (lastFallbackAt > 0 ? " at " + new java.util.Date(lastFallbackAt) : "")
-                + ". Investigate DB latency / queue sizing before scaling up.");
-        }
-        // Final-save spool telemetry
+            ", lastQueueFull=" + formatTime(syncManager.getFinalSaveLastQueueFullAt()));
+        sendMessage(sender, YELLOW + "Final-save spool events: " + WHITE +
+            "spooled=" + syncManager.getFinalSaveSpoolEnqueuedTotal() +
+            ", lastSpooled=" + formatTime(syncManager.getFinalSaveLastSpoolEnqueuedAt()) +
+            ", rejected=" + syncManager.getFinalSaveSpoolRejectedTotal() +
+            ", lastRejected=" + formatTime(syncManager.getFinalSaveLastSpoolRejectedAt()));
+        sendMessage(sender, YELLOW + "Final-save sync fallback: " + WHITE +
+            "total=" + syncManager.getFinalSaveSyncFallbackTotal() +
+            ", last=" + formatTime(syncManager.getFinalSaveLastSyncFallbackAt()));
+        // Spool disk state
         long spoolPending = syncManager.getFinalSaveSpoolPendingCount();
         long spoolFailed = syncManager.getFinalSaveSpoolFailedCount();
         if (spoolPending > 0 || spoolFailed > 0 || configManager.isFinalSaveSpoolEnabled()) {
@@ -493,6 +500,19 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 sendMessage(sender, RED + "Spool FAILED entries exist — check "
                     + configManager.getFinalSaveSpoolDir() + "/failed/ for .reason.txt files.");
             }
+        }
+        // Alerts
+        if (syncManager.getFinalSaveSpoolRejectedTotal() > 0) {
+            sendMessage(sender, RED + "Final-save CRITICAL: spool rejected/failure occurred. "
+                + "Final states may have been lost. Check logs and spool configuration.");
+        }
+        if (syncManager.getFinalSaveSyncFallbackTotal() > 0) {
+            sendMessage(sender, RED + "Final-save CRITICAL: synchronous fallback occurred. "
+                + "Game thread may have been blocked. Investigate DB latency / final-save queue sizing.");
+        }
+        if (syncManager.hasFinalSaveWarning() && !syncManager.hasFinalSaveAlert()) {
+            sendMessage(sender, YELLOW + "Final-save WARNING: queue-full events have occurred. "
+                + "Spool handled some final saves; monitor queue sizing and replay lag.");
         }
         if (configManager.isOperationLogEnabled()) {
             long dropped = syncManager.getOperationLogDroppedTotal();

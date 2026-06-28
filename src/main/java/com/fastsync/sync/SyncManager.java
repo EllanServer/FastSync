@@ -111,8 +111,13 @@ public class SyncManager {
     // immediately causes a synchronous fallback today, so we count both the
     // rejection and the fallback and surface them in /fastsync status.
     private final AtomicLong finalSaveQueueFullTotal = new AtomicLong();
+    private final AtomicLong finalSaveLastQueueFullAt = new AtomicLong();
+    private final AtomicLong finalSaveSpoolEnqueuedTotal = new AtomicLong();
+    private final AtomicLong finalSaveLastSpoolEnqueuedAt = new AtomicLong();
+    private final AtomicLong finalSaveSpoolRejectedTotal = new AtomicLong();
+    private final AtomicLong finalSaveLastSpoolRejectedAt = new AtomicLong();
     private final AtomicLong finalSaveSyncFallbackTotal = new AtomicLong();
-    private final AtomicLong finalSaveLastFallbackAt = new AtomicLong();
+    private final AtomicLong finalSaveLastSyncFallbackAt = new AtomicLong();
 
     // Track players whose data has been applied (actively playing)
     private final ConcurrentHashMap<UUID, Boolean> activePlayers = new ConcurrentHashMap<>();
@@ -1279,6 +1284,8 @@ public class SyncManager {
             if (!config.isFinalSaveAllowSyncFallback()) {
                 // Spool the final save to disk for later replay.
                 // This prevents data loss when the final-save executor is saturated.
+                FinalSaveQueueFullOutcome outcome;
+                String detail;
                 try {
                     String session = playerLockSessions.get(uuid);
                     if (finalSaveSpool != null) {
@@ -1287,25 +1294,23 @@ public class SyncManager {
                             config.getClusterId(), config.getServerName(),
                             session, config.getCompressionMinSize());
                         finalSaveSpool.append(encoded);
-                        logger.severe("[FinalSave] QUIT save for " + uuid
-                            + " rejected by executor, but safely spooled to disk. "
-                            + "The replay service will persist and release the lock.");
+                        outcome = FinalSaveQueueFullOutcome.SPOOLED;
+                        detail = "queue full — final save safely spooled to disk for replay";
                     } else {
-                        logger.log(Level.SEVERE, "[FinalSave] QUIT save for " + uuid
-                            + " rejected (queue full). Spool is NOT initialized — "
-                            + "final state may be lost. Lock will expire after "
-                            + config.getLockTimeout() + "s.");
+                        outcome = FinalSaveQueueFullOutcome.SPOOL_UNAVAILABLE;
+                        detail = "queue full — spool is not initialized; final state may be lost";
                     }
                 } catch (Exception spoolError) {
+                    outcome = FinalSaveQueueFullOutcome.SPOOL_FAILED;
+                    detail = "queue full — failed to spool final save: "
+                        + (spoolError.getMessage() != null ? spoolError.getMessage() : spoolError.getClass().getSimpleName());
                     logger.log(Level.SEVERE, "[FinalSave] CRITICAL: failed to spool final save for "
                         + uuid + ". Final state may be lost. Lock will expire naturally.", spoolError);
                 }
-                recordFinalSaveQueueFull(
-                    "QUIT", uuid,
-                    "queue full — spooled to disk for replay." ,
-                    e, false);
+                recordFinalSaveQueueFull("QUIT", uuid, detail, e, outcome);
                 pendingSaveCount.decrementAndGet();
-                // Do NOT release lock — replay will release it after CAS succeeds.
+                // Do NOT release lock — replay will release it after CAS succeeds if spooled.
+                // If spool failed/unavailable, lock expires naturally.
                 playerVersions.remove(uuid);
                 playerFencingTokens.remove(uuid);
                 playerLockSessions.remove(uuid);
@@ -1317,8 +1322,8 @@ public class SyncManager {
                 "QUIT", uuid,
                 "running synchronously on event thread as last-resort fallback. "
                     + "This blocks the game tick; investigate DB latency or raise "
-                    + "database.queue-capacity.",
-                e, true);
+                    + "final-save.queue-capacity.",
+                e, FinalSaveQueueFullOutcome.SYNC_FALLBACK);
             saveLock.lock();
             try {
                 refreshVersionAndFencingToken(uuid, data);
@@ -2351,8 +2356,8 @@ public class SyncManager {
                             recordFinalSaveQueueFull(
                                 "SHUTDOWN", uuid,
                                 "running synchronously on event thread as fallback. "
-                                    + "Investigate DB latency or raise database.queue-capacity.",
-                                e, true);
+                                    + "Investigate DB latency or raise final-save.queue-capacity.",
+                                e, FinalSaveQueueFullOutcome.SYNC_FALLBACK);
                             SaveResult result;
                             try {
                                 saveLock.lock();
@@ -4178,16 +4183,50 @@ public class SyncManager {
         return finalSaveQueueFullTotal.get();
     }
 
+    public long getFinalSaveLastQueueFullAt() {
+        return finalSaveLastQueueFullAt.get();
+    }
+
+    public long getFinalSaveSpoolEnqueuedTotal() {
+        return finalSaveSpoolEnqueuedTotal.get();
+    }
+
+    public long getFinalSaveLastSpoolEnqueuedAt() {
+        return finalSaveLastSpoolEnqueuedAt.get();
+    }
+
+    public long getFinalSaveSpoolRejectedTotal() {
+        return finalSaveSpoolRejectedTotal.get();
+    }
+
+    public long getFinalSaveLastSpoolRejectedAt() {
+        return finalSaveLastSpoolRejectedAt.get();
+    }
+
     public long getFinalSaveSyncFallbackTotal() {
         return finalSaveSyncFallbackTotal.get();
     }
 
+    public long getFinalSaveLastSyncFallbackAt() {
+        return finalSaveLastSyncFallbackAt.get();
+    }
+
+    /** @deprecated use {@link #getFinalSaveLastSyncFallbackAt()} */
+    @Deprecated
     public long getFinalSaveLastFallbackAt() {
-        return finalSaveLastFallbackAt.get();
+        return getFinalSaveLastSyncFallbackAt();
     }
 
     public boolean hasFinalSaveAlert() {
-        return finalSaveSyncFallbackTotal.get() > 0;
+        return finalSaveSyncFallbackTotal.get() > 0
+            || finalSaveSpoolRejectedTotal.get() > 0
+            || getFinalSaveSpoolFailedCount() > 0;
+    }
+
+    public boolean hasFinalSaveWarning() {
+        return finalSaveQueueFullTotal.get() > 0
+            || finalSaveSpoolEnqueuedTotal.get() > 0
+            || getFinalSaveSpoolPendingCount() > 0;
     }
 
     // Final-save spool telemetry
@@ -4258,20 +4297,45 @@ public class SyncManager {
         }
     }
 
+    private enum FinalSaveQueueFullOutcome {
+        SPOOLED, SPOOL_UNAVAILABLE, SPOOL_FAILED, SYNC_FALLBACK
+    }
+
     private void recordFinalSaveQueueFull(
             String kind, UUID uuid, String detail,
             java.util.concurrent.RejectedExecutionException cause,
-            boolean synchronousFallback) {
+            FinalSaveQueueFullOutcome outcome) {
+        long now = System.currentTimeMillis();
         long queueFullCount = finalSaveQueueFullTotal.incrementAndGet();
-        long fallbackCount = finalSaveSyncFallbackTotal.get();
-        if (synchronousFallback) {
-            fallbackCount = finalSaveSyncFallbackTotal.incrementAndGet();
-            finalSaveLastFallbackAt.set(System.currentTimeMillis());
+        finalSaveLastQueueFullAt.set(now);
+        long spooled = finalSaveSpoolEnqueuedTotal.get();
+        long spoolRejected = finalSaveSpoolRejectedTotal.get();
+        long syncFallback = finalSaveSyncFallbackTotal.get();
+        switch (outcome) {
+            case SPOOLED -> {
+                spooled = finalSaveSpoolEnqueuedTotal.incrementAndGet();
+                finalSaveLastSpoolEnqueuedAt.set(now);
+            }
+            case SPOOL_UNAVAILABLE, SPOOL_FAILED -> {
+                spoolRejected = finalSaveSpoolRejectedTotal.incrementAndGet();
+                finalSaveLastSpoolRejectedAt.set(now);
+            }
+            case SYNC_FALLBACK -> {
+                syncFallback = finalSaveSyncFallbackTotal.incrementAndGet();
+                finalSaveLastSyncFallbackAt.set(now);
+            }
         }
-        logger.log(Level.SEVERE, "[FinalSave] Final-save executor rejected " + kind + " save for "
+        Level level = switch (outcome) {
+            case SPOOLED -> Level.WARNING;
+            case SPOOL_UNAVAILABLE, SPOOL_FAILED, SYNC_FALLBACK -> Level.SEVERE;
+        };
+        logger.log(level, "[FinalSave] Final-save executor rejected " + kind + " save for "
             + uuid + " — " + detail
-            + " (queueFullTotal=" + queueFullCount
-            + ", syncFallbackTotal=" + fallbackCount + ")", cause);
+            + " (outcome=" + outcome
+            + ", queueFullTotal=" + queueFullCount
+            + ", spooledTotal=" + spooled
+            + ", spoolRejectedTotal=" + spoolRejected
+            + ", syncFallbackTotal=" + syncFallback + ")", cause);
     }
 
     /**
