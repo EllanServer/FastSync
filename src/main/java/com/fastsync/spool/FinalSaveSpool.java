@@ -65,6 +65,7 @@ public final class FinalSaveSpool {
         Files.createDirectories(pendingDir);
         Files.createDirectories(failedDir);
         Files.createDirectories(doneDir);
+        validateAtomicMoveSupport();
         cleanupExpiredFailed();
         scanExistingFiles();
 
@@ -115,6 +116,7 @@ public final class FinalSaveSpool {
         Path dst = pendingDir.resolve(fileName);
         Path tmp = pendingDir.resolve(fileName + "." + UUID.randomUUID() + ".tmp");
 
+        boolean moved = false;
         try {
             writeRecord(tmp, record);
             long newSize = Files.size(tmp);
@@ -122,11 +124,17 @@ public final class FinalSaveSpool {
                 throw new IOException("Final-save spool byte limit reached: " + totalBytes.get()
                     + " + " + newSize + " > " + maxBytes);
             }
-            moveAtomically(tmp, dst, false);
+            commitPendingAtomically(tmp, dst);
+            moved = true;
+            fsyncDirectory(pendingDir);
             pendingCount.incrementAndGet();
             totalBytes.addAndGet(newSize);
         } finally {
-            Files.deleteIfExists(tmp);
+            if (!moved) {
+                try { Files.deleteIfExists(tmp); } catch (IOException cleanupError) {
+                    logger.log(Level.WARNING, "[FinalSaveSpool] Failed to delete incomplete temp spool file: " + tmp, cleanupError);
+                }
+            }
         }
     }
 
@@ -166,19 +174,81 @@ public final class FinalSaveSpool {
         return value.length() <= maxChars ? value : value.substring(0, maxChars);
     }
 
-    private static void moveAtomically(Path source, Path target, boolean replace) throws IOException {
+    /**
+     * Probe that the pending directory supports atomic move (rename).
+     * This is critical: non-atomic fallback (copy+delete) can leave half-written
+     * .fspool files on crash, corrupting the final-save WAL.
+     * Throws IOException if atomic move is not supported — refuses to start.
+     */
+    private void validateAtomicMoveSupport() throws IOException {
+        Path probeSrc = pendingDir.resolve(".atomic_probe." + UUID.randomUUID() + ".tmp");
+        Path probeDst = pendingDir.resolve(".atomic_probe." + UUID.randomUUID() + ".fspool");
         try {
-            if (replace) {
-                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } else {
-                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+            Files.writeString(probeSrc, "FASTSYNC_ATOMIC_MOVE_PROBE",
+                java.nio.charset.StandardCharsets.UTF_8,
+                java.nio.file.StandardOpenOption.CREATE_NEW,
+                java.nio.file.StandardOpenOption.WRITE);
+            Files.move(probeSrc, probeDst, StandardCopyOption.ATOMIC_MOVE);
+            if (!Files.exists(probeDst)) {
+                throw new IOException("Atomic move probe reported success but destination does not exist: " + probeDst);
             }
         } catch (AtomicMoveNotSupportedException e) {
-            if (replace) {
-                Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
-            } else {
-                Files.move(source, target);
-            }
+            throw new IOException(
+                "Final-save spool pending directory does not support atomic moves: "
+                    + pendingDir
+                    + " — refusing to start. Use a local POSIX filesystem such as ext4/xfs, "
+                    + "not NFS/CIFS/FUSE/network mounts.",
+                e);
+        } finally {
+            try { Files.deleteIfExists(probeSrc); } catch (IOException ignored) {}
+            try { Files.deleteIfExists(probeDst); } catch (IOException ignored) {}
+        }
+    }
+
+    /**
+     * Commit a pending record atomically. NEVER falls back to non-atomic move —
+     * a half-written .fspool file would corrupt the final-save WAL and potentially
+     * lose player final state.
+     */
+    private static void commitPendingAtomically(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            throw new IOException(
+                "Final-save spool cannot commit pending record atomically: "
+                    + source + " -> " + target
+                    + ". Non-atomic fallback is forbidden because it may lose player final state.",
+                e);
+        }
+    }
+
+    /**
+     * Archive a file (done/failed) with best-effort atomic move. Falls back to
+     * non-atomic if the filesystem doesn't support it — these are already-applied
+     * or permanently-rejected records, not pending WAL commits.
+     */
+    private static void archiveBestEffort(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    /**
+     * Fsync the directory to ensure the rename directory entry is durable.
+     * On filesystems that don't support directory channel fsync, logs a warning
+     * but does not fail — file contents are already fsynced.
+     */
+    private void fsyncDirectory(Path dir) {
+        if (!fsync) return;
+        try (var channel = java.nio.channels.FileChannel.open(dir, java.nio.file.StandardOpenOption.READ)) {
+            channel.force(true);
+        } catch (IOException | UnsupportedOperationException e) {
+            logger.log(Level.WARNING,
+                "[FinalSaveSpool] Directory fsync not supported for " + dir
+                    + ". File contents are fsynced, but directory entry durability may depend on filesystem/journal.",
+                e);
         }
     }
 
@@ -186,7 +256,7 @@ public final class FinalSaveSpool {
     public synchronized void moveToDone(Path file) {
         long size = safeSize(file);
         try {
-            Files.move(file, doneDir.resolve(file.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+            archiveBestEffort(file, doneDir.resolve(file.getFileName()));
             decrementPending(size);
         } catch (IOException moveError) {
             logger.log(Level.WARNING, "[FinalSaveSpool] Failed to archive " + file
@@ -207,7 +277,7 @@ public final class FinalSaveSpool {
         long size = safeSize(file);
         Path target = failedDir.resolve(file.getFileName());
         try {
-            Files.move(file, target, StandardCopyOption.REPLACE_EXISTING);
+            archiveBestEffort(file, target);
             decrementPending(size);
             failedCount.incrementAndGet();
             lastError = reason;
@@ -332,10 +402,12 @@ public final class FinalSaveSpool {
                 throw new IOException("Final-save spool byte limit would be exceeded by rewrite: "
                     + projectedBytes + " > " + maxBytes);
             }
-            moveAtomically(tmp, file, true);
+            commitPendingAtomically(tmp, file);
+            fsyncDirectory(pendingDir);
             totalBytes.updateAndGet(value -> Math.max(0, value - oldSize + newSize));
         } finally {
-            Files.deleteIfExists(tmp);
+            // tmp was atomically moved — nothing to clean up on success.
+            // On failure, the caller (replay service) will handle the error.
         }
     }
 
