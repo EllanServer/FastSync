@@ -4428,6 +4428,17 @@ public class SyncManager {
     }
 
     /**
+     * Return latency status lines for /fastsync status display.
+     */
+    public java.util.List<String> getLatencyStatusLines() {
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        if (loadLatency != null) lines.add(loadLatency.getStatusLine());
+        if (saveLatency != null) lines.add(saveLatency.getStatusLine());
+        if (serializeLatency != null) lines.add(serializeLatency.getStatusLine());
+        return lines;
+    }
+
+    /**
      * Get the conflict manager instance.
      */
     public ConflictManager getConflictManager() {
