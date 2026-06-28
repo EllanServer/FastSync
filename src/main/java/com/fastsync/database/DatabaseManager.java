@@ -337,7 +337,8 @@ public class DatabaseManager {
             // updated_at on every boot — the row is only written once, when
             // the table is freshly created.
             String seedSql = String.format(
-                "INSERT INTO `%s` (id, version, updated_at) VALUES (1, ?, ?)",
+                "INSERT INTO `%s` (id, version, updated_at) VALUES (1, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE version = VALUES(version)",
                 schemaVersionTable);
             try (var ps = conn.prepareStatement(seedSql)) {
                 ps.setInt(1, REQUIRED_SCHEMA_VERSION);
