@@ -1730,12 +1730,29 @@ public class SyncManager {
                     List<PlayerData.ModifierData> modifiers = new ArrayList<>();
 
                     for (AttributeModifier mod : instance.getModifiers()) {
+                        // P0 (issue #56): capture the EquipmentSlotGroup so slot-
+                        // restricted modifiers (e.g. helmet-only +max_health) round-
+                        // trip correctly. Without this, the apply path falls back to
+                        // the 4-arg constructor which defaults the slot to ANY,
+                        // making slot-restricted buffs apply globally.
+                        String slotGroupName = null;
+                        try {
+                            org.bukkit.inventory.EquipmentSlotGroup group = mod.getSlotGroup();
+                            if (group != null) {
+                                slotGroupName = group.toString();
+                            }
+                        } catch (NoSuchMethodError | Exception ignored) {
+                            // Pre-1.21 API does not have getSlotGroup — leave null.
+                        }
+                        byte[] slotBytes = slotGroupName != null
+                            ? slotGroupName.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                            : null;
                         modifiers.add(new PlayerData.ModifierData(
                             mod.getUniqueId().toString(),
                             mod.getName(),
                             mod.getAmount(),
                             mod.getOperation().name(),
-                            null
+                            slotBytes
                         ));
                     }
 
@@ -1769,19 +1786,44 @@ public class SyncManager {
                 while (it.hasNext()) list.add(it.next());
                 cachedAdvancements = list.toArray(new org.bukkit.advancement.Advancement[0]);
             }
+            // P0 (issue #53): apply symmetric award + revoke. Previously only
+            // award was performed — criteria revoked on the source server (via
+            // /advancement revoke or plugin API) were silently lost on cross-
+            // server load. MC's PlayerAdvancements.load does the symmetric
+            // operation; this mirrors it.
+            //
+            // If data.getAdvancements() is null (the collect path was skipped
+            // entirely, e.g. sync-advancements=false at save time), do NOT
+            // touch the player's advancements — preserve target state.
+            if (data.getAdvancements() == null) return;
             for (org.bukkit.advancement.Advancement adv : cachedAdvancements) {
                 String key = adv.getKey().toString();
-                Map<String, Long> criteria = data.getAdvancements().get(key);
-                if (criteria == null) continue;
+                // savedCriteria is the authoritative set: criteria in this set
+                // should be awarded; criteria NOT in this set should be revoked.
+                // An empty set (key present, empty map) means "all revoked".
+                // A missing key means "we have no info — skip" (legacy compat).
+                Map<String, Long> criteriaMap = data.getAdvancements().get(key);
+                if (criteriaMap == null) continue;
+                java.util.Set<String> savedCriteria = criteriaMap.keySet();
 
                 org.bukkit.advancement.AdvancementProgress progress = player.getAdvancementProgress(adv);
                 if (progress == null) continue;
 
-                // Award criteria that are saved but not yet awarded
-                for (String criterion : criteria.keySet()) {
-                    if (!progress.getAwardedCriteria().contains(criterion)) {
+                java.util.Collection<String> currentCriteria = progress.getAwardedCriteria();
+
+                // Award: saved - current
+                for (String criterion : savedCriteria) {
+                    if (!currentCriteria.contains(criterion)) {
                         try {
                             progress.awardCriteria(criterion);
+                        } catch (Exception ignored) {}
+                    }
+                }
+                // Revoke: current - saved (was missing — silent loss of revocations)
+                for (String criterion : new java.util.ArrayList<>(currentCriteria)) {
+                    if (!savedCriteria.contains(criterion)) {
+                        try {
+                            progress.revokeCriteria(criterion);
                         } catch (Exception ignored) {}
                     }
                 }
@@ -1860,13 +1902,31 @@ public class SyncManager {
                     if (attrData.getModifiers() != null) {
                         for (PlayerData.ModifierData modData : attrData.getModifiers()) {
                             try {
-                                AttributeModifier modifier = new AttributeModifier(
-                                    java.util.UUID.fromString(modData.getUuid()),
+                                // P0 (issue #55): tolerate both pre-1.21 enum names
+                                // (ADD_NUMBER/ADD_SCALAR/MULTIPLY_SCALAR_1) and 1.21+
+                                // renamed aliases (ADD_VALUE/ADD_MULTIPLIED_BASE/
+                                // ADD_MULTIPLIED_TOTAL). Paper 1.21.11 still supports
+                                // the old names as deprecated aliases, but future
+                                // versions may remove them — without this adapter,
+                                // valueOf would throw and the modifier would be
+                                // silently dropped (caught below).
+                                AttributeModifier.Operation op = parseAttributeOperation(modData.getOperation());
+
+                                // P0 (issue #56): preserve the EquipmentSlotGroup so
+                                // slot-restricted modifiers round-trip. The 5-arg
+                                // constructor with slotGroup is used when the saved
+                                // data carries it; otherwise fall back to the 4-arg
+                                // constructor (defaults to ANY).
+                                AttributeModifier modifier = buildAttributeModifier(
+                                    modData.getUuid(),
                                     modData.getName(),
                                     modData.getAmount(),
-                                    AttributeModifier.Operation.valueOf(modData.getOperation())
+                                    op,
+                                    modData.getSlotGroupName()
                                 );
-                                instance.addModifier(modifier);
+                                if (modifier != null) {
+                                    instance.addModifier(modifier);
+                                }
                             } catch (Exception ignored) {}
                         }
                     }
@@ -1874,6 +1934,68 @@ public class SyncManager {
             }
         } catch (Exception e) {
             if (config.isDebug()) logger.warning("Failed to apply attributes: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Parse an AttributeModifier.Operation name, accepting both the pre-1.21
+     * enum names and the 1.21+ renamed aliases. Paper 1.21.11 still supports
+     * the old names as deprecated aliases, but future versions may remove them.
+     */
+    private static AttributeModifier.Operation parseAttributeOperation(String name) {
+        if (name == null || name.isEmpty()) {
+            return AttributeModifier.Operation.ADD_NUMBER;
+        }
+        try {
+            return AttributeModifier.Operation.valueOf(name);
+        } catch (IllegalArgumentException e) {
+            return switch (name) {
+                case "ADD_VALUE"            -> AttributeModifier.Operation.ADD_NUMBER;
+                case "ADD_MULTIPLIED_BASE"  -> AttributeModifier.Operation.ADD_SCALAR;
+                case "ADD_MULTIPLIED_TOTAL" -> AttributeModifier.Operation.MULTIPLY_SCALAR_1;
+                default -> AttributeModifier.Operation.ADD_NUMBER;
+            };
+        }
+    }
+
+    /**
+     * Build an AttributeModifier, preserving the EquipmentSlotGroup if the
+     * saved data carries one. Falls back to the 4-arg constructor (ANY slot)
+     * for legacy payloads.
+     *
+     * <p>Paper 1.21.11 has the 5-arg constructor {@code (UUID, String, double,
+     * Operation, EquipmentSlotGroup)}. We resolve the slot group by name via
+     * {@link org.bukkit.inventory.EquipmentSlotGroup#valueOf(String)} (or its
+     * case-insensitive lookup). On older Paper without the 5-arg constructor,
+     * the NoSuchMethodError is caught and we fall back to 4-arg.
+     */
+    private static AttributeModifier buildAttributeModifier(
+            String uuidStr, String name, double amount,
+            AttributeModifier.Operation op, String slotGroupName) {
+        java.util.UUID uuid;
+        try {
+            uuid = java.util.UUID.fromString(uuidStr);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+        if (slotGroupName != null && !slotGroupName.isEmpty()) {
+            try {
+                // EquipmentSlotGroup is an abstract class (not an enum) on
+                // Paper 1.21+. Lookup by name via the static getByName method.
+                org.bukkit.inventory.EquipmentSlotGroup group =
+                    org.bukkit.inventory.EquipmentSlotGroup.getByName(slotGroupName);
+                if (group != null) {
+                    return new AttributeModifier(uuid, name, amount, op, group);
+                }
+            } catch (NoSuchMethodError | Exception ignored) {
+                // Pre-1.21 Paper does not have the 5-arg constructor or the
+                // getByName method — fall through to the 4-arg constructor.
+            }
+        }
+        try {
+            return new AttributeModifier(uuid, name, amount, op);
+        } catch (Exception e) {
+            return null;
         }
     }
 
