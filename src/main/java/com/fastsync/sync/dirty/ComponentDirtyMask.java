@@ -224,11 +224,34 @@ public class ComponentDirtyMask {
         return mask.recordSaveAndCheckValidation(validationInterval);
     }
 
+    // Separate counter for API mutation safety scans (balanced mode).
+    // Not reusing validationInterval — that's for full checksum comparison,
+    // this is for "should we mark ALL components dirty this cycle".
+    private final ConcurrentHashMap<UUID, java.util.concurrent.atomic.AtomicInteger> apiMutationScanCounters = new ConcurrentHashMap<>();
+
+    /**
+     * Record an API mutation scan cycle and check if a full scan is due.
+     * @param interval every Nth cycle triggers a full scan
+     * @return true if this cycle should do a full component scan
+     */
+    public boolean recordApiMutationScanAndCheck(UUID uuid, int interval) {
+        if (interval <= 1) return true;
+        java.util.concurrent.atomic.AtomicInteger counter =
+            apiMutationScanCounters.computeIfAbsent(uuid, k -> new java.util.concurrent.atomic.AtomicInteger());
+        int value = counter.incrementAndGet();
+        if (value >= interval) {
+            counter.set(0);
+            return true;
+        }
+        return false;
+    }
+
     /**
      * Remove the dirty mask for a player (used on quit).
      */
     public void remove(UUID uuid) {
         masks.remove(uuid);
+        apiMutationScanCounters.remove(uuid);
     }
 
     /**

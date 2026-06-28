@@ -58,6 +58,10 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     private DatabaseManager databaseManager;
     private SyncManager syncManager;
 
+    private static FastSync instance;
+
+    public static FastSync getInstance() { return instance; }
+
     private Object cleanupTask;
     private Object periodicSaveTask;
     private Object heartbeatTask;
@@ -89,6 +93,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
     @Override
     public void onEnable() {
+        instance = this;
         // Initialize config
         saveDefaultConfig();
         configManager = new ConfigManager(this);
@@ -247,6 +252,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         }
 
         getLogger().info("FastSync disabled!");
+        instance = null;
     }
 
     // ==================== Command Handler ====================

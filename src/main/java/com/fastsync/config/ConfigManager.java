@@ -90,6 +90,11 @@ public class ConfigManager {
     private boolean dirtyTrackingEnabled;
     private int dirtyValidationInterval;
 
+    // API mutation safety policy for dirty tracking
+    public enum ApiMutationSafetyMode { STRICT, BALANCED, API_ONLY }
+    private ApiMutationSafetyMode apiMutationSafetyMode;
+    private int apiMutationFullComponentScanInterval;
+
     // Phase 2: per-component storage
     private boolean componentStorageEnabled;
     private int componentBatchSize;  // max components per upsertComponentsBatch transaction
@@ -483,6 +488,17 @@ public class ConfigManager {
             dirtyValidationInterval = 1;
         }
 
+        // API mutation safety: handles Bukkit API changes that don't fire events
+        String rawMode = source.getString("sync.dirty-tracking.api-mutation-safety.mode", "balanced");
+        try {
+            apiMutationSafetyMode = ApiMutationSafetyMode.valueOf(rawMode.trim().toUpperCase(java.util.Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            logger.warning("[Config] Invalid api-mutation-safety.mode: '" + rawMode + "', using BALANCED");
+            apiMutationSafetyMode = ApiMutationSafetyMode.BALANCED;
+        }
+        apiMutationFullComponentScanInterval = Math.max(1, Math.min(
+            source.getInt("sync.dirty-tracking.api-mutation-safety.full-component-scan-interval", 3), 20));
+
         // Phase 2: per-component storage. When enabled, dirty components are
         // written to the player_component table instead of rewriting the full
         // player_data Blob. Reads check component_bitmap to decide which path.
@@ -728,6 +744,8 @@ public class ConfigManager {
     public boolean isDirtyTrackingEnabled() { return dirtyTrackingEnabled; }
     /** How many saves between forced full-collect validations. */
     public int getDirtyValidationInterval() { return dirtyValidationInterval; }
+    public ApiMutationSafetyMode getApiMutationSafetyMode() { return apiMutationSafetyMode; }
+    public int getApiMutationFullComponentScanInterval() { return apiMutationFullComponentScanInterval; }
 
     /** Phase 2: per-component storage (writes dirty components to player_component table). */
     public boolean isComponentStorageEnabled() { return componentStorageEnabled; }

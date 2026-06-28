@@ -2525,34 +2525,29 @@ public class SyncManager {
         if (dirtyMask != null && finalKind == SaveKind.PERIODIC) {
             boolean shouldValidate = dirtyMask.recordSaveAndCheckValidation(uuid);
             if (shouldValidate) {
-                // Force full collect + dirty-mark everything to ensure checksum
-                // comparison happens in persistCollectedData.
                 dirtyMask.markAllDirty(uuid);
-            } else if (config.isComponentStorageEnabled()) {
-                // Conservative dirty strategy for components without event coverage.
-                // DirtyTrackingListener does NOT cover: PDC changes (no events),
-                // Statistics changes (no granular events), Attribute changes (rare),
-                // Advancements (criteria granted via API without event).
-                // When component-storage is enabled, these components would only
-                // be written during validation saves (every Nth cycle) if we did
-                // not conservatively mark them here. To avoid losing changes
-                // between validations, mark them dirty on every periodic save
-                // when component-storage is on. This is a small cost (4 extra
-                // component serializations + DB writes per periodic save) but
-                // prevents silent data loss for plugin-driven state changes.
+            } else {
+                // API mutation safety: Bukkit events do not cover direct API
+                // modifications (e.g. player.getInventory().setItem() by a
+                // plugin). Without conservative marking, these changes would
+                // be silently lost between validation cycles.
                 //
-                // NOTE: This MUST run before the "no dirty → skip" check below.
-                // If it ran after, a player with no event-driven dirty bits
-                // would skip the save entirely and never pick up the
-                // conservative marks until the next validation cycle.
-                markComponentsWithoutReliableEvents(uuid);
+                // This logic runs regardless of component-storage.enabled —
+                // even with full Blob saves, a skipped periodic save means
+                // the change is not persisted until quit/validation.
+                switch (config.getApiMutationSafetyMode()) {
+                    case STRICT -> markApiMutationRiskComponents(uuid);
+                    case BALANCED -> {
+                        int interval = config.getApiMutationFullComponentScanInterval();
+                        if (dirtyMask.recordApiMutationScanAndCheck(uuid, interval)) {
+                            markApiMutationRiskComponents(uuid);
+                        } else {
+                            markHighRiskApiMutationComponents(uuid);
+                        }
+                    }
+                    case API_ONLY -> { /* rely on FastSyncApi.markDirty() from plugins */ }
+                }
             }
-            // Now check if there's anything to save. After the conservative
-            // marks above (when component-storage is on) or markAllDirty (when
-            // validating), there will usually be dirty bits. The only case
-            // where we still skip is: component-storage OFF + no validation
-            // due + no event-driven dirty. In that case the next periodic
-            // save will try again.
             if (!shouldValidate && !dirtyMask.isAnyDirty(uuid)) {
                 if (config.isDebug()) {
                     logger.fine("Skipping periodic save for " + uuid + " — no dirty components");
@@ -3494,29 +3489,48 @@ public class SyncManager {
         };
     }
 
-    /** Mark enabled components whose state can change without a reliable Bukkit event. */
-    private void markComponentsWithoutReliableEvents(UUID uuid) {
-        if (config.isSyncPDC()) {
-            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
-        }
-        if (config.isSyncStatistics()) {
-            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
-        }
-        if (config.isSyncAttributes()) {
-            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
-        }
-        if (config.isSyncAdvancements()) {
-            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
-        }
-        if (config.isSyncAir()) {
-            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.AIR);
-        }
-        if (config.isSyncFireTicks()) {
-            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FIRE_TICKS);
-        }
-        if (config.isSyncLocation()) {
-            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.LOCATION);
-        }
+    /**
+     * Mark ALL enabled components as dirty — for strict mode or full-scan cycles.
+     * Covers every component that can be mutated by Bukkit API without firing events.
+     */
+    private void markApiMutationRiskComponents(UUID uuid) {
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.INVENTORY);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ENDER_CHEST);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.VITALS);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FOOD);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.EXPERIENCE);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.GAME_MODE);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.POTION_EFFECTS);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FLIGHT);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.AIR);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FIRE_TICKS);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.LOCATION);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
+    }
+
+    /**
+     * Mark only high-risk components — for balanced mode between full scans.
+     * These are the components most likely to be changed by plugin API calls
+     * and most likely to cause visible data loss (inventory, ender chest, PDC, etc).
+     */
+    private void markHighRiskApiMutationComponents(UUID uuid) {
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.INVENTORY);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ENDER_CHEST);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FOOD);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.EXPERIENCE);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
+        markIfEnabled(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
+    }
+
+    private void markIfEnabled(UUID uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component component) {
+        if (dirtyMask == null) return;
+        if (!isComponentSyncEnabled(component)) return;
+        dirtyMask.markDirty(uuid, component);
     }
 
     /**
@@ -4032,6 +4046,33 @@ public class SyncManager {
         int max = current.length;
         for (int i = 0; i < max; i++) {
             player.getEnderChest().setItem(i, i < contents.length ? contents[i] : null);
+        }
+    }
+
+    /**
+     * Mark a player's component dirty — public API for third-party plugins
+     * that modify player state via Bukkit API without firing events.
+     * Called by {@link com.fastsync.api.FastSyncApi#markDirty}.
+     */
+    public void markPlayerDirty(UUID uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component component) {
+        if (uuid == null || component == null) return;
+        if (dirtyMask == null) return;
+        if (!activePlayers.containsKey(uuid)) return;
+        if (!isComponentSyncEnabled(component)) return;
+        dirtyMask.markDirty(uuid, component);
+    }
+
+    public void markPlayerDirty(UUID uuid, String componentName) {
+        if (uuid == null || componentName == null) return;
+        try {
+            com.fastsync.sync.dirty.ComponentDirtyMask.Component component =
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.valueOf(
+                    componentName.trim().toUpperCase(java.util.Locale.ROOT));
+            markPlayerDirty(uuid, component);
+        } catch (IllegalArgumentException ignored) {
+            if (config.isDebug()) {
+                logger.fine("[DirtyAPI] Unknown component name: " + componentName);
+            }
         }
     }
 
