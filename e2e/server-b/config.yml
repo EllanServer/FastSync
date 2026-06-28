@@ -62,7 +62,7 @@ sync:
   save-on-world-save: true
   cancel-commands-while-locked: false
 
-cluster-id: ""
+cluster-id: "e2e-test"
 
 snapshot:
   enabled: true

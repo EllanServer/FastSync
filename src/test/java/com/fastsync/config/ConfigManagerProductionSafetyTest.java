@@ -107,12 +107,14 @@ class ConfigManagerProductionSafetyTest {
      */
     @Test
     void rejectsClusterIdWithDefaultTablePrefix() throws Exception {
+        // v2 schema has (cluster_id, uuid) PK, so cluster-id + default
+        // table-prefix is now safe — different clusters are isolated at
+        // the DB row level. This test is no longer applicable.
         ConfigManager config = base();
         set(config, "clusterId", "production");
-        set(config, "tablePrefix", "fastsync_");  // the default
-        assertThrows(RuntimeException.class,
-            config::validateProductionSafety,
-            "cluster-id + default table-prefix must refuse startup (DB row collision risk)");
+        set(config, "tablePrefix", "fastsync_");
+        assertDoesNotThrow(config::validateProductionSafety,
+            "v2 schema isolates by cluster_id in PK, so default table-prefix is safe");
     }
 
     /**

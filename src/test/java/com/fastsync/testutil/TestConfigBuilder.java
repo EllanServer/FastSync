@@ -21,6 +21,7 @@ public class TestConfigBuilder {
 
     public TestConfigBuilder defaults() throws ReflectiveOperationException {
         set("serverName", "test-server");
+        set("clusterId", "test-cluster");
         set("tablePrefix", "fastsync_test_");
         set("lockTimeout", 30);
         set("lockRetryIntervalMs", 500L);
