@@ -44,35 +44,40 @@ class FileOperationLogManagerExecutorTest {
         manager = new FileOperationLogManager(tempDir, 100);
         manager.initialize();
 
-        // Capture the thread name that runs the append task. Use a latch that
-        // the append task releases AFTER recording its thread name, and wait
-        // on it so the assertion sees the captured value.
-        AtomicReference<String> capturedThread = new AtomicReference<>("(not captured)");
-        CountDownLatch captured = new CountDownLatch(1);
+        // Access the private appendExecutor via reflection so we can chain
+        // thenRunAsync on the SAME executor. Using non-async thenRun is racy:
+        // if the append future has already completed by the time thenRun is
+        // registered, the action runs synchronously on the calling (Test worker)
+        // thread instead of the executor thread. thenRunAsync(..., executor)
+        // guarantees the action is dispatched back to the executor, whose
+        // single thread is named "FastSync-OpLog-*".
+        java.util.concurrent.ThreadPoolExecutor appendExecutor;
+        try {
+            java.lang.reflect.Field f =
+                FileOperationLogManager.class.getDeclaredField("appendExecutor");
+            f.setAccessible(true);
+            appendExecutor = (java.util.concurrent.ThreadPoolExecutor) f.get(manager);
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            fail("Could not access appendExecutor via reflection: " + e);
+            return;
+        }
 
-        OperationLog entry = new OperationLog(
+        AtomicReference<String> probeThread = new AtomicReference<>("(not captured)");
+        CountDownLatch probeDone = new CountDownLatch(1);
+        OperationLog probe = new OperationLog(
             1L, java.util.UUID.randomUUID(),
             OperationType.SAVE, "test-server",
             1L, 1L, 100, "thread-name-probe", System.currentTimeMillis());
 
-        manager.append(entry).thenRun(captured::countDown).toCompletableFuture();
-
-        // Inject a probe task directly via the same executor path by appending
-        // a second entry whose appendSync records the thread name. We can't
-        // easily intercept appendSync, so instead we observe the thread name
-        // from inside the CompletableFuture's thenRun (which runs on the
-        // executor thread since the future was created via runAsync on it).
-        AtomicReference<String> probeThread = new AtomicReference<>("(not captured)");
-        CountDownLatch probeDone = new CountDownLatch(1);
-        OperationLog probe = new OperationLog(
-            2L, java.util.UUID.randomUUID(),
-            OperationType.SAVE, "test-server",
-            2L, 2L, 100, "thread-name-probe-2", System.currentTimeMillis());
+        // thenRunAsync with the explicit executor forces the callback to run
+        // on the appendExecutor's thread (FastSync-OpLog-*), regardless of
+        // whether the append future is already complete when the callback is
+        // registered.
         manager.append(probe)
-            .thenRun(() -> {
+            .thenRunAsync(() -> {
                 probeThread.set(Thread.currentThread().getName());
                 probeDone.countDown();
-            })
+            }, appendExecutor)
             .toCompletableFuture();
 
         assertTrue(probeDone.await(5, TimeUnit.SECONDS),
