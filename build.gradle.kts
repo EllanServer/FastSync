@@ -70,6 +70,13 @@ dependencies {
     implementation("at.yawk.lz4:lz4-java:1.11.0")
     implementation("org.jooq:jooq:3.21.6")
     implementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
+    // jOOQ 3.21 has a transitive dependency on io.r2dbc:r2dbc-spi (jOOQ's R2DBC
+    // support). jOOQ's static initializer references io.r2dbc.spi.ConnectionFactory
+    // even when only the JDBC DSL is used, so r2dbc-spi MUST be on the runtime
+    // classpath. We shade it in (NOT relocated — it is a pure SPI interface
+    // package and jOOQ's reflection looks up the literal io.r2dbc.spi.* names).
+    // Keeping it out of plugin.yml libraries avoids one more cold-start download.
+    implementation("io.r2dbc:r2dbc-spi:1.0.0.RELEASE")
 
     // Complex runtime deps with deep transitive chains (netty / jackson /
     // protobuf): kept as compileOnly and declared in plugin.yml `libraries:`
@@ -252,6 +259,9 @@ tasks.shadowJar {
     // Shade the self-contained runtime deps + Sparrow libraries. Complex deps
     // (Redisson, MySQL connector, reactive-streams) are excluded — they stay
     // in plugin.yml `libraries:` and are downloaded by Paper at startup.
+    // NOTE: io.r2dbc is shaded WITHOUT relocation — jOOQ's static initializer
+    // references io.r2dbc.spi.ConnectionFactory by literal class name, so the
+    // package must keep its original io.r2dbc.* name.
     dependencies {
         exclude {
             val group = it.moduleGroup
@@ -260,10 +270,12 @@ tasks.shadowJar {
                 && !group.startsWith("at.yawk")
                 && !group.startsWith("org.jooq")
                 && !group.startsWith("com.github.ben-manes")
+                && !group.startsWith("io.r2dbc")
         }
     }
 
     // Relocate shaded libraries to avoid classpath conflicts with other plugins.
+    // io.r2dbc is intentionally NOT relocated — see comment above.
     relocate("com.zaxxer.hikari", "com.fastsync.libs.hikari")
     relocate("net.jpountz", "com.fastsync.libs.lz4")
     relocate("org.jooq", "com.fastsync.libs.jooq")
