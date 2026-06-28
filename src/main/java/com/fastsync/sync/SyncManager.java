@@ -1183,10 +1183,33 @@ public class SyncManager {
         try {
             finalSaveExecutor.execute(quitSaveTask);
         } catch (java.util.concurrent.RejectedExecutionException e) {
-            // Final-save executor also saturated. Last resort: run
-            // synchronously on the current thread (PlayerQuitEvent is on
-            // main/region thread). This blocks the tick loop, but losing the
-            // player's final state is worse. Log at SEVERE so this is visible.
+            // Final-save executor also saturated.
+            // Round 14b: if finalSaveAllowSyncFallback is false (production
+            // default), do NOT run DB I/O on the event thread. Instead, log
+            // SEVERE and let the lock expire naturally. The player's final
+            // state will be missing until the next login triggers a full
+            // save, but this is safer than blocking the game tick.
+            if (!config.isFinalSaveAllowSyncFallback()) {
+                logger.log(Level.SEVERE, "[FinalSave] QUIT save for " + uuid
+                    + " rejected (final-save queue full). Sync fallback is DISABLED "
+                    + "(final-save.allow-sync-fallback=false). Lock will expire after "
+                    + config.getLockTimeout() + "s. Player's final state may be lost "
+                    + "— investigate DB latency or increase final-save.queue-capacity.");
+                recordFinalSaveSynchronousFallback(
+                    "QUIT", uuid,
+                    "sync fallback BLOCKED by config (final-save.allow-sync-fallback=false). "
+                        + "Lock will expire naturally.",
+                    e);
+                pendingSaveCount.decrementAndGet();
+                // Do NOT release lock — let it expire to protect against
+                // stale reads by other servers.
+                playerVersions.remove(uuid);
+                playerFencingTokens.remove(uuid);
+                playerLockSessions.remove(uuid);
+                playersWithBaseline.remove(uuid);
+                return;
+            }
+            // Fallback allowed: run synchronously on the event thread.
             recordFinalSaveSynchronousFallback(
                 "QUIT", uuid,
                 "running synchronously on event thread as last-resort fallback. "

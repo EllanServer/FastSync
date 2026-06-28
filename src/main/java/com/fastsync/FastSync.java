@@ -490,6 +490,26 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         // Stream stats
         sender.sendMessage(ChatColor.YELLOW + "Streams: " +
             (configManager.isStreamsEnabled() ? ChatColor.GREEN + "Enabled" : ChatColor.RED + "Disabled"));
+
+        // Snapshot stats (round 14b)
+        if (syncManager.getSnapshotManager() != null) {
+            var sm = syncManager.getSnapshotManager();
+            long rejected = sm.getRejectedCount();
+            ChatColor snapColor = rejected > 0 ? ChatColor.RED : ChatColor.GREEN;
+            sender.sendMessage(ChatColor.YELLOW + "Snapshots: " + snapColor +
+                "queue=" + sm.getQueueSize() + "/" + sm.getQueueCapacity() +
+                ", rejected=" + rejected);
+        }
+
+        // Cluster + production mode (round 14b)
+        sender.sendMessage(ChatColor.YELLOW + "Cluster: " + ChatColor.WHITE +
+            (configManager.getClusterId() != null && !configManager.getClusterId().isBlank()
+                ? configManager.getClusterId() : "(none)"));
+        if (configManager.isProductionEnabled()) {
+            sender.sendMessage(ChatColor.YELLOW + "Production: " + ChatColor.GREEN + "ON" +
+                " (redis=" + (configManager.isProductionRequireRedis() ? "required" : "optional") +
+                ", sync-fallback=" + (configManager.isFinalSaveAllowSyncFallback() ? "allowed" : "blocked") + ")");
+        }
     }
 
     // ==================== Getters ====================
