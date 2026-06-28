@@ -16,14 +16,10 @@ cluster-id: "survival-main"
 # When enabled, enforces strict safety checks:
 # - require-redis: Redis must be enabled and healthy (no DB polling fallback)
 # - require-cluster-id: cluster-id must be non-empty
-# - allow-final-save-sync-fallback: if false, QUIT saves rejected when
-#   final-save executor queue is full (lock expires naturally instead of
-#   running DB I/O on the event thread)
 production:
   enabled: false
   require-redis: true
   require-cluster-id: true
-  allow-final-save-sync-fallback: false
 
 # ------------------------------------------------------------
 # Final-Save Executor
@@ -324,26 +320,6 @@ statistics:
       - "KILL_ENTITY=ENDER_DRAGON"
       - "KILL_ENTITY=WITHER"
       - "USE_ITEM=TOTEM_OF_UNDYING"
-
-# ------------------------------------------------------------
-# Cluster Settings
-# ------------------------------------------------------------
-# Cluster ID for multi-cluster isolation. Servers with the same cluster ID
-# share player data via Redis pub/sub streams.
-#
-# IMPORTANT: cluster-id only isolates REDIS messaging (topics, streams,
-# consumer groups). It does NOT isolate database rows. The DB tables
-# (player_data, player_component) key on uuid only — there is no
-# cluster_id column. If two logical clusters share the same MySQL
-# database + table-prefix, they will silently overwrite each other's
-# player blobs even if cluster-id differs.
-#
-# To run multiple FastSync clusters against one MySQL instance, give each
-# cluster a distinct database.table-prefix (e.g. "survival_", "creative_")
-# OR a distinct database.database. validateProductionSafety() will refuse
-# to start if a non-empty cluster-id is paired with the default
-# table-prefix, since that combination is almost always a misconfiguration.
-cluster-id: ""
 
 # ------------------------------------------------------------
 # Snapshot / Backup Settings

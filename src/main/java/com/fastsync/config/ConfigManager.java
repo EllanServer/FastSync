@@ -134,7 +134,6 @@ public class ConfigManager {
     private boolean productionEnabled;
     private boolean productionRequireRedis;
     private boolean productionRequireClusterId;
-    private boolean productionAllowFinalSaveSyncFallback;
 
     // Final-save executor
     private int finalSaveThreads;
@@ -304,7 +303,7 @@ public class ConfigManager {
             }
             logger.info("[Config] Production mode enabled. Redis required=" + productionRequireRedis
                 + ", cluster-id required=" + productionRequireClusterId
-                + ", final-save sync fallback allowed=" + productionAllowFinalSaveSyncFallback);
+                + ", final-save sync fallback allowed=" + finalSaveAllowSyncFallback);
         }
     }
 
@@ -516,16 +515,26 @@ public class ConfigManager {
         saveOnDeath = source.getBoolean("sync.save-on-death", false);
         saveOnWorldSave = source.getBoolean("sync.save-on-world-save", false);
 
-        // Cluster
+        // Cluster — fail early if missing/invalid, before DB init
         clusterId = source.getString("cluster-id", "");
+        if (clusterId == null || clusterId.isBlank()) {
+            throw new RuntimeException(
+                "cluster-id must be explicitly set in config.yml. " +
+                "All servers in the same FastSync cluster must use the same non-empty cluster-id.");
+        }
+        clusterId = clusterId.trim();
+        if (!clusterId.matches("[A-Za-z0-9_.-]{1,64}")) {
+            throw new RuntimeException(
+                "Invalid cluster-id '" + clusterId + "'. " +
+                "Allowed characters: A-Z a-z 0-9 _ . - , max 64 characters.");
+        }
 
         // Production mode
         productionEnabled = source.getBoolean("production.enabled", false);
         productionRequireRedis = source.getBoolean("production.require-redis", true);
         productionRequireClusterId = source.getBoolean("production.require-cluster-id", true);
-        productionAllowFinalSaveSyncFallback = source.getBoolean("production.allow-final-save-sync-fallback", false);
 
-        // Final-save executor
+        // Final-save executor (single source of truth for sync-fallback gate)
         finalSaveThreads = source.getInt("final-save.threads", 4);
         finalSaveQueueCapacity = source.getInt("final-save.queue-capacity", 8192);
         finalSaveShutdownTimeoutSeconds = source.getInt("final-save.shutdown-timeout-seconds", 60);
@@ -667,7 +676,6 @@ public class ConfigManager {
     public boolean isProductionEnabled() { return productionEnabled; }
     public boolean isProductionRequireRedis() { return productionRequireRedis; }
     public boolean isProductionRequireClusterId() { return productionRequireClusterId; }
-    public boolean isProductionAllowFinalSaveSyncFallback() { return productionAllowFinalSaveSyncFallback; }
 
     // Final-save executor
     public int getFinalSaveThreads() { return finalSaveThreads; }

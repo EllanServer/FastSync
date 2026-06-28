@@ -203,35 +203,44 @@ public class FastSyncProxy {
      * Query all registered backend servers for their FastSync status.
      */
     public CompletableFuture<List<HandoffProtocol.StatusResponseData>> queryAllStatus() {
-        List<HandoffProtocol.StatusResponseData> results = new ArrayList<>();
         List<CompletableFuture<HandoffProtocol.StatusResponseData>> futures = new ArrayList<>();
 
         for (RegisteredServer server : proxy.getAllServers()) {
             String name = server.getServerInfo().getName();
-            CompletableFuture<HandoffProtocol.StatusResponseData> future = new CompletableFuture<>();
-            pendingStatusQueries.put(name, future);
-            futures.add(future);
+            CompletableFuture<HandoffProtocol.StatusResponseData> raw = new CompletableFuture<>();
+            pendingStatusQueries.put(name, raw);
 
-            server.sendPluginMessage(HANDOFF_CHANNEL, HandoffProtocol.encodeStatusQuery());
-        }
+            // Wrap with timeout + exceptionally so one slow backend
+            // doesn't cause allOf to throw.
+            CompletableFuture<HandoffProtocol.StatusResponseData> safe =
+                raw.orTimeout(config.getStatusQueryTimeoutMs(), TimeUnit.MILLISECONDS)
+                   .exceptionally(ex -> {
+                       if (config.isDebug()) {
+                           logger.warn("[Handoff] Status query timed out or failed for backend {}", name, ex);
+                       }
+                       return null;
+                   })
+                   .whenComplete((result, ex) -> pendingStatusQueries.remove(name, raw));
+            futures.add(safe);
 
-        // Combine all futures with timeout
-        CompletableFuture<Void> all = CompletableFuture.allOf(
-            futures.toArray(new CompletableFuture[0]));
-
-        // Add timeout for each future
-        for (var f : futures) {
-            f.orTimeout(config.getStatusQueryTimeoutMs(), TimeUnit.MILLISECONDS)
-             .exceptionally(ex -> null);
-        }
-
-        return all.thenApply(v -> {
-            for (var f : futures) {
-                HandoffProtocol.StatusResponseData data = f.join();
-                if (data != null) results.add(data);
+            boolean sent = server.sendPluginMessage(HANDOFF_CHANNEL, HandoffProtocol.encodeStatusQuery());
+            if (!sent) {
+                raw.complete(null);
             }
-            return results;
-        });
+        }
+
+        return CompletableFuture
+            .allOf(futures.toArray(new CompletableFuture[0]))
+            .thenApply(v -> {
+                List<HandoffProtocol.StatusResponseData> results = new ArrayList<>();
+                for (CompletableFuture<HandoffProtocol.StatusResponseData> f : futures) {
+                    HandoffProtocol.StatusResponseData data = f.getNow(null);
+                    if (data != null) {
+                        results.add(data);
+                    }
+                }
+                return results;
+            });
     }
 
     // ==================== Incoming message handler ====================
@@ -243,40 +252,58 @@ public class FastSyncProxy {
     public void onPluginMessage(PluginMessageEvent event) {
         if (!event.getIdentifier().equals(HANDOFF_CHANNEL)) return;
 
-        byte[] data = event.getData();
-        int type = HandoffProtocol.getMessageType(data);
+        // Mark as handled so Velocity does not forward internal protocol
+        // messages to the player client or other backends.
+        event.setResult(PluginMessageEvent.ForwardResult.handled());
 
-        switch (type) {
-            case HandoffProtocol.LOCK_STATUS -> {
-                HandoffProtocol.LockStatusData status = HandoffProtocol.decodeLockStatus(data);
-                CompletableFuture<HandoffProtocol.LockStatusData> future =
-                    pendingLockQueries.remove(status.uuid());
-                if (future != null) {
-                    future.complete(status);
-                }
-                if (config.isDebug()) {
-                    logger.info("[Handoff] Lock status for {}: locked={} by {}",
-                        status.uuid(), status.locked(), status.serverName());
-                }
+        // Only accept messages from backend servers, not from player clients.
+        if (!(event.getSource() instanceof com.velocitypowered.api.proxy.ServerConnection)) {
+            if (config != null && config.isDebug()) {
+                logger.warn("[Handoff] Rejected plugin message from non-server source: {}",
+                    event.getSource().getClass().getName());
             }
-            case HandoffProtocol.STATUS_RESPONSE -> {
-                HandoffProtocol.StatusResponseData status = HandoffProtocol.decodeStatusResponse(data);
-                CompletableFuture<HandoffProtocol.StatusResponseData> future =
-                    pendingStatusQueries.remove(status.serverName());
-                if (future != null) {
-                    future.complete(status);
-                }
-                if (config.isDebug()) {
-                    logger.info("[Handoff] Status from {}: db={} redis={} players={}",
-                        status.serverName(), status.dbHealthy(), status.redisHealthy(),
-                        status.playerCount());
-                }
-            }
+            return;
         }
 
-        // Note: We don't forward the message to the player client.
-        // Velocity's default is to forward, but our messages are internal
-        // protocol messages not meant for the client.
+        byte[] data = event.getData();
+        try {
+            int type = HandoffProtocol.getMessageType(data);
+
+            switch (type) {
+                case HandoffProtocol.LOCK_STATUS -> {
+                    HandoffProtocol.LockStatusData status = HandoffProtocol.decodeLockStatus(data);
+                    CompletableFuture<HandoffProtocol.LockStatusData> future =
+                        pendingLockQueries.remove(status.uuid());
+                    if (future != null) {
+                        future.complete(status);
+                    }
+                    if (config.isDebug()) {
+                        logger.info("[Handoff] Lock status for {}: locked={} by {}",
+                            status.uuid(), status.locked(), status.serverName());
+                    }
+                }
+                case HandoffProtocol.STATUS_RESPONSE -> {
+                    HandoffProtocol.StatusResponseData status = HandoffProtocol.decodeStatusResponse(data);
+                    CompletableFuture<HandoffProtocol.StatusResponseData> future =
+                        pendingStatusQueries.remove(status.serverName());
+                    if (future != null) {
+                        future.complete(status);
+                    }
+                    if (config.isDebug()) {
+                        logger.info("[Handoff] Status from {}: db={} redis={} players={}",
+                            status.serverName(), status.dbHealthy(), status.redisHealthy(),
+                            status.playerCount());
+                    }
+                }
+                default -> {
+                    if (config.isDebug()) {
+                        logger.warn("[Handoff] Unknown message type: {}", type);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("[Handoff] Failed to decode plugin message", e);
+        }
     }
 
     // ==================== Utility ====================
