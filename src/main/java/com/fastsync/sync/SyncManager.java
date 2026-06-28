@@ -3962,8 +3962,15 @@ public class SyncManager {
             }
 
                 if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {
-                    snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
-                        .thenRun(() -> snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots()));
+                    try {
+                        snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
+                            .thenRun(() -> snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots()));
+                    } catch (Exception snapshotEx) {
+                        // Post-commit side effect failure must NOT turn a
+                        // successful DB save into a retry/failure. The DB
+                        // commit is authoritative — the snapshot is best-effort.
+                        logger.log(Level.WARNING, kind + " save succeeded but snapshot creation failed for " + uuid, snapshotEx);
+                    }
                 }
 
                 logOperation(uuid, OperationType.SAVE, fencingToken, expectedVersion + 1,
