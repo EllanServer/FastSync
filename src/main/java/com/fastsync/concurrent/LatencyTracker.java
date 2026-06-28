@@ -162,6 +162,24 @@ public class LatencyTracker {
 
     public long getTotalOperations() { return totalOperations.get(); }
     public long getTotalErrors() { return totalErrors.get(); }
+
+    /**
+     * Return a single-line summary string suitable for /fastsync status.
+     * Format: "name: p50=Xms p99=Xms p99.9=Xms n=N err=E"
+     */
+    public String getStatusLine() {
+        long[] arr = sortedSnapshot();
+        if (arr.length == 0) {
+            return operationName + ": no samples (total=" + totalOperations.get()
+                + ", err=" + totalErrors.get() + ")";
+        }
+        double p50 = arr[indexFor(arr.length, 50)];
+        double p99 = arr[indexFor(arr.length, 99)];
+        double p999 = arr[indexFor(arr.length, 99.9)];
+        return String.format("%s: p50=%.1fms p99=%.1fms p99.9=%.1fms n=%d err=%d",
+            operationName, p50, p99, p999, arr.length, totalErrors.get());
+    }
+
     public int getSampleCount() {
         long cur = headTail.get();
         int head = (int) (cur >>> 32);

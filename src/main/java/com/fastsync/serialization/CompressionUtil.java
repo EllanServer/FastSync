@@ -45,6 +45,11 @@ public class CompressionUtil {
     private static final LZ4Compressor compressor = factory.fastCompressor();
     private static final LZ4FastDecompressor decompressor = factory.fastDecompressor();
 
+    // ThreadLocal scratch buffer — avoids allocating a new byte[] on every
+    // compress call. LZ4's worst-case bound is input.length + some overhead,
+    // so we grow the buffer lazily as needed.
+    private static final ThreadLocal<byte[]> scratchBuffer = ThreadLocal.withInitial(() -> new byte[8192]);
+
     /**
      * Default cap on the declared decompressed (raw) length, in bytes.
      * A player data Blob should never legitimately approach this; the cap
@@ -106,11 +111,13 @@ public class CompressionUtil {
         boolean shouldCompress = data.length >= minSize;
         if (shouldCompress) {
             int maxCompressedLen = compressor.maxCompressedLength(data.length);
-            // Worst case: compression makes data larger (rare for tiny inputs).
-            // Allocate a scratch buffer at the worst-case bound, compress into
-            // it, then copy into a right-sized result. Two allocations, but the
-            // scratch buffer is reused only within this call (no thread-local).
-            byte[] tmp = new byte[maxCompressedLen];
+            // Reuse ThreadLocal scratch buffer — avoids per-call allocation.
+            // Grow if needed (rare: only when player data exceeds prior max).
+            byte[] tmp = scratchBuffer.get();
+            if (tmp.length < maxCompressedLen) {
+                tmp = new byte[maxCompressedLen];
+                scratchBuffer.set(tmp);
+            }
             int compressedLen = compressor.compress(data, 0, data.length,
                 tmp, 0, maxCompressedLen);
 

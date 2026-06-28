@@ -546,9 +546,11 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             }
         }
 
-        // Latency stats (Dynamo p99.9)
+        // Latency stats (Dynamo p99.9) — now sent to sender, not just logged
         sendMessage(sender, YELLOW + "Latency: " + GRAY + "(p50/p99/p99.9)");
-        syncManager.logLatencyStats();
+        for (String line : syncManager.getLatencyStatusLines()) {
+            sendMessage(sender, GRAY + "  " + line);
+        }
 
         // Stream stats
         sendMessage(sender, YELLOW + "Streams: " +
