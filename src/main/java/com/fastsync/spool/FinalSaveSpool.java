@@ -230,7 +230,12 @@ public final class FinalSaveSpool {
     }
 
     /** Return newest final states first; applying an older record first releases its lock. */
-    public List<Path> listPending(int maxBatch) {
+    // P1 (issue #66): synchronized to ensure consistency with concurrent
+    // append/moveToDone/moveToFailed. Without sync, Files.list(pendingDir)
+    // could miss files that were just atomically moved in by append — those
+    // files would only be picked up on the next replay cycle, delaying lock
+    // release by up to one replay interval (5s default).
+    public synchronized List<Path> listPending(int maxBatch) {
         if (maxBatch <= 0) return List.of();
         List<Path> files = new ArrayList<>();
         try (var stream = Files.list(pendingDir)) {

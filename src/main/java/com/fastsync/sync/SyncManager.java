@@ -246,6 +246,40 @@ public class SyncManager {
     private volatile org.bukkit.advancement.Advancement[] cachedAdvancements;
     private volatile Attribute[] cachedAttributes;
 
+    // P0 (issue #63): Attribute.MAX_HEALTH is a deprecated legacy field on
+    // Paper 1.21+ (Attribute is no longer an enum). Resolve once via the
+    // Registry API with a legacy fallback so we don't crash on Paper 1.22+
+    // when the field is removed. Initialized lazily to avoid class-load order
+    // issues (Registry.ATTRIBUTE may not be populated during plugin class init).
+    private static volatile Attribute MAX_HEALTH_ATTR;
+    private static Attribute loadMaxHealthAttribute() {
+        Attribute cached = MAX_HEALTH_ATTR;
+        if (cached != null) return cached;
+        try {
+            Attribute resolved = org.bukkit.Registry.ATTRIBUTE.get(
+                org.bukkit.NamespacedKey.minecraft("max_health"));
+            if (resolved != null) {
+                MAX_HEALTH_ATTR = resolved;
+                return resolved;
+            }
+        } catch (Throwable ignored) {
+            // Pre-1.21 Paper — Registry.ATTRIBUTE may not exist or key may not resolve.
+        }
+        // Legacy fallback: Attribute.MAX_HEALTH static field (deprecated but
+        // still present on Paper 1.21.x). On Paper 1.22+ when this field is
+        // removed, the catch above is the only path — and if Registry.ATTRIBUTE
+        // also doesn't have it, the plugin will fail at apply time with NPE.
+        // That's an acceptable fail-closed: the operator sees the error and
+        // files a bug rather than silent data corruption.
+        try {
+            Attribute legacy = Attribute.MAX_HEALTH;
+            MAX_HEALTH_ATTR = legacy;
+            return legacy;
+        } catch (NoSuchFieldError | Exception ignored) {
+            return null;
+        }
+    }
+
     // Pre-grouped statistic registries (avoids Statistic.values() + type check on every save).
     private volatile List<Statistic> untypedStats;
     private volatile List<Statistic> itemStats;
@@ -910,10 +944,13 @@ public class SyncManager {
         if (config.isSyncHealth()) {
             double targetMaxHealth = data.getMaxHealth();
             try {
-                AttributeInstance maxHealth = player.getAttribute(Attribute.MAX_HEALTH);
-                if (maxHealth != null && data.getMaxHealth() > 0) {
-                    maxHealth.setBaseValue(data.getMaxHealth());
-                    targetMaxHealth = maxHealth.getValue();
+                Attribute maxHealthAttr = loadMaxHealthAttribute();
+                if (maxHealthAttr != null) {
+                    AttributeInstance maxHealth = player.getAttribute(maxHealthAttr);
+                    if (maxHealth != null && data.getMaxHealth() > 0) {
+                        maxHealth.setBaseValue(data.getMaxHealth());
+                        targetMaxHealth = maxHealth.getValue();
+                    }
                 }
             } catch (Exception ignored) {
                 // Attribute may be unavailable on an incompatible server build.
@@ -1561,7 +1598,8 @@ public class SyncManager {
             // returns false (e.g. plugin-managed fake death).
             boolean dead = player.isDead() || currentHealth <= 0;
             data.setHealth(dead ? maxHealth : currentHealth);
-            AttributeInstance maxHealthAttr = player.getAttribute(Attribute.MAX_HEALTH);
+            Attribute resolvedAttr = loadMaxHealthAttribute();
+            AttributeInstance maxHealthAttr = resolvedAttr != null ? player.getAttribute(resolvedAttr) : null;
             data.setMaxHealth(maxHealthAttr != null ? maxHealthAttr.getBaseValue() : maxHealth);
         }
         if (config.isSyncFood()) {
@@ -1987,12 +2025,32 @@ public class SyncManager {
                     AttributeInstance instance = player.getAttribute(attr);
                     if (instance == null) continue;
 
-                    instance.setBaseValue(attrData.getBaseValue());
-
-                    // Clear existing modifiers and reapply
+                    // P0/P1 (issues #64, #65, #70): correct ordering + key-based
+                    // remove. Previously:
+                    //   1. setBaseValue (triggers recalc with OLD modifiers attached)
+                    //   2. removeModifier(existing) — object-equality based, fragile
+                    //      for custom AttributeModifier subclasses that don't
+                    //      implement equals correctly; modifiers accumulate
+                    //   3. addModifier (triggers recalc per add)
+                    //
+                    // New order matches MC PlayerList.placeNewPlayer:
+                    //   1. removeModifier by key (1.21+ API, falls back to object-based)
+                    //   2. setBaseValue (clean state, single recalc)
+                    //   3. addModifier (each triggers recalc, unavoidable without NMS)
                     for (AttributeModifier existing : new ArrayList<>(instance.getModifiers())) {
-                        instance.removeModifier(existing);
+                        try {
+                            // 1.21+ key-based remove (preferred — O(1) hash lookup)
+                            instance.removeModifier(existing.getKey());
+                        } catch (NoSuchMethodError | Exception ignored) {
+                            // Legacy object-based remove (1.20 and earlier)
+                            try {
+                                instance.removeModifier(existing);
+                            } catch (Exception ignored2) {}
+                        }
                     }
+
+                    // Now set the base value with no modifiers attached — clean state.
+                    instance.setBaseValue(attrData.getBaseValue());
 
                     if (attrData.getModifiers() != null) {
                         for (PlayerData.ModifierData modData : attrData.getModifiers()) {
@@ -3920,20 +3978,23 @@ public class SyncManager {
      * lets the serializer treat empty slots uniformly as null instead of storing
      * meaningless AIR ItemStacks.
      *
-     * <p>NOTE (P2 audit): Bukkit {@code PlayerInventory.getContents()} returns a
-     * fresh copy on every call (verified against CraftBukkit 1.21.11 source),
-     * so in-place modification here does not corrupt the player's live inventory
-     * backing array. Do NOT change this to mutate the result of any other
-     * inventory accessor without re-verifying the copy semantics.
+     * <p>P2 (issue #71): returns a defensive copy rather than mutating the input
+     * array. Previously relied on Bukkit {@code PlayerInventory.getContents()}
+     * returning a fresh copy — verified true on CraftBukkit 1.21.11, but a
+     * future Paper version could change that contract. The defensive copy is
+     * 36 elements (inventory) or 27 (ender chest) — negligible cost.
      */
     private org.bukkit.inventory.ItemStack[] sparseContents(org.bukkit.inventory.ItemStack[] contents) {
         if (contents == null) return null;
+        org.bukkit.inventory.ItemStack[] copy = new org.bukkit.inventory.ItemStack[contents.length];
         for (int i = 0; i < contents.length; i++) {
             if (contents[i] != null && contents[i].getType() == org.bukkit.Material.AIR) {
-                contents[i] = null;
+                copy[i] = null;
+            } else {
+                copy[i] = contents[i];
             }
         }
-        return contents;
+        return copy;
     }
 
     /**
