@@ -29,9 +29,13 @@ val paperVersion: String = property("paper.version") as String
 // Strategy:
 //   - Sparrow-NBT / Sparrow-YAML (not on Maven Central) → implementation,
 //     shaded into the JAR by the shadowJar task.
-//   - Maven Central libraries (Redisson, jOOQ, HikariCP, etc.)
+//   - Self-contained Maven Central libs (HikariCP, LZ4, jOOQ, Caffeine)
+//     → implementation, shaded + relocated into the JAR to avoid cold-start
+//     download dependency and classpath conflicts.
+//   - Complex Maven Central libs (Redisson, MySQL connector, reactive-streams)
 //     → compileOnly for compilation; declared in plugin.yml `libraries:` so
-//     Paper downloads them automatically at startup.
+//     Paper downloads them at startup. These have deep transitive chains
+//     (netty / jackson / protobuf) that make shading + relocating risky.
 //   - Paper API → compileOnly (provided by the server).
 // =============================================================================
 dependencies {
@@ -59,17 +63,23 @@ dependencies {
     compileOnly("io.netty:netty-codec:4.2.15.Final")
     compileOnly("io.netty:netty-resolver:4.2.15.Final")
 
-    // Maven Central runtime deps: compileOnly because Paper will download them
-    // via plugin.yml `libraries:` at startup.
-    compileOnly("com.zaxxer:HikariCP:7.1.0")
-    compileOnly("at.yawk.lz4:lz4-java:1.11.0")
+    // Self-contained runtime deps: shaded into the JAR (implementation) so
+    // the plugin does not depend on downloading them at cold start. Relocated
+    // in shadowJar to avoid classpath conflicts with other plugins.
+    implementation("com.zaxxer:HikariCP:7.1.0")
+    implementation("at.yawk.lz4:lz4-java:1.11.0")
+    implementation("org.jooq:jooq:3.21.6")
+    implementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
+
+    // Complex runtime deps with deep transitive chains (netty / jackson /
+    // protobuf): kept as compileOnly and declared in plugin.yml `libraries:`
+    // so Paper downloads them at startup. Shading + relocating these reliably
+    // is high-risk (Redisson ↔ netty reflection, MySQL ↔ protobuf bloat), so
+    // they stay on the libraries path for production safety.
     compileOnly("com.mysql:mysql-connector-j:9.7.0")
     // Redis coordination: Redisson replaces Lettuce + sparrow-redis-message-broker.
     // Provides RFencedLock, RTopic (Pub/Sub), RStream (Streams) in one library.
     compileOnly("org.redisson:redisson:4.6.1")
-    // Type-safe SQL DSL for OCC + fencing token CAS queries.
-    compileOnly("org.jooq:jooq:3.21.6")
-    compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.4")
     compileOnly("org.reactivestreams:reactive-streams:1.0.4")
 
     // Sparrow libraries: shaded into the JAR (not on Maven Central).
@@ -226,26 +236,38 @@ val velocityJar = tasks.register<Jar>("velocityJar") {
 // =============================================================================
 // Main JAR: Paper/Folia backend plugin (shadowJar)
 // =============================================================================
-// Sparrow libraries are shaded into this JAR (no relocation). Maven Central
-// dependencies are declared in plugin.yml `libraries:` and auto-downloaded by
-// Paper at startup. The manifest declares `paperweight-mappings-namespace:
-// mojang` so Paper skips its PluginRemapper.
+// Self-contained runtime deps (HikariCP, LZ4, jOOQ, Caffeine) + Sparrow
+// libraries are shaded into this JAR and relocated to com.fastsync.libs.*.
+// Complex deps (Redisson, MySQL connector, reactive-streams) are declared in
+// plugin.yml `libraries:` and auto-downloaded by Paper at startup. The manifest
+// declares `paperweight-mappings-namespace: mojang` so Paper skips its
+// PluginRemapper.
 tasks.shadowJar {
     group = "build"
-    description = "Packages the Paper/Folia backend plugin JAR with Sparrow libraries shaded in."
+    description = "Packages the Paper/Folia backend plugin JAR with runtime dependencies shaded + relocated."
     archiveBaseName.set("FastSync")
     archiveVersion.set(version.toString())
     archiveClassifier.set("")
 
-    // Only shade Sparrow libraries (net.momirealms group).
-    // All other runtimeClasspath deps (transitive deps of Sparrow, etc.)
-    // are excluded — they're either on Maven Central (auto-downloaded by
-    // Paper via plugin.yml libraries) or not needed at runtime.
+    // Shade the self-contained runtime deps + Sparrow libraries. Complex deps
+    // (Redisson, MySQL connector, reactive-streams) are excluded — they stay
+    // in plugin.yml `libraries:` and are downloaded by Paper at startup.
     dependencies {
         exclude {
-            it.moduleGroup != "net.momirealms"
+            val group = it.moduleGroup
+            !group.startsWith("net.momirealms")
+                && !group.startsWith("com.zaxxer")
+                && !group.startsWith("at.yawk")
+                && !group.startsWith("org.jooq")
+                && !group.startsWith("com.github.ben-manes")
         }
     }
+
+    // Relocate shaded libraries to avoid classpath conflicts with other plugins.
+    relocate("com.zaxxer.hikari", "com.fastsync.libs.hikari")
+    relocate("net.jpountz", "com.fastsync.libs.lz4")
+    relocate("org.jooq", "com.fastsync.libs.jooq")
+    relocate("com.github.benmanes.caffeine", "com.fastsync.libs.caffeine")
 
     // Strip META-INF signatures and duplicate metadata
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",

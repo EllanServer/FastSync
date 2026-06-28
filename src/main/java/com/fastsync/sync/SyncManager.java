@@ -306,7 +306,8 @@ public class SyncManager {
                         logger, finalSaveSpool, databaseManager, plugin,
                         config.getFinalSaveSpoolReplayBatchSize(),
                         config.getFinalSaveSpoolReplayIntervalTicks(),
-                        config.getServerName());
+                        config.getServerName(),
+                        this::notifyLockReleased);
                     finalSaveReplayService.start();
                 }
             } catch (Exception e) {
@@ -3254,6 +3255,24 @@ public class SyncManager {
      *                        Ignored when {@code kind.releaseLock == true}
      *                        (QUIT/SHUTDOWN uses clearAll instead).
      */
+    /** Encoded player-data blob: raw serialized bytes, compressed bytes, and checksum. */
+    private record EncodedBlob(byte[] serialized, byte[] compressed, long checksum) {}
+
+    /**
+     * Serialize + compress + checksum a PlayerData into an {@link EncodedBlob}.
+     *
+     * <p>Extracted so the initial encode and the retry re-encode in
+     * {@link #persistCollectedData} share one implementation, matching
+     * {@link com.fastsync.spool.FinalSaveEncoder} which uses the same
+     * three-step sequence for the spool path.
+     */
+    private EncodedBlob encodeBlob(PlayerData data) throws java.io.IOException {
+        byte[] serialized = PlayerDataSerializer.serialize(data);
+        byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
+        long checksum = DatabaseManager.computeChecksum(serialized);
+        return new EncodedBlob(serialized, compressed, checksum);
+    }
+
     private SaveResult persistCollectedData(UUID uuid, PlayerData data, SaveKind kind,
             com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot) {
         long startTime = System.nanoTime();
@@ -3342,12 +3361,11 @@ public class SyncManager {
         int maxAttempts = kind.releaseLock ? 3 : 1;
 
         try {
-            // 1. Serialize
-            byte[] serialized = PlayerDataSerializer.serialize(data);
-            // 2. Compress (respects config.isCompressionEnabled())
-            byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
-            // 3. Checksum on raw serialized (not compressed)
-            long checksum = DatabaseManager.computeChecksum(serialized);
+            // Serialize + compress + checksum (shared with the spool encoder path)
+            EncodedBlob encoded = encodeBlob(data);
+            byte[] serialized = encoded.serialized();
+            byte[] compressed = encoded.compressed();
+            long checksum = encoded.checksum();
 
             long serElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
             if (serializeLatency != null) serializeLatency.record(serElapsedMs);
@@ -3443,9 +3461,10 @@ public class SyncManager {
                 data.setVersion(actualVersion);
 
                 // Re-serialize with the updated version so the checksum matches.
-                serialized = PlayerDataSerializer.serialize(data);
-                compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
-                checksum = DatabaseManager.computeChecksum(serialized);
+                EncodedBlob reEncoded = encodeBlob(data);
+                serialized = reEncoded.serialized();
+                compressed = reEncoded.compressed();
+                checksum = reEncoded.checksum();
                 // Loop continues → next attempt uses the new expectedVersion.
             }
 

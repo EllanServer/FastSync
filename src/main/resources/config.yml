@@ -5,9 +5,18 @@
 # Unique server identifier (must be unique across all servers in the network)
 server-name: "survival-1"
 
-# Cluster identifier — isolates Redis messaging namespaces.
-# All servers in the same logical cluster MUST use the same cluster-id.
-# Different clusters sharing the same MySQL MUST use different table-prefix.
+# Cluster identifier.
+# In schema v2, player_data and player_component include cluster_id in their
+# primary keys (PRIMARY KEY (cluster_id, uuid) / (cluster_id, uuid, component)),
+# so different logical clusters can share one MySQL database and table-prefix
+# safely as long as cluster-id is unique.
+#
+# Cluster-id also isolates Redis pub/sub stream namespaces.
+#
+# Production rule:
+# - same logical server network: same cluster-id
+# - independent networks: different cluster-id
+# - changing cluster-id after launch creates a new isolated data namespace
 cluster-id: "survival-main"
 
 # ------------------------------------------------------------
@@ -61,12 +70,11 @@ database:
   username: "root"
   password: "password"
 
-  # Table prefix. Each logical FastSync cluster sharing the same MySQL
-  # database MUST use a distinct table-prefix — cluster-id (below) only
-  # isolates Redis pub/sub streams, NOT database rows. The player_data /
-  # player_component primary key is (uuid) [or (uuid, component)], with no
-  # cluster_id column. Two clusters pointing at the same database + prefix
-  # would silently overwrite each other's player blobs.
+  # Table prefix. In schema v2, cluster_id is part of every primary key, so
+  # multiple logical clusters can safely share the same database AND table-
+  # prefix as long as each cluster uses a distinct cluster-id. You only need a
+  # distinct table-prefix if you want physical table separation (e.g. separate
+  # backup/restore boundaries per cluster).
   table-prefix: "fastsync_"
 
   # Connection pool (HikariCP) settings

@@ -460,6 +460,15 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 "pending=" + spoolPending +
                 ", failed=" + spoolFailed +
                 ", bytes=" + syncManager.getFinalSaveSpoolBytes());
+            long lastReplay = syncManager.getFinalSaveSpoolLastReplayAt();
+            if (lastReplay > 0) {
+                sender.sendMessage(ChatColor.YELLOW + "  lastReplay=" + ChatColor.WHITE
+                    + new java.util.Date(lastReplay));
+            }
+            String lastError = syncManager.getFinalSaveSpoolLastError();
+            if (lastError != null && !lastError.isEmpty()) {
+                sender.sendMessage(ChatColor.RED + "  lastError=" + lastError);
+            }
             if (spoolFailed > 0) {
                 sender.sendMessage(ChatColor.RED + "Spool FAILED entries exist — check "
                     + configManager.getFinalSaveSpoolDir() + "/failed/ for .reason.txt files.");

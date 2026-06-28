@@ -156,6 +156,43 @@ class ConfigManagerProductionSafetyTest {
             "blank cluster-id must be treated as empty (no multi-cluster intent)");
     }
 
+    // ==================== Production spool requirement ====================
+
+    /**
+     * Production mode MUST require the final-save spool. Without it, a
+     * saturated final-save executor silently drops the player's final state.
+     */
+    @Test
+    void rejectsProductionModeWithoutSpool() throws Exception {
+        ConfigManager config = base();
+        set(config, "dbUsername", "appuser");
+        set(config, "dbPassword", "realpass");
+        set(config, "productionEnabled", true);
+        set(config, "productionRequireRedis", false); // isolate the spool check
+        set(config, "finalSaveSpoolEnabled", false);
+        assertThrows(RuntimeException.class,
+            config::validateProductionSafety,
+            "production mode without spool must refuse startup");
+    }
+
+    /**
+     * Production mode with spool enabled, Redis enabled, and a non-empty
+     * cluster-id passes validation.
+     */
+    @Test
+    void allowsProductionModeWithSpoolAndRedis() throws Exception {
+        ConfigManager config = base();
+        set(config, "dbUsername", "appuser");
+        set(config, "dbPassword", "realpass");
+        set(config, "productionEnabled", true);
+        set(config, "productionRequireRedis", true);
+        set(config, "redisEnabled", true);
+        set(config, "clusterId", "prod-cluster");
+        set(config, "finalSaveSpoolEnabled", true);
+        assertDoesNotThrow(config::validateProductionSafety,
+            "production mode with spool + redis + cluster-id is allowed");
+    }
+
     /** Start from TestConfigBuilder defaults (which pass validation) and override per-test. */
     private static ConfigManager base() throws Exception {
         return new TestConfigBuilder().defaults().build();

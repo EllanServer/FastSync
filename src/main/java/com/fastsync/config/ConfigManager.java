@@ -312,8 +312,37 @@ public class ConfigManager {
                     "production.require-redis=true but redis.enabled=false. "
                         + "Redis is mandatory in production mode for real-time lock coordination.");
             }
+            // Final-save spool MUST be enabled in production. Without it, a
+            // queue-full event on QUIT silently drops the player's final state.
+            if (!finalSaveSpoolEnabled) {
+                throw new RuntimeException(
+                    "production.enabled=true but final-save.spool.enabled=false. "
+                        + "The spool WAL is mandatory in production so that a "
+                        + "saturated final-save executor never silently loses a "
+                        + "player's final state. Enable final-save.spool.enabled "
+                        + "or disable production mode.");
+            }
+            // Sync fallback on the event thread blocks the game tick — warn
+            // loudly. It is not hard-rejected because a very small server with
+            // a fast DB might intentionally accept the risk.
+            if (finalSaveAllowSyncFallback) {
+                logger.warning("[Config] production.enabled=true with "
+                    + "final-save.allow-sync-fallback=true. Synchronous fallback "
+                    + "on the event thread can block the game tick under DB "
+                    + "latency. Recommended: set allow-sync-fallback=false and "
+                    + "rely on the spool + replay service.");
+            }
+            // Component storage is Phase 2 and not yet battle-tested. Warn so
+            // operators know they are running an experimental feature.
+            if (componentStorageEnabled) {
+                logger.warning("[Config] production.enabled=true with "
+                    + "sync.component-storage.enabled=true. Component storage is "
+                    + "an experimental Phase 2 feature. Monitor version conflicts, "
+                    + "overlay completeness errors, and failed spool counts closely.");
+            }
             logger.info("[Config] Production mode enabled. Redis required=" + productionRequireRedis
                 + ", cluster-id required=" + productionRequireClusterId
+                + ", final-save spool=" + finalSaveSpoolEnabled
                 + ", final-save sync fallback allowed=" + finalSaveAllowSyncFallback);
         }
     }
