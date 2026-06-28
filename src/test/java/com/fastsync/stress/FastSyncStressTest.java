@@ -146,7 +146,10 @@ class FastSyncStressTest {
         ThreadLocalRandom.current().nextBytes(blob);
 
         ExecutorService pool = Executors.newFixedThreadPool(threadPoolSize);
-        CountDownLatch ready = new CountDownLatch(playerCount);
+        // Only threadPoolSize tasks can start before the gate opens; waiting
+        // for all playerCount tasks here deadlocks the bounded executor because
+        // the queued tasks cannot count down until a worker is released.
+        CountDownLatch ready = new CountDownLatch(threadPoolSize);
         CountDownLatch start = new CountDownLatch(1);
         AtomicInteger success = new AtomicInteger(0);
         AtomicInteger failures = new AtomicInteger(0);
@@ -190,7 +193,7 @@ class FastSyncStressTest {
                 }, pool));
             }
 
-            ready.await(60, TimeUnit.SECONDS);
+            assertTrue(ready.await(60, TimeUnit.SECONDS), "worker readiness timeout");
             long wallStart = System.nanoTime();
             start.countDown();
             CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).get(120, TimeUnit.SECONDS);

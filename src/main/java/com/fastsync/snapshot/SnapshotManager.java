@@ -46,6 +46,7 @@ public class SnapshotManager {
      *  snapshot creations can't OOM the JVM. */
     private ThreadPoolExecutor snapshotExecutor;
     private final AtomicLong rejectedSnapshotTasks = new AtomicLong();
+    private java.util.concurrent.Semaphore dbWorkSemaphore;
 
     /** Hard cap on the snapshot work queue. */
     private static final int SNAPSHOT_QUEUE_CAPACITY = 4096;
@@ -53,6 +54,11 @@ public class SnapshotManager {
     public SnapshotManager(Logger logger, ConfigManager config) {
         this.logger = logger;
         this.config = config;
+    }
+
+    /** Share SyncManager's non-critical DB budget with snapshot work. */
+    public void setDbWorkSemaphore(java.util.concurrent.Semaphore semaphore) {
+        this.dbWorkSemaphore = semaphore;
     }
 
     /**
@@ -119,7 +125,23 @@ public class SnapshotManager {
             failed.completeExceptionally(new IllegalStateException("SnapshotManager is closed"));
             return failed;
         }
-        return CompletableFuture.supplyAsync(supplier, snapshotExecutor);
+        return CompletableFuture.supplyAsync(() -> {
+            boolean acquired = false;
+            try {
+                if (dbWorkSemaphore != null) {
+                    dbWorkSemaphore.acquire();
+                    acquired = true;
+                }
+                return supplier.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted waiting for snapshot DB capacity", e);
+            } finally {
+                if (acquired) {
+                    dbWorkSemaphore.release();
+                }
+            }
+        }, snapshotExecutor);
     }
 
     /**

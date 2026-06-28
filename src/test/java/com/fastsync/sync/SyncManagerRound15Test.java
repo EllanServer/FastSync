@@ -5,6 +5,7 @@ import com.fastsync.config.ConfigManager;
 import com.fastsync.conflict.ConflictManager;
 import com.fastsync.data.PlayerData;
 import com.fastsync.database.DatabaseManager;
+import com.fastsync.snapshot.SnapshotManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -287,6 +288,37 @@ class SyncManagerRound15Test {
 
         // getLockState called once after failure.
         verify(databaseManager, times(1)).getLockState(eq(uuid));
+    }
+
+    @Test
+    void postCommitSideEffectFailureDoesNotTurnSaveIntoRetry() throws Exception {
+        UUID uuid = UUID.randomUUID();
+        PlayerData data = new PlayerData();
+        data.setVersion(5);
+        data.setFencingToken(10);
+        ConcurrentHashMap<UUID, String> sessions = getField("playerLockSessions");
+        sessions.put(uuid, "session-ours");
+
+        when(databaseManager.saveDataAndReleaseLockClearComponents(
+                eq(uuid), any(byte[].class), anyLong(), eq(5L), eq(10L),
+                eq("test-server"), eq("session-ours")))
+            .thenReturn(true);
+
+        SnapshotManager snapshotManager = mock(SnapshotManager.class);
+        when(snapshotManager.createSnapshot(eq(uuid), any(byte[].class), anyString()))
+            .thenThrow(new java.util.concurrent.RejectedExecutionException("snapshot queue full"));
+        injectField("snapshotManager", snapshotManager);
+        injectField("snapshotTriggerSet", java.util.Set.of("always"));
+
+        SyncManager.SaveResult result = invokePersistCollectedData(
+            uuid, data, SyncManager.SaveKind.QUIT,
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
+
+        assertTrue(result.success(), "the DB commit is authoritative even if a side effect fails");
+        assertEquals(SyncManager.SaveFailureReason.NONE, result.failureReason());
+        verify(databaseManager, times(1)).saveDataAndReleaseLockClearComponents(
+            eq(uuid), any(byte[].class), anyLong(), eq(5L), eq(10L),
+            eq("test-server"), eq("session-ours"));
     }
 
     // ==================== Component Rejection Classification Tests ====================

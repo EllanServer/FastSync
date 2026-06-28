@@ -46,7 +46,7 @@ import java.util.logging.Logger;
  *   <li>Periodic save: skip (next tick will retry)</li>
  *   <li>BULK /saveall: skip with QUEUE_FULL reason</li>
  *   <li>SHUTDOWN: synchronous fallback (must persist data)</li>
- *   <li>QUIT: synchronous fallback</li>
+ *   <li>QUIT: disk WAL by default, optional synchronous fallback</li>
  * </ul>
  */
 public class AsyncExecutor {

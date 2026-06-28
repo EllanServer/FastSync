@@ -38,7 +38,7 @@ production:
 # the main queue cannot block final saves.
 final-save:
   threads: 4
-  queue-capacity: 8192
+  queue-capacity: 1024
   shutdown-timeout-seconds: 60
   # false: queue full → spool to disk for replay (safe, no tick blocking)
   # true: queue full → synchronous fallback on event thread (blocks tick, risky)
@@ -81,7 +81,7 @@ database:
   pool-size: 10
   # Max tasks pending in the async executor queue (prevents OOM under login storms).
   # When full, AbortPolicy throws RejectedExecutionException.
-  # Quit saves fall back to synchronous execution; periodic saves are skipped (coalesced).
+  # Online saves are skipped/coalesced when full; final saves use their dedicated queue/WAL.
   queue-capacity: 256
   connection-timeout: 10000
   idle-timeout: 300000

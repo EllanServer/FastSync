@@ -73,6 +73,9 @@ class SyncManagerFinalSaveExecutorTest {
         assertNotNull(finalSaveExecutor, "finalSaveExecutor must be initialized");
         assertNotSame(asyncExecutor, finalSaveExecutor,
             "finalSaveExecutor must be a distinct pool, not the same instance as asyncExecutor");
+        assertEquals(7, syncManager.getNonCriticalDbLimit(),
+            "pool=10 with two final-save threads and one heartbeat reserve leaves seven non-critical slots");
+        assertEquals(7, syncManager.getNonCriticalDbAvailablePermits());
     }
 
     /**

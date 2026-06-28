@@ -3,6 +3,7 @@ package com.fastsync.database;
 import com.fastsync.config.ConfigManager;
 import com.fastsync.testutil.TestConfigBuilder;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -71,6 +72,14 @@ class DatabaseLockSessionTest {
         try (var conn = databaseManager.getDataSource().getConnection();
              var stmt = conn.createStatement()) {
             stmt.execute("TRUNCATE TABLE " + config.getTablePrefix() + "player_data");
+        }
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (databaseManager != null) {
+            databaseManager.close();
+            databaseManager = null;
         }
     }
 

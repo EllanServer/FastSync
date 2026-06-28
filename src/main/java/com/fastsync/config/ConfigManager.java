@@ -592,7 +592,7 @@ public class ConfigManager {
 
         // Final-save executor (single source of truth for sync-fallback gate)
         finalSaveThreads = source.getInt("final-save.threads", 4);
-        finalSaveQueueCapacity = source.getInt("final-save.queue-capacity", 8192);
+        finalSaveQueueCapacity = source.getInt("final-save.queue-capacity", 1024);
         finalSaveShutdownTimeoutSeconds = source.getInt("final-save.shutdown-timeout-seconds", 60);
         finalSaveAllowSyncFallback = source.getBoolean("final-save.allow-sync-fallback", false);
 

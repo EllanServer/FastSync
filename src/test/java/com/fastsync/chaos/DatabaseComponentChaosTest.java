@@ -4,6 +4,7 @@ import com.fastsync.config.ConfigManager;
 import com.fastsync.database.DatabaseManager;
 import com.fastsync.testutil.TestConfigBuilder;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -91,6 +92,14 @@ class DatabaseComponentChaosTest {
                 .build();
         databaseManager = new DatabaseManager(Logger.getLogger("chaos-test"), config);
         databaseManager.initialize();
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (databaseManager != null) {
+            databaseManager.close();
+            databaseManager = null;
+        }
     }
 
     @Test

@@ -463,6 +463,10 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sendMessage(sender, YELLOW + "Async threads: " + WHITE +
             "active=" + syncManager.getAsyncActiveCount() +
             ", queue=" + syncManager.getAsyncQueueSize());
+        sendMessage(sender, YELLOW + "DB non-critical budget: " + WHITE
+            + "available=" + syncManager.getNonCriticalDbAvailablePermits()
+            + "/" + syncManager.getNonCriticalDbLimit()
+            + " (final-save/heartbeat reserved)");
         String finalSaveColor = syncManager.hasFinalSaveAlert() ? RED
             : (syncManager.hasFinalSaveWarning() ? YELLOW : GREEN);
         sendMessage(sender, YELLOW + "Final-save executor: " + finalSaveColor +

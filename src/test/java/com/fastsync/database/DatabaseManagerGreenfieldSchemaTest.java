@@ -3,6 +3,7 @@ package com.fastsync.database;
 import com.fastsync.config.ConfigManager;
 import com.fastsync.testutil.TestConfigBuilder;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -82,6 +83,14 @@ class DatabaseManagerGreenfieldSchemaTest {
         databaseManager = new DatabaseManager(LOGGER, config);
         // initialize() calls createTables() + validateGreenfieldSchemaStrict()
         // — the test asserts that this completes without SQLException.
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (databaseManager != null) {
+            databaseManager.close();
+            databaseManager = null;
+        }
     }
 
     private static boolean isDockerAvailable() {

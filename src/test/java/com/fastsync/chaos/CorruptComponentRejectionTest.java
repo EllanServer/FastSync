@@ -6,6 +6,7 @@ import com.fastsync.serialization.CompressionUtil;
 import com.fastsync.serialization.CorruptDataException;
 import com.fastsync.testutil.TestConfigBuilder;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -95,6 +96,14 @@ class CorruptComponentRejectionTest {
                 .build();
         databaseManager = new DatabaseManager(Logger.getLogger("corrupt-test"), config);
         databaseManager.initialize();
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (databaseManager != null) {
+            databaseManager.close();
+            databaseManager = null;
+        }
     }
 
     /**
