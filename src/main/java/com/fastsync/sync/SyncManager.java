@@ -416,6 +416,12 @@ public class SyncManager {
     /**
      * Re-parse config-dependent caches after a config reload.
      * Called from {@code /fastsync reload}.
+     *
+     * <p>P1 (issue #59): invalidate the cached Attribute / Advancement arrays
+     * so any registry additions made by other plugins since the last reload
+     * are picked up. Without this, custom attributes registered via
+     * {@code Registry.ATTRIBUTE} after FastSync {@code onEnable} would never
+     * be synced.
      */
     public void refreshConfigCache() {
         parseSnapshotTriggerSet();
@@ -427,6 +433,10 @@ public class SyncManager {
             typedStatsStrategy = null;
         }
         locationStrategy = new com.fastsync.sync.strategy.LocationSyncStrategy(config, logger);
+        // P1 (issue #59): invalidate registry caches so newly-registered
+        // attributes / advancements are picked up on the next collect.
+        cachedAttributes = null;
+        cachedAdvancements = null;
     }
 
     /**
@@ -1517,8 +1527,27 @@ public class SyncManager {
 
         // Vitals
         if (config.isSyncHealth()) {
-            data.setHealth(player.getHealth());
-            data.setMaxHealth(player.getMaxHealth());
+            double maxHealth = player.getMaxHealth();
+            double currentHealth = player.getHealth();
+            // P1 (issue #60): when a player is dead (health <= 0) at collect
+            // time — e.g. they died and immediately quit before respawn —
+            // saving health=0 lets the death act as a free health refill on
+            // cross-server hop: the target server's applyPlayerData skips
+            // setHealth(0) (you cannot setHealth(0) on a joining player) and
+            // the player spawns at full health.
+            //
+            // The fix: save the EXPECTED post-respawn health (= maxHealth)
+            // when the player is dead. This matches what MC does on respawn
+            // (PlayerList.respawn sets health to getMaxHealth()), so the saved
+            // state reflects the player's "next alive" state rather than the
+            // transient "currently dying" state.
+            //
+            // isDead() catches both natural death and /kill. We also guard
+            // against the (theoretical) case where health <= 0 but isDead()
+            // returns false (e.g. plugin-managed fake death).
+            boolean dead = player.isDead() || currentHealth <= 0;
+            data.setHealth(dead ? maxHealth : currentHealth);
+            data.setMaxHealth(maxHealth);
         }
         if (config.isSyncFood()) {
             data.setFoodLevel(player.getFoodLevel());
@@ -1556,8 +1585,26 @@ public class SyncManager {
 
         // Flight status
         if (config.isSyncFlight()) {
-            data.setFlying(player.isFlying());
-            data.setAllowFlight(player.getAllowFlight());
+            boolean flying = player.isFlying();
+            boolean allowFlight = player.getAllowFlight();
+            // P1 (audit): data integrity check. A logically inconsistent state
+            // (flying=true with allowFlight=false) cannot be applied on the
+            // target server — Player.setFlying(true) without allowFlight=true
+            // is silently ignored by Bukkit. If we save this state and apply
+            // it elsewhere, the player would keep whatever flight state the
+            // target server has, which is non-deterministic.
+            //
+            // Force the state to be self-consistent: if the player is currently
+            // flying but allowFlight is false (a transient inconsistency from
+            // a plugin setting allowFlight=false mid-flight), save allowFlight=true
+            // so the apply path can actually re-enter flight. This matches MC
+            // PlayerList behavior where setFlying is gated on abilities.flying
+            // which is gated on abilities.allowFlight.
+            if (flying && !allowFlight) {
+                allowFlight = true;
+            }
+            data.setFlying(flying);
+            data.setAllowFlight(allowFlight);
         }
 
         // Advancements (using Bukkit API - iterates all advancement criteria)
@@ -1632,18 +1679,38 @@ public class SyncManager {
         this.blockStats = List.copyOf(blk);
         this.entityStats = List.copyOf(ent);
 
+        // P2 (audit): Material and EntityType are no longer enums on Paper
+        // 1.21+ — they are Registry entries. Material.values() / EntityType
+        // .values() are deprecated and may be removed on a future Paper
+        // release. Use Registry.MATERIAL / Registry.ENTITY_TYPE iteration
+        // with a fallback to .values() for legacy versions.
         List<org.bukkit.Material> items = new ArrayList<>();
         List<org.bukkit.Material> blocks = new ArrayList<>();
-        for (org.bukkit.Material mat : org.bukkit.Material.values()) {
-            if (mat.isItem()) items.add(mat);
-            if (mat.isBlock()) blocks.add(mat);
+        try {
+            org.bukkit.Registry.MATERIAL.forEach(mat -> {
+                if (mat.isItem()) items.add(mat);
+                if (mat.isBlock()) blocks.add(mat);
+            });
+        } catch (NoSuchFieldError | Exception ignored) {
+            // Pre-1.21 fallback
+            for (org.bukkit.Material mat : org.bukkit.Material.values()) {
+                if (mat.isItem()) items.add(mat);
+                if (mat.isBlock()) blocks.add(mat);
+            }
         }
         this.itemMaterials = List.copyOf(items);
         this.blockMaterials = List.copyOf(blocks);
 
         List<org.bukkit.entity.EntityType> alive = new ArrayList<>();
-        for (org.bukkit.entity.EntityType e : org.bukkit.entity.EntityType.values()) {
-            if (e.isAlive()) alive.add(e);
+        try {
+            org.bukkit.Registry.ENTITY_TYPE.forEach(e -> {
+                if (e.isAlive()) alive.add(e);
+            });
+        } catch (NoSuchFieldError | Exception ignored) {
+            // Pre-1.21 fallback
+            for (org.bukkit.entity.EntityType e : org.bukkit.entity.EntityType.values()) {
+                if (e.isAlive()) alive.add(e);
+            }
         }
         this.aliveEntities = List.copyOf(alive);
     }
@@ -1715,10 +1782,23 @@ public class SyncManager {
     private void collectAttributes(Player player, PlayerData data) {
         try {
             List<PlayerData.AttributeData> attributes = new ArrayList<>();
-            // Attribute.values() is immutable for the server lifetime; cache it to
-            // avoid rebuilding the array on every save.
+            // P1 (issue #59): use Registry.ATTRIBUTE (the 1.21+ API) instead of
+            // the deprecated Attribute.values(). Attribute is no longer an enum
+            // — it is a Registry<Attribute> — and Attribute.values() may be
+            // removed on a future Paper release. The cache is invalidated on
+            // /fastsync reload so custom attributes registered by other plugins
+            // after FastSync onEnable are picked up.
             if (cachedAttributes == null) {
-                cachedAttributes = Attribute.values();
+                java.util.List<Attribute> list = new java.util.ArrayList<>();
+                try {
+                    org.bukkit.Registry.ATTRIBUTE.forEach(list::add);
+                } catch (NoSuchFieldError | Exception ignored) {
+                    // Pre-1.21 fallback — Attribute was an enum then.
+                    // Safe to use values() on legacy versions.
+                    list.clear();
+                    for (Attribute a : Attribute.values()) list.add(a);
+                }
+                cachedAttributes = list.toArray(new Attribute[0]);
             }
             for (Attribute attr : cachedAttributes) {
                 try {
@@ -3801,6 +3881,12 @@ public class SyncManager {
      * (and thus slot positions) is preserved; only AIR entries are cleared. This
      * lets the serializer treat empty slots uniformly as null instead of storing
      * meaningless AIR ItemStacks.
+     *
+     * <p>NOTE (P2 audit): Bukkit {@code PlayerInventory.getContents()} returns a
+     * fresh copy on every call (verified against CraftBukkit 1.21.11 source),
+     * so in-place modification here does not corrupt the player's live inventory
+     * backing array. Do NOT change this to mutate the result of any other
+     * inventory accessor without re-verifying the copy semantics.
      */
     private org.bukkit.inventory.ItemStack[] sparseContents(org.bukkit.inventory.ItemStack[] contents) {
         if (contents == null) return null;
@@ -3812,19 +3898,41 @@ public class SyncManager {
         return contents;
     }
 
+    /**
+     * Apply the saved inventory contents to the player with full-replace semantics
+     * (matching MC {@code Inventory.load}).
+     *
+     * <p>P0 (issue #57): the old implementation used {@code Math.min(contents.length,
+     * current.length)} for the loop bound, which meant slots beyond {@code contents.length}
+     * kept their current items. This was safe under {@code clear-before-apply=true}
+     * (the inventory is cleared first), but leaked items from the target server
+     * when {@code clear-before-apply=false}. The new implementation always writes
+     * every slot of the player's inventory: slots beyond the saved contents are
+     * explicitly set to {@code null}, achieving full-replace regardless of the
+     * clear-before-apply setting.
+     *
+     * <p>Null {@code contents} is a no-op — the caller is expected to have
+     * cleared the inventory separately (e.g. via clear-before-apply) if needed.
+     */
     private void setInventoryContents(Player player, org.bukkit.inventory.ItemStack[] contents) {
+        if (contents == null) return;
         org.bukkit.inventory.ItemStack[] current = player.getInventory().getContents();
-        int max = Math.min(contents.length, current.length);
+        int max = current.length;
         for (int i = 0; i < max; i++) {
-            player.getInventory().setItem(i, contents[i]);
+            player.getInventory().setItem(i, i < contents.length ? contents[i] : null);
         }
     }
 
+    /**
+     * Apply the saved ender chest contents with full-replace semantics.
+     * See {@link #setInventoryContents} for the P0 (issue #57) rationale.
+     */
     private void setEnderChestContents(Player player, org.bukkit.inventory.ItemStack[] contents) {
+        if (contents == null) return;
         org.bukkit.inventory.ItemStack[] current = player.getEnderChest().getContents();
-        int max = Math.min(contents.length, current.length);
+        int max = current.length;
         for (int i = 0; i < max; i++) {
-            player.getEnderChest().setItem(i, contents[i]);
+            player.getEnderChest().setItem(i, i < contents.length ? contents[i] : null);
         }
     }
 
