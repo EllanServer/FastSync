@@ -539,7 +539,18 @@ public class PlayerDataSerializer {
                 }
             }
             case "ENDER_CHEST" -> {
-                if (data.getEnderChest() != null) c.put("enderChest", toItemStackList(data.getEnderChest()));
+                // P1 (issue #58): symmetric with INVENTORY's offhandPresent flag.
+                // Without this, a component payload produced when
+                // data.getEnderChest() == null (collect path skipped) would not
+                // write the enderChest field at all, and deserialize would leave
+                // the baseline Blob's stale enderChest in place. The present
+                // flag distinguishes "explicitly empty" from "no data".
+                if (data.getEnderChest() != null) {
+                    c.putBoolean("enderChestPresent", true);
+                    c.put("enderChest", toItemStackList(data.getEnderChest()));
+                } else {
+                    c.putBoolean("enderChestPresent", false);
+                }
             }
             case "VITALS" -> {
                 c.putDouble("health", data.getHealth());
@@ -700,7 +711,21 @@ public class PlayerDataSerializer {
                 }
             }
             case "ENDER_CHEST" -> {
-                if (c.get("enderChest") instanceof ListTag ec) data.setEnderChest(fromItemStackList(ec));
+                // P1 (issue #58): the current serializer ALWAYS writes
+                // enderChestPresent (true or false). An absent flag means the
+                // component was produced by a legacy code path — treat that as
+                // a corrupt/unsupported component rather than silently
+                // preserving the baseline Blob's stale enderChest.
+                if (c.get("enderChestPresent") == null) {
+                    throw new IOException("ENDER_CHEST component missing 'enderChestPresent' flag "
+                        + "— unsupported/legacy component payload");
+                }
+                if (c.getBoolean("enderChestPresent")) {
+                    if (c.get("enderChest") instanceof ListTag ec) data.setEnderChest(fromItemStackList(ec));
+                } else {
+                    // Explicit empty state — clear the ender chest.
+                    data.setEnderChest(null);
+                }
             }
             case "VITALS" -> {
                 data.setHealth(c.getDouble("health"));

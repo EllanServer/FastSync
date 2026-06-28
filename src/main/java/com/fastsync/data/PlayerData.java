@@ -244,7 +244,13 @@ public class PlayerData {
         private final String name;
         private final double amount;
         private final String operation; // ADD_NUMBER, ADD_SCALAR, MULTIPLY_SCALAR_1
-        private final byte[] serializedData; // raw NBT for complex modifiers
+        // Holds the EquipmentSlotGroup name (UTF-8 encoded) for MC 1.21+,
+        // so slot-restricted modifiers (e.g. helmet-only +max_health) round-trip
+        // correctly. Null or empty for legacy payloads — apply path treats
+        // those as ANY (matching the old 4-arg constructor behavior).
+        // (Field renamed from "raw NBT for complex modifiers" — the original
+        // intent was never implemented; repurposed for slotGroup in issue #56.)
+        private final byte[] serializedData;
 
         public ModifierData(String uuid, String name, double amount, String operation, byte[] serializedData) {
             this.uuid = uuid;
@@ -259,5 +265,14 @@ public class PlayerData {
         public double getAmount() { return amount; }
         public String getOperation() { return operation; }
         public byte[] getSerializedData() { return serializedData; }
+        /** Decode the slot group name from serializedData; null if absent/empty. */
+        public String getSlotGroupName() {
+            if (serializedData == null || serializedData.length == 0) return null;
+            try {
+                return new String(serializedData, java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                return null;
+            }
+        }
     }
 }
