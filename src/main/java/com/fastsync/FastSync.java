@@ -447,8 +447,9 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sendMessage(sender, YELLOW + "Database: " +
             (databaseManager.isHealthy() ? GREEN + "Connected" : RED + "Disconnected"));
         sendMessage(sender, YELLOW + "Redis: " +
-            (syncManager.isRedisEnabled() ? GREEN + "Connected" :
-             (configManager.isRedisEnabled() ? RED + "Failed" : GRAY + "Disabled")));
+            (configManager.isRedisEnabled()
+                ? (syncManager.isRedisHealthy() ? GREEN + "Connected" : RED + "Failed")
+                : GRAY + "Disabled"));
         sendMessage(sender, YELLOW + "Serialization: " + WHITE +
             "Paper native ItemStack byte serialization");
         sendMessage(sender, YELLOW + "Active players: " + WHITE + syncManager.getActiveCount());
@@ -463,10 +464,10 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sendMessage(sender, YELLOW + "Async threads: " + WHITE +
             "active=" + syncManager.getAsyncActiveCount() +
             ", queue=" + syncManager.getAsyncQueueSize());
-        sendMessage(sender, YELLOW + "DB non-critical budget: " + WHITE
-            + "available=" + syncManager.getNonCriticalDbAvailablePermits()
-            + "/" + syncManager.getNonCriticalDbLimit()
-            + " (final-save/heartbeat reserved)");
+        sendMessage(sender, YELLOW + "Login-load semaphore: " + WHITE
+            + "available=" + syncManager.getLoginLoadAvailablePermits()
+            + "/" + syncManager.getLoginLoadLimit()
+            + " (max-concurrent-loads)");
         String finalSaveColor = syncManager.hasFinalSaveAlert() ? RED
             : (syncManager.hasFinalSaveWarning() ? YELLOW : GREEN);
         sendMessage(sender, YELLOW + "Final-save executor: " + finalSaveColor +

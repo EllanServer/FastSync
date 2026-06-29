@@ -2,6 +2,7 @@ package com.fastsync.sync;
 
 import com.fastsync.FastSync;
 import com.fastsync.api.FastSyncEvents;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 import com.fastsync.concurrent.AsyncExecutor;
@@ -880,7 +881,7 @@ public class SyncManager {
                 // is null/blank, it logs and refuses tokenless release rather
                 // than clearing another session's lock.
                 releaseLockAsyncBestEffort(uuid, fencingToken, emptyLockSession, "empty-data join without valid token");
-                player.kick(plugin.getMessageManager().component(player, "player.kick.prepare-fail"));
+                player.kick(LegacyComponentSerializer.legacyAmpersand().deserialize(config.getLoadFailKickMessage()));
                 return;
             }
             activePlayers.put(uuid, true);
@@ -910,7 +911,7 @@ public class SyncManager {
         // acquireLock). When metadata IS present, releasing here prevents
         // the lock from leaking until timeout.
         releaseLockAsyncBestEffort(uuid, ft, lockSession, "joined without preloaded data");
-        player.kick(plugin.getMessageManager().component(player, "player.kick.prepare-fail"));
+        player.kick(LegacyComponentSerializer.legacyAmpersand().deserialize(config.getLoadFailKickMessage()));
         return;
     }
 
@@ -1134,7 +1135,7 @@ public class SyncManager {
             // lock. We do NOT bypass the helper even when ft looks valid — the
             // helper's guards are the single source of truth for safe release.
             releaseLockAsyncBestEffort(uuid, ft, lockSession, "apply failure");
-            player.kick(plugin.getMessageManager().component(player, "player.kick.apply-fail"));
+            player.kick(LegacyComponentSerializer.legacyAmpersand().deserialize(config.getLoadFailKickMessage()));
             logger.log(Level.SEVERE, "Failed to apply data for " + uuid
                 + " — player kicked, lock released, state not saved.", t);
         } finally {
@@ -3080,7 +3081,7 @@ public class SyncManager {
             // runAtEntity falls back to the main thread, which is fine.
             SchedulerUtil.runAtEntity(plugin, player, () -> {
                 if (player.isOnline()) {
-                    player.kick(this.plugin.getMessageManager().component(player, "player.kick.lock-lost"));
+                    player.kick(LegacyComponentSerializer.legacyAmpersand().deserialize(config.getLockTimeoutKickMessage()));
                 }
             }, () -> {
                 // Entity retired between lookup and dispatch — player is gone, nothing to kick.

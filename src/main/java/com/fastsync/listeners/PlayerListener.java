@@ -2,9 +2,7 @@ package com.fastsync.listeners;
 
 import com.fastsync.FastSync;
 import com.fastsync.sync.SyncManager;
-import net.kyori.adventure.text.Component;
-import org.bukkit.Bukkit;
-import org.bukkit.entity.Player;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -22,6 +20,8 @@ import java.util.UUID;
  * is loaded after the player has already entered the server.
  */
 public class PlayerListener implements Listener {
+
+    private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacyAmpersand();
 
     private final FastSync plugin;
     private final SyncManager syncManager;
@@ -43,37 +43,29 @@ public class PlayerListener implements Listener {
             return;
         }
 
-        // Skip for players with bypass permission (when configured)
-        // Note: permissions aren't available at pre-login, so we can't check here
-
         UUID uuid = event.getUniqueId();
 
         SyncManager.LoadResult result = syncManager.loadPlayerData(uuid);
 
         if (!result.isSuccess()) {
-            Component kickMessage;
-            // Try to get the player object for per-player locale support.
-            // At pre-login stage, the player may not be online yet, so we
-            // fall back to the global language if the player object is unavailable.
-            Player player = Bukkit.getPlayer(uuid);
+            var config = plugin.getConfigManager();
             if (result.getStatus() == SyncManager.LoadResult.Status.LOCKED) {
-                kickMessage = player != null
-                    ? plugin.getMessageManager().component(player, "player.kick.lock-timeout")
-                    : plugin.getMessageManager().component("player.kick.lock-timeout");
+                event.disallow(
+                    AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                    LEGACY.deserialize(config.getLockTimeoutKickMessage())
+                );
             } else if (result.getStatus() == SyncManager.LoadResult.Status.BUSY) {
-                kickMessage = player != null
-                    ? plugin.getMessageManager().component(player, "player.kick.busy")
-                    : plugin.getMessageManager().component("player.kick.busy");
+                event.disallow(
+                    AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                    LEGACY.deserialize(config.getBusyKickMessage())
+                );
             } else {
                 plugin.getLogger().warning("Failed to load data for " + uuid + ": " + result.getMessage());
-                kickMessage = player != null
-                    ? plugin.getMessageManager().component(player, "player.kick.load-fail")
-                    : plugin.getMessageManager().component("player.kick.load-fail");
+                event.disallow(
+                    AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                    LEGACY.deserialize(config.getLoadFailKickMessage())
+                );
             }
-            event.disallow(
-                AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
-                kickMessage
-            );
         }
     }
 
@@ -92,7 +84,7 @@ public class PlayerListener implements Listener {
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onQuit(PlayerQuitEvent event) {
-        Player player = event.getPlayer();
+        var player = event.getPlayer();
         try {
             syncManager.collectAndSavePlayerData(player);
         } finally {
