@@ -11,8 +11,20 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class SyncManagerComponentOverlayTest {
+
+    @Test
+    void persistedBitmapUsesStableIdsAndRejectsUnknownBits() throws IOException {
+        long bitmap = com.fastsync.sync.dirty.ComponentDirtyMask.Component.INVENTORY.storageMask()
+            | com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC.storageMask();
+        assertEquals(Set.of("INVENTORY", "PDC"), SyncManager.componentNamesForBitmap(bitmap));
+
+        IOException error = assertThrows(IOException.class,
+            () -> SyncManager.componentNamesForBitmap(1L << 40));
+        assertTrue(error.getMessage().contains("unknown storage bits"));
+    }
 
     @Test
     void verifyComponentOverlayCompletenessAcceptsFullyLoadedBitmap() {

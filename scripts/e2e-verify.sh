@@ -65,7 +65,7 @@ verify_plugin_loaded() {
     local name="$1"
     local container="$2"
     echo "Checking FastSync plugin loaded in ${name}..."
-    if docker logs "${container}" 2>&1 | grep -qiE "FastSync.*enabled|Enabling FastSync"; then
+    if docker logs "${container}" 2>&1 | grep -qiE "FastSync.*enabled|Enabling FastSync|Loading server plugin FastSync"; then
         echo "  OK: FastSync loaded in ${name}"
     else
         echo "  WARN: FastSync load message not found in ${name} logs (plugin may still work)"
@@ -93,6 +93,13 @@ if docker exec fastsync-mysql mysql -ufastsync -pfastsync -D fastsync -e "SHOW T
     echo "  OK: fastsync_player_data table exists"
 else
     echo "  ERROR: fastsync_player_data table not found"
+    exit 1
+fi
+
+if docker exec fastsync-mysql mysql -ufastsync -pfastsync -D fastsync -e "SHOW TABLES LIKE 'fastsync_player_component';" 2>/dev/null | grep -q "fastsync_player_component"; then
+    echo "  OK: fastsync_player_component table exists"
+else
+    echo "  ERROR: fastsync_player_component table not found"
     exit 1
 fi
 

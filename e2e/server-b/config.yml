@@ -32,6 +32,12 @@ redis:
   streams-enabled: true
 
 sync:
+  dirty-tracking:
+    enabled: true
+    validation-interval: 5
+  component-storage:
+    enabled: true
+    batch-size: 15
   sync-inventory: true
   sync-ender-chest: true
   sync-health: true

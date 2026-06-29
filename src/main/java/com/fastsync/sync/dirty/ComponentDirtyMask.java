@@ -2,7 +2,6 @@ package com.fastsync.sync.dirty;
 
 import java.util.UUID;
 import java.util.EnumSet;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -12,19 +11,21 @@ import java.util.concurrent.atomic.AtomicLong;
  * successful save, so that periodic saves can skip serialization + DB writes
  * for unchanged components.
  *
- * <h2>Design (round 20: AtomicLong bitset)</h2>
- * <p>Each player's dirty state is stored as a single {@link AtomicLong} bitset
- * plus a per-component epoch array (also lock-free via {@link AtomicLong}).
- * This eliminates the {@code synchronized} blocks that were on the Bukkit
- * event thread hot path (InventoryClickEvent, etc.).
+ * <h2>Design: atomic component state</h2>
+ * <p>Each component is stored in one atomic state word. Bit 0 is the dirty
+ * flag and the remaining bits are a monotonically increasing epoch. Keeping
+ * the flag and epoch in the same CAS word is important: a separate dirty
+ * bitset can lose a concurrent mark between an epoch check and bit clearing.
+ * This also reduces the event-thread hot path from two atomic writes to one.
  *
  * <ul>
- *   <li>{@code dirtyBits}: AtomicLong — bit i set means Component.ordinal()==i is dirty</li>
- *   <li>{@code epochs[i]}: AtomicLong — bumped on every markDirty for component i</li>
+ *   <li>{@code states[i] & 1}: component i is dirty</li>
+ *   <li>{@code states[i] >>> 1}: mutation epoch for component i</li>
  * </ul>
  *
- * <p>{@code markDirty} is now a single CAS-style {@code getAndUpdate} — no
- * monitor, no EnumSet allocation, no EnumSet.copyOf on snapshot.
+ * <p>{@code markDirty} is a single CAS-style {@code getAndUpdate} — no
+ * monitor and no allocation. A snapshot is one primitive {@code long[]} with
+ * no {@code EnumMap} or boxed epoch values.
  *
  * <h2>Epoch-based clear (the race this prevents)</h2>
  * <p>Naive boolean dirty tracking has a classic lost-update race. This class
@@ -35,29 +36,42 @@ import java.util.concurrent.atomic.AtomicLong;
  * snapshot's epoch.
  *
  * <h2>Thread safety</h2>
- * <p>All operations are lock-free. {@code dirtyBits} and {@code epochs[]}
- * use {@link AtomicLong}, so {@code markDirty} (event thread) never blocks
+ * <p>All operations are lock-free. Every component state uses an
+ * {@link AtomicLong}, so {@code markDirty} (event thread) never blocks
  * {@code snapshotDirty} / {@code clearDirty} (async save thread).
  */
 public class ComponentDirtyMask {
 
     /** Components that can be independently marked dirty. */
     public enum Component {
-        INVENTORY,       // inventory + armor + offhand
-        ENDER_CHEST,
-        VITALS,          // health + maxHealth
-        FOOD,            // foodLevel + saturation + exhaustion
-        EXPERIENCE,      // level + exp progress + total exp
-        POTION_EFFECTS,
-        GAME_MODE,
-        FIRE_TICKS,
-        AIR,
-        FLIGHT,
-        ADVANCEMENTS,
-        STATISTICS,
-        ATTRIBUTES,
-        PDC,
-        LOCATION
+        INVENTORY(0),       // inventory + armor + offhand
+        ENDER_CHEST(1),
+        VITALS(2),          // health + maxHealth
+        FOOD(3),            // foodLevel + saturation + exhaustion
+        EXPERIENCE(4),      // level + exp progress + total exp
+        POTION_EFFECTS(5),
+        GAME_MODE(6),
+        FIRE_TICKS(7),
+        AIR(8),
+        FLIGHT(9),
+        ADVANCEMENTS(10),
+        STATISTICS(11),
+        ATTRIBUTES(12),
+        PDC(13),
+        LOCATION(14);
+
+        private final int storageBit;
+
+        Component(int storageBit) {
+            if (storageBit < 0 || storageBit >= Long.SIZE) {
+                throw new IllegalArgumentException("storageBit must be in [0, 63]");
+            }
+            this.storageBit = storageBit;
+        }
+
+        /** Stable on-disk bit; unlike ordinal, this may never be renumbered. */
+        public int storageBit() { return storageBit; }
+        public long storageMask() { return 1L << storageBit; }
     }
 
     /** All components — used for full-collect fallback. */
@@ -71,14 +85,8 @@ public class ComponentDirtyMask {
     );
 
     private static final int NUM_COMPONENTS = Component.values().length;
-    private static final long ALL_DIRTY_BITS;
-    static {
-        long bits = 0;
-        for (int i = 0; i < NUM_COMPONENTS; i++) {
-            bits |= (1L << i);
-        }
-        ALL_DIRTY_BITS = bits;
-    }
+    private static final long DIRTY_FLAG = 1L;
+    private static final long EPOCH_INCREMENT = 2L;
 
     private final ConcurrentHashMap<UUID, PlayerDirtyState> masks = new ConcurrentHashMap<>();
     private final Set<UUID> suppressedPlayers = ConcurrentHashMap.newKeySet();
@@ -89,42 +97,37 @@ public class ComponentDirtyMask {
     }
 
     private static long bit(Component c) {
-        return 1L << c.ordinal();
+        return c.storageMask();
+    }
+
+    private static long markState(long state) {
+        return (state + EPOCH_INCREMENT) | DIRTY_FLAG;
     }
 
     /**
-     * Mark a component dirty for a player.
-     * Lock-free: epoch bump followed by AtomicLong.getAndUpdate on dirty bits.
-     * The order is intentional: publishing the bit first would let a concurrent
-     * saver snapshot+clear the old epoch before the writer bumps it, losing the
-     * dirty signal.
+     * Mark a component dirty for a player with one atomic transition that both
+     * bumps the epoch and publishes the dirty flag.
      */
     public void markDirty(UUID uuid, Component component) {
         if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
-        state.epochs[component.ordinal()].incrementAndGet();
-        state.dirtyBits.getAndUpdate(v -> v | bit(component));
+        state.states[component.ordinal()].getAndUpdate(ComponentDirtyMask::markState);
     }
 
     public void markDirty(UUID uuid, Set<Component> components) {
         if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
-        long mask = 0;
         for (Component c : components) {
-            mask |= bit(c);
-            state.epochs[c.ordinal()].incrementAndGet();
+            state.states[c.ordinal()].getAndUpdate(ComponentDirtyMask::markState);
         }
-        final long maskFinal = mask;
-        state.dirtyBits.getAndUpdate(v -> v | maskFinal);
     }
 
     public void markAllDirty(UUID uuid) {
         if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
         for (int i = 0; i < NUM_COMPONENTS; i++) {
-            state.epochs[i].incrementAndGet();
+            state.states[i].getAndUpdate(ComponentDirtyMask::markState);
         }
-        state.dirtyBits.getAndUpdate(v -> v | ALL_DIRTY_BITS);
     }
 
     /**
@@ -142,12 +145,12 @@ public class ComponentDirtyMask {
      */
     public boolean isAnyDirty(UUID uuid) {
         PlayerDirtyState state = masks.get(uuid);
-        return state != null && state.dirtyBits.get() != 0;
+        return state != null && state.isAnyDirty();
     }
 
     /**
      * Snapshot the current dirty set WITH per-component epochs.
-     * Allocates a DirtySnapshot (Map + Long values) — called once per save cycle.
+     * Allocates one primitive state array — called once per save cycle.
      */
     public DirtySnapshot snapshotDirty(UUID uuid) {
         PlayerDirtyState state = masks.get(uuid);
@@ -176,7 +179,7 @@ public class ComponentDirtyMask {
      */
     public void clearAll(UUID uuid) {
         PlayerDirtyState state = masks.get(uuid);
-        if (state != null) state.dirtyBits.set(0);
+        if (state != null) state.clearAll();
     }
 
     public boolean recordSaveAndCheckValidation(UUID uuid) {
@@ -221,71 +224,92 @@ public class ComponentDirtyMask {
     // ==================== DirtySnapshot ====================
 
     public static final class DirtySnapshot {
-        public static final DirtySnapshot EMPTY = new DirtySnapshot(Map.of());
-        private final Map<Component, Long> epochs;
-        DirtySnapshot(Map<Component, Long> epochs) { this.epochs = epochs; }
-        public Map<Component, Long> epochs() { return epochs; }
-        public Set<Component> components() { return epochs.keySet(); }
-        public int size() { return epochs.size(); }
-        public boolean isEmpty() { return epochs.isEmpty(); }
+        public static final DirtySnapshot EMPTY = new DirtySnapshot(0L, new long[0]);
+        private final long bits;
+        private final long[] states;
+
+        DirtySnapshot(long bits, long[] states) {
+            this.bits = bits;
+            this.states = states;
+        }
+
+        public Set<Component> components() {
+            if (bits == 0) return EnumSet.noneOf(Component.class);
+            EnumSet<Component> result = EnumSet.noneOf(Component.class);
+            for (Component component : Component.values()) {
+                if ((bits & bit(component)) != 0) result.add(component);
+            }
+            return result;
+        }
+
+        public boolean contains(Component component) {
+            return (bits & bit(component)) != 0;
+        }
+
+        public int size() { return Long.bitCount(bits); }
+        public boolean isEmpty() { return bits == 0; }
     }
 
     // ==================== Per-player state (lock-free) ====================
 
     private static final class PlayerDirtyState {
-        final AtomicLong dirtyBits = new AtomicLong(0);
-        final AtomicLong[] epochs = new AtomicLong[NUM_COMPONENTS];
+        final AtomicLong[] states = new AtomicLong[NUM_COMPONENTS];
         final AtomicLong saveCount = new AtomicLong(0);
 
         PlayerDirtyState() {
             for (int i = 0; i < NUM_COMPONENTS; i++) {
-                epochs[i] = new AtomicLong(0);
+                states[i] = new AtomicLong(0);
             }
         }
 
+        boolean isAnyDirty() {
+            for (AtomicLong state : states) {
+                if ((state.get() & DIRTY_FLAG) != 0) return true;
+            }
+            return false;
+        }
+
         Set<Component> getDirtySet() {
-            long bits = dirtyBits.get();
-            if (bits == 0) return EnumSet.noneOf(Component.class);
             EnumSet<Component> set = EnumSet.noneOf(Component.class);
             for (Component c : Component.values()) {
-                if ((bits & bit(c)) != 0) set.add(c);
+                if ((states[c.ordinal()].get() & DIRTY_FLAG) != 0) set.add(c);
             }
             return set;
         }
 
         DirtySnapshot snapshotWithEpochs() {
-            long bits = dirtyBits.get();
-            if (bits == 0) return DirtySnapshot.EMPTY;
-            Map<Component, Long> map = new java.util.EnumMap<>(Component.class);
+            long bits = 0L;
+            long[] snapshotStates = new long[NUM_COMPONENTS];
             for (Component c : Component.values()) {
-                if ((bits & bit(c)) != 0) {
-                    map.put(c, epochs[c.ordinal()].get());
+                long value = states[c.ordinal()].get();
+                if ((value & DIRTY_FLAG) != 0) {
+                    bits |= bit(c);
+                    snapshotStates[c.ordinal()] = value;
                 }
             }
-            return new DirtySnapshot(map);
+            return bits == 0 ? DirtySnapshot.EMPTY : new DirtySnapshot(bits, snapshotStates);
         }
 
         void clearIfEpochMatches(DirtySnapshot snapshot) {
             if (snapshot == null || snapshot.isEmpty()) return;
-            long clearMask = 0;
-            for (Map.Entry<Component, Long> entry : snapshot.epochs().entrySet()) {
-                Component c = entry.getKey();
-                long snapshotEpoch = entry.getValue();
-                if (epochs[c.ordinal()].get() == snapshotEpoch) {
-                    clearMask |= bit(c);
-                }
-            }
-            if (clearMask != 0) {
-                final long clearMaskFinal = clearMask;
-                dirtyBits.getAndUpdate(v -> v & ~clearMaskFinal);
+            for (Component component : Component.values()) {
+                if (!snapshot.contains(component)) continue;
+                int index = component.ordinal();
+                long expected = snapshot.states[index];
+                states[index].compareAndSet(expected, expected & ~DIRTY_FLAG);
             }
         }
 
         void clearBits(Set<Component> components) {
-            long clearMask = 0;
-            for (Component c : components) clearMask |= bit(c);
-            final long clearMaskFinal = clearMask;
-            dirtyBits.getAndUpdate(v -> v & ~clearMaskFinal);
+            for (Component component : components) {
+                states[component.ordinal()].getAndUpdate(value -> value & ~DIRTY_FLAG);
+            }
+        }
+
+        void clearAll() {
+            for (AtomicLong state : states) {
+                state.getAndUpdate(value -> value & ~DIRTY_FLAG);
+            }
         }
     }
 }

@@ -78,6 +78,32 @@ class SyncManagerInventoryStorageTest {
         verify(enderChest, never()).getContents();
     }
 
+    @Test
+    void collectionDetachesLivePaperItemMirrorsBeforeAsyncEncoding() throws Exception {
+        ConfigManager config = mock(ConfigManager.class);
+        when(config.isSyncInventory()).thenReturn(true);
+        SyncManager manager = manager(config);
+        Player player = mock(Player.class);
+        PlayerInventory inventory = mock(PlayerInventory.class);
+        ItemStack liveMirror = mock(ItemStack.class);
+        ItemStack detached = mock(ItemStack.class);
+        org.bukkit.Material material = mock(org.bukkit.Material.class);
+        when(player.getUniqueId()).thenReturn(UUID.randomUUID());
+        when(player.getInventory()).thenReturn(inventory);
+        when(inventory.getStorageContents()).thenReturn(new ItemStack[]{liveMirror});
+        when(inventory.getArmorContents()).thenReturn(new ItemStack[4]);
+        when(liveMirror.getType()).thenReturn(material);
+        when(material.isAir()).thenReturn(false);
+        when(liveMirror.clone()).thenReturn(detached);
+
+        Method method = SyncManager.class.getDeclaredMethod("collectPlayerData", Player.class);
+        method.setAccessible(true);
+        PlayerData data = (PlayerData) method.invoke(manager, player);
+
+        assertSame(detached, data.getInventory()[0]);
+        verify(liveMirror).clone();
+    }
+
     private static SyncManager manager(ConfigManager config) {
         FastSync plugin = mock(FastSync.class);
         when(plugin.getLogger()).thenReturn(Logger.getLogger("inventory-storage-test"));

@@ -336,12 +336,13 @@ public class ConfigManager {
                     + "latency. Recommended: set allow-sync-fallback=false and "
                     + "rely on the spool + replay service.");
             }
-            // Component storage is Phase 2 and not yet battle-tested. Warn so
-            // operators know they are running an experimental feature.
+            // Component storage remains opt-in because its DB layout differs
+            // from the full-Blob path. Keep an operational reminder in
+            // production mode even though the hot path is fully fenced.
             if (componentStorageEnabled) {
                 logger.warning("[Config] production.enabled=true with "
-                    + "sync.component-storage.enabled=true. Component storage is "
-                    + "an experimental Phase 2 feature. Monitor version conflicts, "
+                    + "sync.component-storage.enabled=true. Component storage is opt-in; "
+                    + "monitor version conflicts, "
                     + "overlay completeness errors, and failed spool counts closely.");
             }
             logger.info("[Config] Production mode enabled. Redis required=" + productionRequireRedis
