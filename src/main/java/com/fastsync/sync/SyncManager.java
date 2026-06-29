@@ -26,7 +26,6 @@ import org.bukkit.Location;
 import org.bukkit.NamespacedKey;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
-import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.entity.Player;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.Statistic;
@@ -105,6 +104,11 @@ public class SyncManager {
     // data are tracked explicitly in pendingEmptyData.
     private final ConcurrentHashMap<UUID, PlayerData> pendingData = new ConcurrentHashMap<>();
     private final java.util.Set<UUID> pendingEmptyData = ConcurrentHashMap.newKeySet();
+    // Login loads explicitly cancelled through FastSyncPreLoadEvent. These
+    // players bypass FastSync entirely: no DB lock, apply, heartbeat, or save.
+    private final java.util.Set<UUID> pendingBypass = ConcurrentHashMap.newKeySet();
+    private final java.util.Set<UUID> bypassedPlayers = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<UUID, DeathState> deathStates = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Long> pendingLoadTimes = new ConcurrentHashMap<>();
 
     // Final-save saturation telemetry. A queue-full event on finalSaveExecutor
@@ -250,12 +254,6 @@ public class SyncManager {
     // re-iterating Bukkit.advancementIterator()/Attribute.values() on every save.
     private volatile org.bukkit.advancement.Advancement[] cachedAdvancements;
     private volatile Attribute[] cachedAttributes;
-    // Performance: cache EquipmentSlotGroup → UTF-8 bytes. These are singleton
-    // constants (ANY, HAND, ARMOR, etc.) so toString()/getBytes() results never
-    // change. Caching avoids ~N allocations per modifier per save.
-    private static final java.util.Map<org.bukkit.inventory.EquipmentSlotGroup, byte[]>
-        SLOT_GROUP_BYTES_CACHE = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
-
     // Paper 1.21.11 registry entry, resolved lazily to avoid class-load order
     // issues during plugin construction.
     private static volatile Attribute MAX_HEALTH_ATTR;
@@ -553,6 +551,14 @@ public class SyncManager {
      * @return LoadResult indicating success, locked, or error
      */
     public LoadResult loadPlayerData(UUID uuid) {
+        FastSyncEvents.FastSyncPreLoadEvent preLoadEvent =
+            new FastSyncEvents.FastSyncPreLoadEvent(uuid, true);
+        Bukkit.getPluginManager().callEvent(preLoadEvent);
+        if (preLoadEvent.isCancelled()) {
+            pendingBypass.add(uuid);
+            pendingLoadTimes.put(uuid, System.currentTimeMillis());
+            return LoadResult.bypassed();
+        }
         if (protectionMode) {
             return LoadResult.protection("FastSync protection mode is active");
         }
@@ -827,7 +833,16 @@ public class SyncManager {
         UUID uuid = player.getUniqueId();
         PlayerData data = pendingData.remove(uuid);
         boolean hadEmptyData = pendingEmptyData.remove(uuid);
+        boolean bypassed = pendingBypass.remove(uuid);
         pendingLoadTimes.remove(uuid);
+
+        if (bypassed) {
+            bypassedPlayers.add(uuid);
+            if (config.isDebug()) {
+                logger.info("FastSync load/apply bypassed by FastSyncPreLoadEvent for " + uuid);
+            }
+            return;
+        }
 
         if (data == null) {
         if (hadEmptyData) {
@@ -889,6 +904,9 @@ public class SyncManager {
     }
 
         long startTime = config.isLogTiming() ? System.nanoTime() : 0;
+        if (dirtyMask != null) {
+            dirtyMask.beginApply(uuid);
+        }
         try {
         // Greenfield payloads fully replace enabled components below. Avoid
         // clearing complete payloads first: CraftInventoryPlayer's
@@ -945,9 +963,9 @@ public class SyncManager {
             setEnderChestContents(player.getEnderChest(), data.getEnderChest());
         }
 
-        // Restore attributes before health. Minecraft validates setHealth
-        // against the effective max-health value (base + modifiers), so all
-        // saved modifiers must be present before health is clamped/applied.
+        // Restore attribute base values before health. Minecraft validates
+        // setHealth against the resulting effective value (base plus the
+        // target player's live equipment/effect modifiers).
         if (config.isSyncAttributes() && data.getAttributes() != null) {
             applyAttributes(player, data);
         }
@@ -1021,15 +1039,20 @@ public class SyncManager {
 
         // Air
         if (config.isSyncAir()) {
+            // CraftLivingEntity stores maximumAir separately from the current
+            // air supply. Restore the maximum first so custom capacities survive
+            // the hop and the current value is interpreted against the right cap.
+            player.setMaximumAir(data.getMaximumAir());
             player.setRemainingAir(data.getRemainingAir());
         }
 
         // Flight status
         if (config.isSyncFlight()) {
             player.setAllowFlight(data.isAllowFlight());
-            if (data.isFlying() && data.isAllowFlight()) {
-                player.setFlying(true);
-            }
+            // Full-replace semantics: false must clear a target server's stale
+            // flying state just as true enables it. collectPlayerData guarantees
+            // flying => allowFlight, so this call satisfies Paper's precondition.
+            player.setFlying(data.isFlying());
         }
 
         // Advancements
@@ -1062,6 +1085,13 @@ public class SyncManager {
         playerVersions.put(uuid, data.getVersion());
         // Store the fencing token for stale-write defence on save
         playerFencingTokens.put(uuid, data.getFencingToken());
+
+        // Internal setters above can fire Bukkit events and must not dirty the
+        // just-loaded snapshot. End suppression before exposing the apply event:
+        // listener-owned mutations are real gameplay state and must be saved.
+        if (dirtyMask != null) {
+            dirtyMask.endApply(uuid);
+        }
 
         // Fire API event
         FastSyncEvents.FastSyncApplyEvent applyEvent = new FastSyncEvents.FastSyncApplyEvent(player, data);
@@ -1098,6 +1128,10 @@ public class SyncManager {
                 net.kyori.adventure.text.format.NamedTextColor.RED));
             logger.log(Level.SEVERE, "Failed to apply data for " + uuid
                 + " — player kicked, lock released, state not saved.", t);
+        } finally {
+            if (dirtyMask != null) {
+                dirtyMask.endApply(uuid);
+            }
         }
     }
 
@@ -1148,6 +1182,11 @@ public class SyncManager {
     public void collectAndSavePlayerData(Player player) {
         UUID uuid = player.getUniqueId();
 
+        if (bypassedPlayers.remove(uuid) || pendingBypass.remove(uuid)) {
+            pendingLoadTimes.remove(uuid);
+            return;
+        }
+
         // Check failed-join players — they never became active with a valid lock.
         // The kick from applyPlayerData triggers PlayerQuitEvent, so we must
         // intercept here to prevent a save with invalid version/fencingToken.
@@ -1157,6 +1196,7 @@ public class SyncManager {
             activePlayers.remove(uuid);
             pendingData.remove(uuid);
             pendingEmptyData.remove(uuid);
+            pendingBypass.remove(uuid);
             pendingLoadTimes.remove(uuid);
             Long ft = playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
             if (dirtyMask != null) {
@@ -1211,28 +1251,67 @@ public class SyncManager {
             return;
         }
 
+        // Heartbeat already proved that this session no longer owns the lock.
+        // Do not collect or expose stale state through FastSyncSaveEvent.
+        if (quarantinedPlayers.remove(uuid)) {
+            logger.warning("[Quit] Player " + uuid + " was quarantined (lock lost during session)."
+                + " Skipping final save; player should already have been kicked.");
+            activePlayers.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
+            String lockSession = playerLockSessions.remove(uuid);
+            playerVersions.remove(uuid);
+            playersWithBaseline.remove(uuid);
+            if (dirtyMask != null) dirtyMask.remove(uuid);
+            releaseLockAsyncBestEffort(uuid, ft, lockSession, "quarantined player quit");
+            return;
+        }
+
         // IMPORTANT: collect data BEFORE removing from maps.
         // collectPlayerData() reads version and fencing token from playerVersions
         // and playerFencingTokens. If we remove first, the save will use default
         // version=0 and fencingToken=0, causing saveData() to fail or overwrite.
-        PlayerData data = collectPlayerData(player);
+        PlayerData data;
+        try {
+            data = collectPlayerData(player);
+        } catch (Throwable collectFailure) {
+            // The player is leaving, so there is no later event from which to
+            // retry collection. Do not release the DB lock: doing so would let
+            // another server load stale data as if this final state had saved.
+            // Also stop heartbeats and remove local metadata so the abandoned
+            // lock expires naturally instead of being refreshed forever.
+            activePlayers.remove(uuid);
+            quarantinedPlayers.remove(uuid);
+            playerVersions.remove(uuid);
+            playerFencingTokens.remove(uuid);
+            playerLockSessions.remove(uuid);
+            playersWithBaseline.remove(uuid);
+            if (dirtyMask != null) {
+                dirtyMask.remove(uuid);
+            }
+            logger.log(Level.SEVERE, "[FinalSave] Failed to collect final state for " + uuid
+                + "; NOT releasing lock. It will expire after " + config.getLockTimeout()
+                + "s so stale DB data cannot be loaded immediately.", collectFailure);
+            return;
+        }
+
+        if (!fireSaveEvent(player, data, SaveKind.QUIT)) {
+            activePlayers.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
+            String lockSession = playerLockSessions.remove(uuid);
+            playerVersions.remove(uuid);
+            playersWithBaseline.remove(uuid);
+            if (dirtyMask != null) dirtyMask.remove(uuid);
+            // Cancellation delegates persistence to the listener. FastSync still
+            // owns the coordination lock, so release it after the callback.
+            releaseLockAsyncBestEffort(uuid, ft, lockSession, "cancelled FastSyncSaveEvent");
+            return;
+        }
 
         // Now safe to remove from active tracking.
         // playerVersions and playerFencingTokens are NOT removed here — they
         // are cleaned up after the async save completes (in the finally block),
         // because the per-UUID lock check in periodic save still references them.
         activePlayers.remove(uuid);
-
-        // Check quarantine — if heartbeat detected lock loss, skip normal save.
-        if (quarantinedPlayers.remove(uuid)) {
-            logger.warning("[Quit] Player " + uuid + " was quarantined (lock lost during session)."
-                + " Skipping final save — data may be stale. Player should have been kicked.");
-            Long ft = playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
-            playerVersions.remove(uuid);
-            playersWithBaseline.remove(uuid);
-            releaseLockAsyncBestEffort(uuid, ft, lockSession, "quarantined player quit");
-            return;
-        }
 
         // Save asynchronously using dedicated thread pool.
         // Per-UUID lock ensures this save runs AFTER any in-flight periodic save,
@@ -1362,6 +1441,11 @@ public class SyncManager {
     public void collectAndSavePlayerDataSync(Player player) {
         UUID uuid = player.getUniqueId();
 
+        if (bypassedPlayers.remove(uuid) || pendingBypass.remove(uuid)) {
+            pendingLoadTimes.remove(uuid);
+            return;
+        }
+
         // Check if player has pending data (was kicked during pre-login, never joined)
         if (pendingData.containsKey(uuid) || pendingEmptyData.contains(uuid)) {
         pendingData.remove(uuid);
@@ -1403,20 +1487,30 @@ public class SyncManager {
             return;
         }
 
-        activePlayers.remove(uuid);
-
-        // Check quarantine — skip save if lock was lost
         if (quarantinedPlayers.remove(uuid)) {
             logger.warning("[Quit-Sync] Player " + uuid + " was quarantined. Skipping save.");
-            Long ft = playerFencingTokens.remove(uuid); String lockSession = playerLockSessions.remove(uuid);
-            if (dirtyMask != null) {
-                dirtyMask.remove(uuid);
-            }
+            activePlayers.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
+            String lockSession = playerLockSessions.remove(uuid);
+            if (dirtyMask != null) dirtyMask.remove(uuid);
             playerVersions.remove(uuid);
             playersWithBaseline.remove(uuid);
-            releaseLockAsyncBestEffort(uuid, ft, lockSession, "quarantined player quit (sync)");
+            releaseOwnedLockAndNotify(uuid, ft, lockSession, "quarantined player quit (sync)");
             return;
         }
+
+        if (!fireSaveEvent(player, data, SaveKind.QUIT)) {
+            activePlayers.remove(uuid);
+            Long ft = playerFencingTokens.remove(uuid);
+            String lockSession = playerLockSessions.remove(uuid);
+            playerVersions.remove(uuid);
+            playersWithBaseline.remove(uuid);
+            if (dirtyMask != null) dirtyMask.remove(uuid);
+            releaseOwnedLockAndNotify(uuid, ft, lockSession, "cancelled FastSyncSaveEvent (sync)");
+            return;
+        }
+
+        activePlayers.remove(uuid);
 
         // Save synchronously with per-UUID lock to avoid races with any in-flight save
         java.util.concurrent.locks.ReentrantLock saveLock =
@@ -1560,14 +1654,16 @@ public class SyncManager {
      */
     private PlayerData collectPlayerData(Player player) {
         PlayerData data = new PlayerData();
+        UUID playerId = player.getUniqueId();
+        DeathState deathState = deathStates.get(playerId);
 
         // Inherit version from the loaded data for optimistic concurrency
-        Long version = playerVersions.get(player.getUniqueId());
+        Long version = playerVersions.get(playerId);
         if (version != null) {
             data.setVersion(version);
         }
         // Inherit fencing token from lock acquisition (Kleppmann stale-write defence)
-        Long fencingToken = playerFencingTokens.get(player.getUniqueId());
+        Long fencingToken = playerFencingTokens.get(playerId);
         if (fencingToken != null) {
             data.setFencingToken(fencingToken);
         }
@@ -1619,28 +1715,47 @@ public class SyncManager {
             // isDead() catches both natural death and /kill. We also guard
             // against the (theoretical) case where health <= 0 but isDead()
             // returns false (e.g. plugin-managed fake death).
-            boolean dead = player.isDead() || currentHealth <= 0;
+            boolean dead = deathState != null || player.isDead() || currentHealth <= 0;
             data.setHealth(healthForSave(dead, currentHealth, effectiveMaxHealth));
             data.setMaxHealth(baseMaxHealth);
         }
         if (config.isSyncFood()) {
-            data.setFoodLevel(player.getFoodLevel());
-            data.setSaturation(player.getSaturation());
-            data.setExhaustion(player.getExhaustion());
+            if (deathState != null || player.isDead()) {
+                // ServerPlayer.reset(): foodData = new FoodData().
+                data.setFoodLevel(20);
+                data.setSaturation(5.0F);
+                data.setExhaustion(0.0F);
+            } else {
+                data.setFoodLevel(player.getFoodLevel());
+                data.setSaturation(player.getSaturation());
+                data.setExhaustion(player.getExhaustion());
+            }
         }
 
         // Experience
         if (config.isSyncExperience()) {
-            data.setExpLevel(player.getLevel());
-            data.setExpProgress(player.getExp());
-            data.setTotalExperience(player.getTotalExperience());
+            if (deathState != null) {
+                data.setExpLevel(deathState.level());
+                data.setExpProgress(deathState.progress());
+                data.setTotalExperience(deathState.totalExperience());
+            } else if (player.isDead()) {
+                data.setExpLevel(0);
+                data.setExpProgress(0);
+                data.setTotalExperience(0);
+            } else {
+                data.setExpLevel(player.getLevel());
+                data.setExpProgress(player.getExp());
+                data.setTotalExperience(player.getTotalExperience());
+            }
         }
 
         // Potion effects
         if (config.isSyncPotionEffects()) {
             List<PlayerData.PotionEffectData> effects = new ArrayList<>();
-            for (PotionEffect effect : player.getActivePotionEffects()) {
-                effects.add(PlayerDataSerializer.toPotionEffectData(effect));
+            if (deathState == null && !player.isDead()) {
+                for (PotionEffect effect : player.getActivePotionEffects()) {
+                    effects.add(PlayerDataSerializer.toPotionEffectData(effect));
+                }
             }
             data.setPotionEffects(effects);
         }
@@ -1650,11 +1765,13 @@ public class SyncManager {
             data.setGameMode(player.getGameMode());
         }
         if (config.isSyncFireTicks()) {
-            data.setFireTicks(player.getFireTicks());
+            data.setFireTicks(deathState != null || player.isDead() ? 0 : player.getFireTicks());
         }
         if (config.isSyncAir()) {
-            data.setRemainingAir(player.getRemainingAir());
-            data.setMaximumAir(player.getMaximumAir());
+            int maximumAir = player.getMaximumAir();
+            data.setMaximumAir(maximumAir);
+            data.setRemainingAir(
+                deathState != null || player.isDead() ? maximumAir : player.getRemainingAir());
         }
 
         // Flight status
@@ -1714,6 +1831,7 @@ public class SyncManager {
         if (config.isSyncLocation()) {
             Location loc = player.getLocation();
             data.setWorldName(loc.getWorld() != null ? loc.getWorld().getName() : "world");
+            data.setWorldUuid(loc.getWorld() != null ? loc.getWorld().getUID().toString() : "");
             data.setX(loc.getX());
             data.setY(loc.getY());
             data.setZ(loc.getZ());
@@ -1724,6 +1842,71 @@ public class SyncManager {
         data.setTimestamp(System.currentTimeMillis());
 
         return data;
+    }
+
+    /** Snapshot Paper's event-derived state that ServerPlayer.reset applies. */
+    public void recordDeathState(org.bukkit.event.entity.PlayerDeathEvent event) {
+        Player player = event.getEntity();
+        if (event.getKeepLevel()) {
+            deathStates.put(player.getUniqueId(), new DeathState(
+                player.getLevel(), player.getExp(), player.getTotalExperience()));
+            return;
+        }
+        deathStates.put(player.getUniqueId(), experienceAfterDeath(
+            event.getNewLevel(), event.getNewTotalExp(), event.getNewExp()));
+    }
+
+    public void clearDeathState(UUID uuid) {
+        deathStates.remove(uuid);
+    }
+
+    static DeathState experienceAfterDeath(int initialLevel, int initialTotal, int points) {
+        int level = Math.max(0, initialLevel);
+        long total = Math.max(0, initialTotal);
+        int remaining = Math.max(0, points);
+        total = Math.min(Integer.MAX_VALUE, total + remaining);
+        while (remaining > 0) {
+            long needed = experienceToNextLevel(level);
+            if (remaining < needed) {
+                return new DeathState(level, (float) (remaining / (double) needed), (int) total);
+            }
+            remaining -= (int) needed;
+            if (level == Integer.MAX_VALUE) {
+                return new DeathState(level, 0.0F, (int) total);
+            }
+            level++;
+        }
+        return new DeathState(level, 0.0F, (int) total);
+    }
+
+    private static long experienceToNextLevel(int level) {
+        if (level >= 30) return 112L + (level - 30L) * 9L;
+        if (level >= 15) return 37L + (level - 15L) * 5L;
+        return 7L + level * 2L;
+    }
+
+    record DeathState(int level, float progress, int totalExperience) {}
+
+    private boolean fireSaveEvent(Player player, PlayerData data, SaveKind kind) {
+        FastSyncEvents.FastSyncSaveEvent event =
+            new FastSyncEvents.FastSyncSaveEvent(player, data, kind.causeName);
+        Bukkit.getPluginManager().callEvent(event);
+        return !event.isCancelled();
+    }
+
+    private com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot snapshotDirtyForSave(
+            UUID uuid, SaveKind kind) {
+        if (dirtyMask == null || kind.releaseLock) {
+            return com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
+        }
+        // Save listeners may mutate any PlayerData field. When component
+        // storage is enabled, restricting the write to the pre-existing dirty
+        // subset would silently discard those mutations. Only pay the full-
+        // snapshot cost when a third-party listener is actually registered.
+        if (FastSyncEvents.FastSyncSaveEvent.getHandlerList().getRegisteredListeners().length > 0) {
+            dirtyMask.markAllDirty(uuid);
+        }
+        return dirtyMask.snapshotDirty(uuid);
     }
 
     // ==================== Data Collection Helpers ====================
@@ -1753,39 +1936,21 @@ public class SyncManager {
         this.blockStats = List.copyOf(blk);
         this.entityStats = List.copyOf(ent);
 
-        // P2 (audit): Material and EntityType are no longer enums on Paper
-        // 1.21+ — they are Registry entries. Material.values() / EntityType
-        // .values() are deprecated and may be removed on a future Paper
-        // release. Use Registry.MATERIAL / Registry.ENTITY_TYPE iteration
-        // with a fallback to .values() for legacy versions.
+        // Paper 1.21.11 registry entries. This project intentionally targets
+        // that API directly; there is no old-version values() fallback.
         List<org.bukkit.Material> items = new ArrayList<>();
         List<org.bukkit.Material> blocks = new ArrayList<>();
-        try {
-            org.bukkit.Registry.MATERIAL.forEach(mat -> {
-                if (mat.isItem()) items.add(mat);
-                if (mat.isBlock()) blocks.add(mat);
-            });
-        } catch (NoSuchFieldError | Exception ignored) {
-            // Pre-1.21 fallback
-            for (org.bukkit.Material mat : org.bukkit.Material.values()) {
-                if (mat.isItem()) items.add(mat);
-                if (mat.isBlock()) blocks.add(mat);
-            }
-        }
+        org.bukkit.Registry.MATERIAL.forEach(mat -> {
+            if (mat.isItem()) items.add(mat);
+            if (mat.isBlock()) blocks.add(mat);
+        });
         this.itemMaterials = List.copyOf(items);
         this.blockMaterials = List.copyOf(blocks);
 
         List<org.bukkit.entity.EntityType> alive = new ArrayList<>();
-        try {
-            org.bukkit.Registry.ENTITY_TYPE.forEach(e -> {
-                if (e.isAlive()) alive.add(e);
-            });
-        } catch (NoSuchFieldError | Exception ignored) {
-            // Pre-1.21 fallback
-            for (org.bukkit.entity.EntityType e : org.bukkit.entity.EntityType.values()) {
-                if (e.isAlive()) alive.add(e);
-            }
-        }
+        org.bukkit.Registry.ENTITY_TYPE.forEach(e -> {
+            if (e.isAlive()) alive.add(e);
+        });
         this.aliveEntities = List.copyOf(alive);
     }
 
@@ -1808,13 +1973,15 @@ public class SyncManager {
                 String key = adv.getKey().toString();
                 Map<String, Long> criteria = new HashMap<>();
                 for (String awarded : progress.getAwardedCriteria()) {
-                    // Note: Bukkit doesn't expose per-criteria award timestamps; using current
-                    // time as approximation. For precise timing, NMS-level hooks would be needed.
-                    criteria.put(awarded, System.currentTimeMillis());
+                    // Bukkit exposes no criterion timestamp and cannot restore
+                    // one. Store a stable sentinel so an unchanged advancement
+                    // snapshot remains byte-for-byte stable across saves.
+                    criteria.put(awarded, 0L);
                 }
-                if (!criteria.isEmpty()) {
-                    advancements.put(key, criteria);
-                }
+                // Keep an explicit empty map. Minecraft's advancement file is
+                // authoritative: an empty criterion set must revoke progress
+                // that may exist on the target server.
+                advancements.put(key, criteria);
             }
             data.setAdvancements(advancements);
         } catch (Exception e) {
@@ -1879,39 +2046,15 @@ public class SyncManager {
 
                     String key = attr.getKey().toString();
                     double baseValue = instance.getBaseValue();
-                    java.util.Collection<AttributeModifier> mods = instance.getModifiers();
-                    // Avoid allocating an ArrayList when there are no modifiers.
-                    List<PlayerData.ModifierData> modifiers =
-                        mods.isEmpty() ? java.util.Collections.emptyList() : new ArrayList<>(mods.size());
-
-                    for (AttributeModifier mod : mods) {
-                        // P0 (issue #56): capture the EquipmentSlotGroup so slot-
-                        // restricted modifiers (e.g. helmet-only +max_health) round-
-                        // trip correctly. Without this, the apply path falls back to
-                        // the 4-arg constructor which defaults the slot to ANY,
-                        // making slot-restricted buffs apply globally.
-                        byte[] slotBytes = null;
-                        try {
-                            org.bukkit.inventory.EquipmentSlotGroup group = mod.getSlotGroup();
-                            if (group != null) {
-                                // Performance: cache the UTF-8 bytes — slot groups
-                                // are singleton constants so the result never changes.
-                                slotBytes = SLOT_GROUP_BYTES_CACHE.computeIfAbsent(group,
-                                    g -> g.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                            }
-                        } catch (NoSuchMethodError | Exception ignored) {
-                            // Pre-1.21 API does not have getSlotGroup — leave null.
-                        }
-                        modifiers.add(new PlayerData.ModifierData(
-                            mod.getKey().toString(),
-                            mod.getName(),
-                            mod.getAmount(),
-                            mod.getOperation().name(),
-                            slotBytes
-                        ));
-                    }
-
-                    attributes.add(new PlayerData.AttributeData(key, baseValue, modifiers));
+                    // Paper's public AttributeInstance#getModifiers() returns
+                    // permanent AND transient modifiers together, while
+                    // addModifier() always creates a permanent modifier. Copying
+                    // that collection would turn equipment, potion and movement
+                    // modifiers into persistent player data. The API exposes no
+                    // way to identify the permanent subset, so FastSync safely
+                    // synchronizes base values only and leaves runtime modifiers
+                    // owned by their source systems.
+                    attributes.add(new PlayerData.AttributeData(key, baseValue));
                 } catch (Exception ignored) {
                     // Some attributes may not exist on all versions
                 }
@@ -2047,130 +2190,14 @@ public class SyncManager {
                     AttributeInstance instance = player.getAttribute(attr);
                     if (instance == null) continue;
 
-                    // P0/P1 (issues #64, #65, #70): correct ordering + key-based
-                    // remove. Previously:
-                    //   1. setBaseValue (triggers recalc with OLD modifiers attached)
-                    //   2. removeModifier(existing) — object-equality based, fragile
-                    //      for custom AttributeModifier subclasses that don't
-                    //      implement equals correctly; modifiers accumulate
-                    //   3. addModifier (triggers recalc per add)
-                    //
-                    // New order matches MC PlayerList.placeNewPlayer:
-                    //   1. removeModifier by key (1.21+ API, falls back to object-based)
-                    //   2. setBaseValue (clean state, single recalc)
-                    //   3. addModifier (each triggers recalc, unavoidable without NMS)
-                    for (AttributeModifier existing : new ArrayList<>(instance.getModifiers())) {
-                        try {
-                            // 1.21+ key-based remove (preferred — O(1) hash lookup)
-                            instance.removeModifier(existing.getKey());
-                        } catch (NoSuchMethodError | Exception ignored) {
-                            // Legacy object-based remove (1.20 and earlier)
-                            try {
-                                instance.removeModifier(existing);
-                            } catch (Exception ignored2) {}
-                        }
-                    }
-
-                    // Now set the base value with no modifiers attached — clean state.
+                    // Do not touch modifiers here. Paper exposes all modifiers as
+                    // one collection but cannot tell callers which are transient;
+                    // removing/re-adding them would corrupt equipment/potion state.
                     instance.setBaseValue(attrData.getBaseValue());
-
-                    if (attrData.getModifiers() != null) {
-                        for (PlayerData.ModifierData modData : attrData.getModifiers()) {
-                            try {
-                                // P0 (issue #55): tolerate both pre-1.21 enum names
-                                // (ADD_NUMBER/ADD_SCALAR/MULTIPLY_SCALAR_1) and 1.21+
-                                // renamed aliases (ADD_VALUE/ADD_MULTIPLIED_BASE/
-                                // ADD_MULTIPLIED_TOTAL). Paper 1.21.11 still supports
-                                // the old names as deprecated aliases, but future
-                                // versions may remove them — without this adapter,
-                                // valueOf would throw and the modifier would be
-                                // silently dropped (caught below).
-                                AttributeModifier.Operation op = parseAttributeOperation(modData.getOperation());
-
-                                // P0 (issue #56): preserve the EquipmentSlotGroup so
-                                // slot-restricted modifiers round-trip. The 5-arg
-                                // constructor with slotGroup is used when the saved
-                                // data carries it; otherwise fall back to the 4-arg
-                                // constructor (defaults to ANY).
-                                AttributeModifier modifier = buildAttributeModifier(
-                                    modData.getUuid(),
-                                    modData.getAmount(),
-                                    op,
-                                    modData.getSlotGroupName()
-                                );
-                                if (modifier != null) {
-                                    instance.addModifier(modifier);
-                                }
-                            } catch (Exception ignored) {}
-                        }
-                    }
                 } catch (Exception ignored) {}
             }
         } catch (Exception e) {
             if (config.isDebug()) logger.warning("Failed to apply attributes: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Parse an AttributeModifier.Operation name, accepting both the pre-1.21
-     * enum names and the 1.21+ renamed aliases. Paper 1.21.11 still supports
-     * the old names as deprecated aliases, but future versions may remove them.
-     */
-    private static AttributeModifier.Operation parseAttributeOperation(String name) {
-        if (name == null || name.isEmpty()) {
-            return AttributeModifier.Operation.ADD_NUMBER;
-        }
-        try {
-            return AttributeModifier.Operation.valueOf(name);
-        } catch (IllegalArgumentException e) {
-            return switch (name) {
-                case "ADD_VALUE"            -> AttributeModifier.Operation.ADD_NUMBER;
-                case "ADD_MULTIPLIED_BASE"  -> AttributeModifier.Operation.ADD_SCALAR;
-                case "ADD_MULTIPLIED_TOTAL" -> AttributeModifier.Operation.MULTIPLY_SCALAR_1;
-                default -> AttributeModifier.Operation.ADD_NUMBER;
-            };
-        }
-    }
-
-    /**
-     * Build an AttributeModifier, preserving the EquipmentSlotGroup if the
-     * saved data carries one. Falls back to the 4-arg constructor (ANY slot)
-     * for legacy payloads.
-     *
-     * <p>Current Paper identifies modifiers with a {@link NamespacedKey}. Legacy
-     * payloads stored UUID strings; those are mapped into the stable
-     * {@code fastsync:legacy_<uuid>} namespace so they remain loadable.
-     */
-    private static AttributeModifier buildAttributeModifier(
-            String identifier, double amount,
-            AttributeModifier.Operation op, String slotGroupName) {
-        if (identifier == null || identifier.isBlank()) return null;
-        NamespacedKey key = NamespacedKey.fromString(identifier);
-        if (key == null) {
-            try {
-                java.util.UUID uuid = java.util.UUID.fromString(identifier);
-                key = new NamespacedKey("fastsync", "legacy_" + uuid.toString().replace('-', '_'));
-            } catch (IllegalArgumentException e) {
-                return null;
-            }
-        }
-        if (slotGroupName != null && !slotGroupName.isEmpty()) {
-            try {
-                // EquipmentSlotGroup is an abstract class (not an enum) on
-                // Paper 1.21+. Lookup by name via the static getByName method.
-                org.bukkit.inventory.EquipmentSlotGroup group =
-                    org.bukkit.inventory.EquipmentSlotGroup.getByName(slotGroupName);
-                if (group != null) {
-                    return new AttributeModifier(key, amount, op, group);
-                }
-            } catch (Exception ignored) {
-                // Invalid slot group: fall through to the ANY-slot constructor.
-            }
-        }
-        try {
-            return new AttributeModifier(key, amount, op);
-        } catch (Exception e) {
-            return null;
         }
     }
 
@@ -2320,11 +2347,28 @@ public class SyncManager {
                     // protection. SHUTDOWN is releaseLock=true and uses
                     // clearAll() (player is leaving anyway).
                     final com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot =
-                        (dirtyMask != null && !kind.releaseLock)
-                            ? dirtyMask.snapshotDirty(uuid)
-                            : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
+                        snapshotDirtyForSave(uuid, kind);
 
                     PlayerData data = collectPlayerData(player);
+                    if (!fireSaveEvent(player, data, kind)) {
+                        if (isBulk && bulkGate != null) {
+                            bulkGate.set(false);
+                        }
+                        if (kind.releaseLock) {
+                            finalSaveInProgress.remove(uuid);
+                            activePlayers.remove(uuid);
+                            Long ft = playerFencingTokens.remove(uuid);
+                            String session = playerLockSessions.remove(uuid);
+                            playerVersions.remove(uuid);
+                            playersWithBaseline.remove(uuid);
+                            if (dirtyMask != null) dirtyMask.remove(uuid);
+                            releaseLockAsyncBestEffort(uuid, ft, session,
+                                "cancelled " + kind + " FastSyncSaveEvent");
+                        }
+                        future.complete(SaveResult.error(
+                            "save cancelled by FastSyncSaveEvent", SaveFailureReason.CANCELLED));
+                        return;
+                    }
                     pendingSaveCount.incrementAndGet();
                     java.util.concurrent.locks.ReentrantLock saveLock =
                         playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
@@ -2426,7 +2470,7 @@ public class SyncManager {
                     finalSaveInProgress.remove(uuid);
                 }
                 future.complete(SaveResult.error("entity retired", SaveFailureReason.ENTITY_RETIRED));
-            });
+            }, kind == SaveKind.SHUTDOWN);
             futures.add(Map.entry(uuid, future));
         }
         return futures;
@@ -2626,13 +2670,18 @@ public class SyncManager {
             // and use clearAll() unconditionally (player is leaving, no more
             // changes will arrive).
             final com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot =
-                (dirtyMask != null && !finalKind.releaseLock)
-                    ? dirtyMask.snapshotDirty(uuid)
-                    : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
+                snapshotDirtyForSave(uuid, finalKind);
 
             PlayerData data;
             try {
                 data = collectPlayerData(player);
+                if (!fireSaveEvent(player, data, finalKind)) {
+                    if (!finalKind.releaseLock) {
+                        java.util.concurrent.atomic.AtomicBoolean inFlight = onlineSaveInFlight.get(uuid);
+                        if (inFlight != null) inFlight.set(false);
+                    }
+                    return;
+                }
             } catch (Throwable t) {
                 // collect failed — release gate so future saves can proceed.
                 // (The gate must NOT stay set on collect failure, otherwise
@@ -2655,7 +2704,6 @@ public class SyncManager {
                     boolean locked = false;
                     try {
                         if (!saveLock.tryLock()) {
-                            pendingSaveCount.decrementAndGet();
                             if (config.isDebug()) {
                                 logger.fine("Skipping " + finalKind + " save for " + uuid + " — save already in progress");
                             }
@@ -2984,6 +3032,7 @@ public class SyncManager {
         if (loadTime != null && (now - loadTime) > staleThreshold) {
             pendingData.remove(uuid);
             pendingEmptyData.remove(uuid);
+            boolean wasBypassed = pendingBypass.remove(uuid);
             pendingLoadTimes.remove(uuid);
             // Clean up ALL tracking maps to prevent memory leaks during login storms
             playerVersions.remove(uuid);
@@ -2991,6 +3040,10 @@ public class SyncManager {
             failedJoinPlayers.remove(uuid);
             quarantinedPlayers.remove(uuid);
             playersWithBaseline.remove(uuid);
+            if (wasBypassed) {
+                logger.warning("Cleaned up stale bypassed pre-login state for " + uuid);
+                return;
+            }
             asyncExecutor.execute(() -> {
                 try {
                     // Release via the unified sync helper (already on the async
@@ -3014,7 +3067,8 @@ public class SyncManager {
             UUID uuid = e.getKey();
             if (activePlayers.containsKey(uuid)
                 || pendingData.containsKey(uuid)
-                || pendingEmptyData.contains(uuid)) {
+                || pendingEmptyData.contains(uuid)
+                || pendingBypass.contains(uuid)) {
                 return false;
             }
             java.util.concurrent.locks.ReentrantLock lock = e.getValue();
@@ -3032,7 +3086,8 @@ public class SyncManager {
             UUID uuid = e.getKey();
             return !activePlayers.containsKey(uuid)
                 && !pendingData.containsKey(uuid)
-                && !pendingEmptyData.contains(uuid);
+                && !pendingEmptyData.contains(uuid)
+                && !pendingBypass.contains(uuid);
         });
     }
 
@@ -3199,6 +3254,8 @@ public class SyncManager {
         QUEUE_FULL,
         /** Entity retired (player offline). NOT retryable. */
         ENTITY_RETIRED,
+        /** A FastSyncSaveEvent listener explicitly cancelled this save. */
+        CANCELLED,
         /** Component save rejected by fencing validation. Fall back to full Blob save. */
         COMPONENT_SAVE_REJECTED,
         /** Catch-all for unexpected errors. */
@@ -4143,11 +4200,11 @@ public class SyncManager {
     }
 
     public boolean isPlayerActive(UUID uuid) {
-        return activePlayers.containsKey(uuid);
+        return activePlayers.containsKey(uuid) || bypassedPlayers.contains(uuid);
     }
 
     public int getPendingCount() {
-        return pendingData.size() + pendingEmptyData.size();
+        return pendingData.size() + pendingEmptyData.size() + pendingBypass.size();
     }
 
     /** Available permits on the login-load semaphore (max-concurrent-loads). */
@@ -4226,10 +4283,6 @@ public class SyncManager {
         return redissonManager != null && redissonManager.isHealthy();
     }
 
-    public boolean isRedisEnabled() {
-        return redissonManager != null && redissonManager.isHealthy();
-    }
-
     public int getAsyncActiveCount() {
         return asyncExecutor != null ? asyncExecutor.getActiveCount() : -1;
     }
@@ -4280,12 +4333,6 @@ public class SyncManager {
 
     public long getFinalSaveLastSyncFallbackAt() {
         return finalSaveLastSyncFallbackAt.get();
-    }
-
-    /** @deprecated use {@link #getFinalSaveLastSyncFallbackAt()} */
-    @Deprecated
-    public long getFinalSaveLastFallbackAt() {
-        return getFinalSaveLastSyncFallbackAt();
     }
 
     public boolean hasFinalSaveAlert() {
@@ -4604,7 +4651,7 @@ public class SyncManager {
     // ==================== LoadResult ====================
 
     public static class LoadResult {
-        public enum Status { SUCCESS, LOCKED, ERROR, PROTECTION, BUSY }
+        public enum Status { SUCCESS, BYPASSED, LOCKED, ERROR, PROTECTION, BUSY }
 
         private final Status status;
         private final String message;
@@ -4615,6 +4662,7 @@ public class SyncManager {
         }
 
         public static LoadResult success() { return new LoadResult(Status.SUCCESS, null); }
+        public static LoadResult bypassed() { return new LoadResult(Status.BYPASSED, null); }
         public static LoadResult locked() { return new LoadResult(Status.LOCKED, null); }
         public static LoadResult error(String message) { return new LoadResult(Status.ERROR, message); }
     public static LoadResult protection(String message) { return new LoadResult(Status.PROTECTION, message); }
@@ -4622,6 +4670,6 @@ public class SyncManager {
 
         public Status getStatus() { return status; }
         public String getMessage() { return message; }
-        public boolean isSuccess() { return status == Status.SUCCESS; }
+        public boolean isSuccess() { return status == Status.SUCCESS || status == Status.BYPASSED; }
     }
 }

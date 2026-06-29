@@ -150,21 +150,6 @@ public class PlayerDataSerializer {
                 CompoundTag attrTag = NBT.createCompound();
                 attrTag.putString("key", attr.getAttributeKey());
                 attrTag.putDouble("base", attr.getBaseValue());
-                if (attr.getModifiers() != null && !attr.getModifiers().isEmpty()) {
-                    ListTag modList = NBT.createList();
-                    for (PlayerData.ModifierData mod : attr.getModifiers()) {
-                        CompoundTag modTag = NBT.createCompound();
-                        modTag.putString("uuid", mod.getUuid());
-                        modTag.putString("name", mod.getName());
-                        modTag.putDouble("amount", mod.getAmount());
-                        modTag.putString("operation", mod.getOperation());
-                        if (mod.getSerializedData() != null && mod.getSerializedData().length > 0) {
-                            modTag.putByteArray("data", mod.getSerializedData());
-                        }
-                        modList.add(modTag);
-                    }
-                    attrTag.put("modifiers", modList);
-                }
                 attrList.add(attrTag);
             }
             root.put("attributes", attrList);
@@ -182,20 +167,12 @@ public class PlayerDataSerializer {
         // Location (optional)
         if (data.getWorldName() != null) {
             root.putString("world", data.getWorldName());
+            root.putString("worldUuid", data.getWorldUuid() != null ? data.getWorldUuid() : "");
             root.putDouble("x", data.getX());
             root.putDouble("y", data.getY());
             root.putDouble("z", data.getZ());
             root.putFloat("yaw", data.getYaw());
             root.putFloat("pitch", data.getPitch());
-        }
-
-        // Locked maps (list of byte arrays)
-        if (data.getLockedMaps() != null && !data.getLockedMaps().isEmpty()) {
-            ListTag mapList = NBT.createList();
-            for (byte[] mapData : data.getLockedMaps()) {
-                mapList.add(NBT.createByteArray(mapData));
-            }
-            root.put("lockedMaps", mapList);
         }
 
         // Metadata
@@ -344,25 +321,7 @@ public class PlayerDataSerializer {
                 if (attrList.get(i) instanceof CompoundTag attrTag) {
                     String key = attrTag.getString("key");
                     double base = attrTag.getDouble("base");
-                    List<PlayerData.ModifierData> mods = new ArrayList<>();
-                    if (attrTag.get("modifiers") instanceof ListTag modList) {
-                        for (int j = 0; j < modList.size(); j++) {
-                            if (modList.get(j) instanceof CompoundTag modTag) {
-                                byte[] modData = null;
-                                if (modTag.get("data") != null) {
-                                    modData = modTag.getByteArray("data");
-                                }
-                                mods.add(new PlayerData.ModifierData(
-                                    modTag.getString("uuid"),
-                                    modTag.getString("name"),
-                                    modTag.getDouble("amount"),
-                                    modTag.getString("operation"),
-                                    modData
-                                ));
-                            }
-                        }
-                    }
-                    attributes.add(new PlayerData.AttributeData(key, base, mods));
+                    attributes.add(new PlayerData.AttributeData(key, base));
                 }
             }
             playerData.setAttributes(attributes);
@@ -381,23 +340,12 @@ public class PlayerDataSerializer {
         String worldName = root.getString("world");
         if (worldName != null && !worldName.isEmpty()) {
             playerData.setWorldName(worldName);
+            playerData.setWorldUuid(root.getString("worldUuid"));
             playerData.setX(root.getDouble("x"));
             playerData.setY(root.getDouble("y"));
             playerData.setZ(root.getDouble("z"));
             playerData.setYaw(root.getFloat("yaw"));
             playerData.setPitch(root.getFloat("pitch"));
-        }
-
-        // Locked maps
-        if (root.get("lockedMaps") instanceof ListTag mapList) {
-            List<byte[]> maps = new ArrayList<>();
-            for (int i = 0; i < mapList.size(); i++) {
-                Tag mapTag = mapList.get(i);
-                if (mapTag instanceof net.momirealms.sparrow.nbt.ByteArrayTag baTag) {
-                    maps.add(baTag.getAsByteArray());
-                }
-            }
-            playerData.setLockedMaps(maps);
         }
 
         // Metadata
@@ -628,21 +576,6 @@ public class PlayerDataSerializer {
                         CompoundTag a = NBT.createCompound();
                         a.putString("key", attr.getAttributeKey());
                         a.putDouble("base", attr.getBaseValue());
-                        if (attr.getModifiers() != null && !attr.getModifiers().isEmpty()) {
-                            ListTag mods = NBT.createList();
-                            for (PlayerData.ModifierData mod : attr.getModifiers()) {
-                                CompoundTag m = NBT.createCompound();
-                                m.putString("uuid", mod.getUuid());
-                                m.putString("name", mod.getName());
-                                m.putDouble("amount", mod.getAmount());
-                                m.putString("operation", mod.getOperation());
-                                if (mod.getSerializedData() != null && mod.getSerializedData().length > 0) {
-                                    m.putByteArray("data", mod.getSerializedData());
-                                }
-                                mods.add(m);
-                            }
-                            a.put("modifiers", mods);
-                        }
                         attrList.add(a);
                     }
                     c.put("attributes", attrList);
@@ -660,6 +593,7 @@ public class PlayerDataSerializer {
             case "LOCATION" -> {
                 if (data.getWorldName() != null) {
                     c.putString("world", data.getWorldName());
+                    c.putString("worldUuid", data.getWorldUuid() != null ? data.getWorldUuid() : "");
                     c.putDouble("x", data.getX());
                     c.putDouble("y", data.getY());
                     c.putDouble("z", data.getZ());
@@ -817,18 +751,8 @@ public class PlayerDataSerializer {
                 if (c.get("attributes") instanceof ListTag list) {
                     for (int i = 0; i < list.size(); i++) {
                         if (list.get(i) instanceof CompoundTag a) {
-                            java.util.List<PlayerData.ModifierData> mods = new java.util.ArrayList<>();
-                            if (a.get("modifiers") instanceof ListTag ml) {
-                                for (int j = 0; j < ml.size(); j++) {
-                                    if (ml.get(j) instanceof CompoundTag m) {
-                                        byte[] md = m.get("data") != null ? m.getByteArray("data") : null;
-                                        mods.add(new PlayerData.ModifierData(
-                                            m.getString("uuid"), m.getString("name"),
-                                            m.getDouble("amount"), m.getString("operation"), md));
-                                    }
-                                }
-                            }
-                            attrs.add(new PlayerData.AttributeData(a.getString("key"), a.getDouble("base"), mods));
+                            attrs.add(new PlayerData.AttributeData(
+                                a.getString("key"), a.getDouble("base")));
                         }
                     }
                 }
@@ -844,6 +768,7 @@ public class PlayerDataSerializer {
             case "LOCATION" -> {
                 if (c.getString("world") != null && !c.getString("world").isEmpty()) {
                     data.setWorldName(c.getString("world"));
+                    data.setWorldUuid(c.getString("worldUuid"));
                     data.setX(c.getDouble("x"));
                     data.setY(c.getDouble("y"));
                     data.setZ(c.getDouble("z"));

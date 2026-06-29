@@ -13,6 +13,10 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.server.PluginDisableEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 
@@ -38,7 +42,7 @@ import java.util.logging.Level;
  *   5. Dedicated thread pool for async operations (NOT ForkJoinPool.commonPool)
  *   6. Version byte prefix for future serialization format migration
  */
-public class FastSync extends JavaPlugin implements CommandExecutor, TabCompleter {
+public class FastSync extends JavaPlugin implements CommandExecutor, TabCompleter, Listener {
 
     private static final LegacyComponentSerializer MESSAGE_SERIALIZER =
         LegacyComponentSerializer.legacySection();
@@ -69,6 +73,8 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     private Object cleanupTask;
     private Object periodicSaveTask;
     private Object heartbeatTask;
+    private final java.util.concurrent.atomic.AtomicBoolean shutdownSavePrepared =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
      * Start (or restart) the heartbeat task. Called from onEnable and from
@@ -150,6 +156,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         getLogger().info("Registered fastsync:handoff plugin messaging channel (optional: for Velocity proxy integration)");
 
         // Register listeners
+        getServer().getPluginManager().registerEvents(this, this);
         getServer().getPluginManager().registerEvents(
             new PlayerListener(this, syncManager), this);
         getServer().getPluginManager().registerEvents(
@@ -223,27 +230,10 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
     @Override
     public void onDisable() {
-        // P0 (round 15): close the online-save gate FIRST. Any periodic/death/
-        // world_save task that fires during the shutdown-save window must be
-        // rejected by savePlayerAsync, otherwise it could collect a stale
-        // snapshot and commit it after the SHUTDOWN save — rolling back the
-        // player's final state.
-        if (syncManager != null) {
-            syncManager.beginShutdown();
-        }
-
-        // Cancel scheduled tasks (Paper/Folia compatible)
-        SchedulerUtil.cancel(cleanupTask);
-        SchedulerUtil.cancel(periodicSaveTask);
-        SchedulerUtil.cancel(heartbeatTask);
-
-        // Save all online players synchronously (release locks — server is stopping)
-        if (syncManager != null) {
-            getLogger().info("Saving all online players (shutdown)...");
-            SyncManager.SaveAllResult result = syncManager.saveAllOnlinePlayers(SyncManager.SaveKind.SHUTDOWN);
-            getLogger().info("Shutdown save: " + result.success() + "/" + result.total()
-                + " succeeded" + (result.failed() > 0 ? ", " + result.failed() + " failed" : "") + ".");
-        }
+        // The normal path already ran from PluginDisableEvent while scheduler
+        // submissions were still legal. This remains as an idempotent fallback
+        // for direct lifecycle invocations and standard Paper.
+        prepareShutdownSave();
 
         // Shut down sync manager (waits for pending saves, closes Redis + thread pool)
         if (syncManager != null) {
@@ -257,6 +247,37 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
         getLogger().info("FastSync disabled!");
         instance = null;
+    }
+
+    /**
+     * Paper fires PluginDisableEvent immediately before JavaPlugin is marked
+     * disabled and onDisable() is invoked. This is the final point where Folia
+     * entity-scheduler tasks may legally be submitted for final-state capture.
+     */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPluginDisable(PluginDisableEvent event) {
+        if (event.getPlugin() == this) {
+            prepareShutdownSave();
+        }
+    }
+
+    private void prepareShutdownSave() {
+        if (!shutdownSavePrepared.compareAndSet(false, true) || syncManager == null) {
+            return;
+        }
+
+        // Close the online-save gate first so no periodic/death/world-save
+        // snapshot can commit after this final save.
+        syncManager.beginShutdown();
+        SchedulerUtil.cancel(cleanupTask);
+        SchedulerUtil.cancel(periodicSaveTask);
+        SchedulerUtil.cancel(heartbeatTask);
+
+        getLogger().info("Saving all online players (shutdown)...");
+        SyncManager.SaveAllResult result =
+            syncManager.saveAllOnlinePlayers(SyncManager.SaveKind.SHUTDOWN);
+        getLogger().info("Shutdown save: " + result.success() + "/" + result.total()
+            + " succeeded" + (result.failed() > 0 ? ", " + result.failed() + " failed" : "") + ".");
     }
 
     // ==================== Command Handler ====================
@@ -283,13 +304,6 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 }
                 // Restart heartbeat task — interval may have changed
                 restartHeartbeatTask();
-                // Reset protection mode on reload — only if DB is healthy
-                boolean resetOk = syncManager.resetProtectionMode();
-                if (resetOk) {
-                    sendMessage(sender, GREEN + "[FastSync] Protection mode reset.");
-                } else {
-                    sendMessage(sender, RED + "[FastSync] Protection mode still active: database is unhealthy.");
-                }
                 sendMessage(sender, GREEN + "[FastSync] Configuration reloaded.");
                 sendMessage(sender, GRAY + "Server: " + configManager.getServerName());
                 sendMessage(sender, GRAY + "Compression: " +
@@ -298,8 +312,25 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     (configManager.isRedisEnabled() ? "Enabled" : "Disabled"));
                 sendMessage(sender, GRAY + "Heartbeat: every " +
                     configManager.getHeartbeatIntervalSeconds() + "s (timer restarted)");
+                // The health probe borrows a JDBC connection and may wait up to
+                // connection-timeout. Never perform it on a Paper/Folia tick.
+                SchedulerUtil.runAsync(this, () -> {
+                    boolean resetOk = syncManager.resetProtectionMode();
+                    runForSender(sender, () -> sendMessage(sender,
+                        resetOk
+                            ? GREEN + "[FastSync] Protection mode reset."
+                            : RED + "[FastSync] Protection mode still active: database is unhealthy."));
+                });
             }
-            case "status" -> sendStatus(sender);
+            case "status" -> {
+                sendMessage(sender, YELLOW + "[FastSync] Checking backend health...");
+                SchedulerUtil.runAsync(this, () -> {
+                    boolean databaseHealthy = databaseManager.isHealthy();
+                    boolean redisHealthy = syncManager.isRedisHealthy();
+                    runForSender(sender,
+                        () -> sendStatus(sender, databaseHealthy, redisHealthy));
+                });
+            }
             case "debug" -> {
                 boolean newDebug = !configManager.isDebug();
                 getConfig().set("debug", newDebug);
@@ -441,13 +472,22 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sendMessage(sender, YELLOW + "/" + label + " log <player> [n] " + GRAY + "- View operation log for a player");
     }
 
-    private void sendStatus(CommandSender sender) {
+    private void runForSender(CommandSender sender, Runnable task) {
+        if (sender instanceof Player player) {
+            SchedulerUtil.runAtEntity(this, player, task,
+                () -> getLogger().fine("Command sender retired before response could be sent"));
+        } else {
+            SchedulerUtil.runGlobal(this, task);
+        }
+    }
+
+    private void sendStatus(CommandSender sender, boolean databaseHealthy, boolean redisHealthy) {
         sendMessage(sender, GOLD + "===== FastSync Status =====");
         sendMessage(sender, YELLOW + "Server: " + WHITE + configManager.getServerName());
         sendMessage(sender, YELLOW + "Database: " +
-            (databaseManager.isHealthy() ? GREEN + "Connected" : RED + "Disconnected"));
+            (databaseHealthy ? GREEN + "Connected" : RED + "Disconnected"));
         sendMessage(sender, YELLOW + "Redis: " +
-            (syncManager.isRedisEnabled() ? GREEN + "Connected" :
+            (redisHealthy ? GREEN + "Connected" :
              (configManager.isRedisEnabled() ? RED + "Failed" : GRAY + "Disabled")));
         sendMessage(sender, YELLOW + "Serialization: " + WHITE +
             "Paper native ItemStack byte serialization");

@@ -26,6 +26,18 @@ import static org.junit.jupiter.api.Assertions.*;
 class RegisteredKeysPdcStrategyCountTest {
 
     @Test
+    void restoreRejectsEmptyPayloadWithoutTouchingPdc() {
+        RegisteredKeysPdcStrategy strategy = new RegisteredKeysPdcStrategy(
+            List.of(new RegisteredKeysPdcStrategy.KeyBinding(
+                NamespacedKey.fromString("test:foo"), PersistentDataType.STRING)),
+            Logger.getLogger("test"), true);
+        Player player = Mockito.mock(Player.class);
+
+        assertThrows(IllegalArgumentException.class, () -> strategy.restore(player, new byte[0]));
+        Mockito.verifyNoInteractions(player);
+    }
+
+    @Test
     void restoreRejectsOversizedEntryCountWithoutTouchingPdc() throws Exception {
         RegisteredKeysPdcStrategy strategy = new RegisteredKeysPdcStrategy(
             List.of(new RegisteredKeysPdcStrategy.KeyBinding(
@@ -42,7 +54,7 @@ class RegisteredKeysPdcStrategyCountTest {
         Player player = Mockito.mock(Player.class);
         // The count is validated BEFORE any clear, so getPersistentDataContainer()
         // must never be called — i.e. local PDC state is left untouched.
-        strategy.restore(player, payload);
+        assertThrows(IllegalArgumentException.class, () -> strategy.restore(player, payload));
 
         Mockito.verifyNoInteractions(player);
     }
@@ -61,7 +73,7 @@ class RegisteredKeysPdcStrategyCountTest {
         byte[] payload = baos.toByteArray();
 
         Player player = Mockito.mock(Player.class);
-        strategy.restore(player, payload);
+        assertThrows(IllegalArgumentException.class, () -> strategy.restore(player, payload));
 
         Mockito.verifyNoInteractions(player);
     }
@@ -89,5 +101,27 @@ class RegisteredKeysPdcStrategyCountTest {
 
         // The registered key should have been removed (clear-before-restore).
         Mockito.verify(pdc).remove(NamespacedKey.fromString("test:foo"));
+    }
+
+    @Test
+    void truncatedPayloadDoesNotPartiallyClearContainer() throws Exception {
+        RegisteredKeysPdcStrategy strategy = new RegisteredKeysPdcStrategy(
+            List.of(new RegisteredKeysPdcStrategy.KeyBinding(
+                NamespacedKey.fromString("test:foo"), PersistentDataType.STRING)),
+            Logger.getLogger("test"), true);
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(baos)) {
+            out.writeInt(1);
+            out.writeUTF("test:foo");
+            out.writeByte(8); // STRING, but its value is deliberately missing
+        }
+
+        Player player = Mockito.mock(Player.class);
+        assertThrows(IllegalArgumentException.class,
+            () -> strategy.restore(player, baos.toByteArray()));
+
+        // Full decoding fails before the player's live PDC is obtained/cleared.
+        Mockito.verifyNoInteractions(player);
     }
 }

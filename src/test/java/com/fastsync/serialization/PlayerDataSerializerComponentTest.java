@@ -212,6 +212,7 @@ class PlayerDataSerializerComponentTest {
     void testLocationRoundTrip() throws IOException {
         PlayerData original = new PlayerData();
         original.setWorldName("world");
+        original.setWorldUuid("123e4567-e89b-12d3-a456-426614174000");
         original.setX(123.45);
         original.setY(64.0);
         original.setZ(-78.9);
@@ -225,6 +226,7 @@ class PlayerDataSerializerComponentTest {
         PlayerDataSerializer.deserializeComponent("LOCATION", bytes, target);
 
         assertEquals("world", target.getWorldName());
+        assertEquals("123e4567-e89b-12d3-a456-426614174000", target.getWorldUuid());
         assertEquals(123.45, target.getX(), 0.001);
         assertEquals(64.0, target.getY(), 0.001);
         assertEquals(-78.9, target.getZ(), 0.001);

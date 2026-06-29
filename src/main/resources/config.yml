@@ -162,7 +162,6 @@ sync:
   sync-game-mode: true
   sync-fire-ticks: true
   sync-air: true
-  sync-extra-data: true
 
   # Lock timeout in seconds (how long before a lock from another server is considered stale)
   #
@@ -259,6 +258,9 @@ sync:
   # Sync additional data types (HuskSync feature parity)
   sync-advancements: true
   sync-statistics: true
+  # Synchronizes attribute base values. Paper does not expose whether a modifier
+  # is permanent or transient, so modifiers remain owned by equipment, potion
+  # effects, movement state, and the plugins that created them.
   sync-attributes: true
   sync-flight: true
   sync-pdc: true

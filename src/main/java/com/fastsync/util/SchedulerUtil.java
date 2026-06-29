@@ -60,6 +60,10 @@ public final class SchedulerUtil {
     }
 
     public static void runAsyncDelayed(Plugin plugin, Runnable task, long delayTicks) {
+        if (delayTicks <= 0) {
+            runAsync(plugin, task);
+            return;
+        }
         if (FOLIA) {
             long delayMs = ticksToMillis(delayTicks);
             Bukkit.getAsyncScheduler().runDelayed(plugin, t -> task.run(), delayMs, TimeUnit.MILLISECONDS);
@@ -100,6 +104,12 @@ public final class SchedulerUtil {
      * thread. The global region is the correct context for these reads.
      */
     public static void runGlobalDelayed(Plugin plugin, Runnable task, long delayTicks) {
+        // Folia rejects delay <= 0. The first periodic-save batch deliberately
+        // uses zero delay, so route it through run() (next global tick) instead.
+        if (delayTicks <= 0) {
+            runGlobal(plugin, task);
+            return;
+        }
         if (FOLIA) {
             Bukkit.getGlobalRegionScheduler().runDelayed(plugin, t -> task.run(), delayTicks);
         } else {
@@ -132,9 +142,23 @@ public final class SchedulerUtil {
      * @param retired fallback if the entity is no longer valid (can be null)
      */
     public static void runAtEntity(Plugin plugin, Entity entity, Runnable task, Runnable retired) {
+        runAtEntity(plugin, entity, task, retired, false);
+    }
+
+    /**
+     * Run on an entity, optionally collecting inline on standard Paper when
+     * already on its single owning thread. Inline execution is reserved for
+     * shutdown, where waiting for a task scheduled onto the blocked main thread
+     * would deadlock; normal callers retain next-tick scheduling semantics.
+     */
+    public static void runAtEntity(
+            Plugin plugin, Entity entity, Runnable task, Runnable retired,
+            boolean inlineOnPaperPrimaryThread) {
         if (FOLIA) {
             entity.getScheduler().run(plugin, t -> task.run(),
                 retired != null ? retired : () -> {});
+        } else if (inlineOnPaperPrimaryThread && Bukkit.isPrimaryThread()) {
+            task.run();
         } else {
             Bukkit.getScheduler().runTask(plugin, task);
         }
@@ -144,6 +168,10 @@ public final class SchedulerUtil {
      * Execute a task on the entity's region after a delay (ticks).
      */
     public static void runAtEntityDelayed(Plugin plugin, Entity entity, Runnable task, long delayTicks) {
+        if (delayTicks <= 0) {
+            runAtEntity(plugin, entity, task, null);
+            return;
+        }
         if (FOLIA) {
             entity.getScheduler().execute(plugin, task, null, delayTicks);
         } else {

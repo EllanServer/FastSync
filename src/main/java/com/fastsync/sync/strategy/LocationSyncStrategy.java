@@ -15,7 +15,7 @@ import java.util.logging.Level;
  * <p>Location sync is disabled by default because it's contextual:
  * teleporting a player to coordinates from a different world can trap
  * them inside walls or void. When enabled, this strategy validates
- * world name and/or UUID before applying.
+ * world name and UUID before applying.
  */
 public class LocationSyncStrategy {
     
@@ -40,31 +40,53 @@ public class LocationSyncStrategy {
         
         World world = Bukkit.getWorld(worldName);
         if (world == null) {
-            if (config.isLocationFallbackToSpawn()) {
-                player.teleport(player.getWorld().getSpawnLocation());
-                if (config.isDebug()) {
-                    logger.fine("[Location] World '" + worldName + "' not found, teleported to spawn");
-                }
-            }
+            fallbackToSpawn(player, "world '" + worldName + "' was not found");
             return false;
         }
         
         // Validate world name matches
         if (config.isLocationRequireSameWorldName() 
                 && !world.getName().equals(worldName)) {
-            if (config.isDebug()) {
-                logger.fine("[Location] World name mismatch, skipping location sync");
-            }
+            fallbackToSpawn(player, "world name did not match");
             return false;
         }
         
-        // Validate world UUID matches (if PlayerData has worldUuid field)
-        // TODO: Add worldUuid to PlayerData for stricter validation
-        // For now, world name validation is sufficient for most deployments
+        if (config.isLocationRequireSameWorldUuid()) {
+            String savedUuid = data.getWorldUuid();
+            if (savedUuid == null || !world.getUID().toString().equals(savedUuid)) {
+                fallbackToSpawn(player, "world UUID did not match");
+                return false;
+            }
+        }
 
         Location loc = new Location(world, data.getX(), data.getY(), data.getZ(),
                                      data.getYaw(), data.getPitch());
-        player.teleport(loc);
+        // Paper loads/generates the destination chunks asynchronously before
+        // teleporting. This avoids a synchronous chunk-load stall on Paper and
+        // is the supported cross-region/cross-world path on Folia.
+        teleportAsync(player, loc, "saved location");
         return true;
+    }
+
+    private void fallbackToSpawn(Player player, String reason) {
+        if (config.isLocationFallbackToSpawn()) {
+            teleportAsync(player, player.getWorld().getSpawnLocation(), "fallback spawn");
+        }
+        if (config.isDebug()) {
+            logger.fine("[Location] Skipped saved location because " + reason);
+        }
+    }
+
+    private void teleportAsync(Player player, Location destination, String description) {
+        java.util.UUID playerId = player.getUniqueId();
+        player.teleportAsync(destination).whenComplete((success, error) -> {
+            if (error != null) {
+                logger.log(Level.WARNING, "[Location] Failed to teleport "
+                    + playerId + " to " + description, error);
+            } else if (!Boolean.TRUE.equals(success)) {
+                logger.warning("[Location] Teleport rejected for " + playerId
+                    + " to " + description);
+            }
+        });
     }
 }

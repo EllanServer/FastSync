@@ -3,6 +3,7 @@ package com.fastsync.listeners;
 import com.fastsync.FastSync;
 import com.fastsync.sync.SyncManager;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -85,6 +86,14 @@ public class PlayerListener implements Listener {
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onQuit(PlayerQuitEvent event) {
-        syncManager.collectAndSavePlayerData(event.getPlayer());
+        Player player = event.getPlayer();
+        try {
+            syncManager.collectAndSavePlayerData(player);
+        } finally {
+            // A player can leave from the death screen without respawning.
+            // Collection is synchronous even though persistence is not, so the
+            // event-derived respawn snapshot is no longer needed at this point.
+            syncManager.clearDeathState(player.getUniqueId());
+        }
     }
 }

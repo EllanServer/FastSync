@@ -81,6 +81,7 @@ public class ComponentDirtyMask {
     }
 
     private final ConcurrentHashMap<UUID, PlayerDirtyState> masks = new ConcurrentHashMap<>();
+    private final Set<UUID> suppressedPlayers = ConcurrentHashMap.newKeySet();
     private final int validationInterval;
 
     public ComponentDirtyMask(int validationInterval) {
@@ -93,15 +94,20 @@ public class ComponentDirtyMask {
 
     /**
      * Mark a component dirty for a player.
-     * Lock-free: single AtomicLong.getAndUpdate on the dirty bits + epoch bump.
+     * Lock-free: epoch bump followed by AtomicLong.getAndUpdate on dirty bits.
+     * The order is intentional: publishing the bit first would let a concurrent
+     * saver snapshot+clear the old epoch before the writer bumps it, losing the
+     * dirty signal.
      */
     public void markDirty(UUID uuid, Component component) {
+        if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
-        state.dirtyBits.getAndUpdate(v -> v | bit(component));
         state.epochs[component.ordinal()].incrementAndGet();
+        state.dirtyBits.getAndUpdate(v -> v | bit(component));
     }
 
     public void markDirty(UUID uuid, Set<Component> components) {
+        if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
         long mask = 0;
         for (Component c : components) {
@@ -113,11 +119,12 @@ public class ComponentDirtyMask {
     }
 
     public void markAllDirty(UUID uuid) {
+        if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
-        state.dirtyBits.set(ALL_DIRTY_BITS);
         for (int i = 0; i < NUM_COMPONENTS; i++) {
             state.epochs[i].incrementAndGet();
         }
+        state.dirtyBits.getAndUpdate(v -> v | ALL_DIRTY_BITS);
     }
 
     /**
@@ -195,6 +202,16 @@ public class ComponentDirtyMask {
     public void remove(UUID uuid) {
         masks.remove(uuid);
         apiMutationScanCounters.remove(uuid);
+        suppressedPlayers.remove(uuid);
+    }
+
+    /** Ignore Bukkit events caused by FastSync's own join-time apply phase. */
+    public void beginApply(UUID uuid) {
+        suppressedPlayers.add(uuid);
+    }
+
+    public void endApply(UUID uuid) {
+        suppressedPlayers.remove(uuid);
     }
 
     public int getTrackedPlayerCount() {

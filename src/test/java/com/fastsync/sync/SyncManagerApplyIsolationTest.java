@@ -11,6 +11,7 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.plugin.PluginManager;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.mockito.MockedStatic;
 
 import java.lang.reflect.Field;
@@ -100,6 +101,42 @@ class SyncManagerApplyIsolationTest {
         verify(inventory).setItemInOffHand(null);
         verify(enderChest).setStorageContents(same(ender));
         verify(player, times(1)).getActivePotionEffects();
+        assertTrue(manager.isPlayerActive(uuid));
+    }
+
+    @Test
+    void airAndFlightAreFullyReplaced() throws Exception {
+        FastSync plugin = mock(FastSync.class);
+        when(plugin.getLogger()).thenReturn(Logger.getLogger("apply-air-flight-test"));
+        ConfigManager config = mock(ConfigManager.class);
+        when(config.isSyncAir()).thenReturn(true);
+        when(config.isSyncFlight()).thenReturn(true);
+
+        SyncManager manager = new SyncManager(plugin, config, mock(DatabaseManager.class));
+        Player player = mock(Player.class);
+        UUID uuid = UUID.randomUUID();
+        when(player.getUniqueId()).thenReturn(uuid);
+
+        PlayerData data = new PlayerData();
+        data.setMaximumAir(480);
+        data.setRemainingAir(123);
+        data.setAllowFlight(true);
+        data.setFlying(false);
+        data.setVersion(4);
+        data.setFencingToken(8);
+        pendingData(manager).put(uuid, data);
+
+        PluginManager pluginManager = mock(PluginManager.class);
+        try (MockedStatic<Bukkit> bukkit = mockStatic(Bukkit.class)) {
+            bukkit.when(Bukkit::getPluginManager).thenReturn(pluginManager);
+            manager.applyPlayerData(player);
+        }
+
+        InOrder order = inOrder(player);
+        order.verify(player).setMaximumAir(480);
+        order.verify(player).setRemainingAir(123);
+        order.verify(player).setAllowFlight(true);
+        order.verify(player).setFlying(false);
         assertTrue(manager.isPlayerActive(uuid));
     }
 

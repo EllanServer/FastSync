@@ -24,17 +24,14 @@ import java.util.logging.Logger;
  * <p>The new implementation:
  * <ul>
  *   <li>Uses a fixed-size {@code long[]} ring buffer — zero allocation per record.</li>
- *   <li>{@code record()} is lock-free via a {@code long} head/tail packed into
- *       an {@code AtomicLong}; contention is reduced by using {@code getAndIncrement}.</li>
+ *   <li>{@code record()} uses a tiny monitor-protected array update. This keeps
+ *       publication atomic: readers never observe a claimed slot before its
+ *       latency value has actually been written.</li>
  *   <li>{@code logStats()} sorts the snapshot once and computes all percentiles
  *       via binary-search index lookup.</li>
  * </ul>
  *
- * <p>Trade-off: the ring buffer is a snapshot — once full, new samples overwrite
- * the oldest. Under heavy contention two writers may briefly collide; the
- * overwritten sample is the oldest one, which is acceptable for a statistics
- * tracker. The previous implementation had the same effective behavior with
- * its eviction loop.
+ * <p>The ring buffer is a snapshot: once full, new samples overwrite the oldest.
  */
 public class LatencyTracker {
 
@@ -42,44 +39,30 @@ public class LatencyTracker {
     private final Logger logger;
     private final int windowSize;
 
-    /** Packed head (high 32) + tail (low 32) for single-atomic update. */
-    private final AtomicLong headTail = new AtomicLong(0L);
     private final long[] ring;
+    private int writeIndex;
+    private int sampleCount;
     private final AtomicLong totalOperations = new AtomicLong(0);
     private final AtomicLong totalErrors = new AtomicLong(0);
 
     public LatencyTracker(String operationName, Logger logger, int windowSize) {
         this.operationName = operationName;
         this.logger = logger;
-        // Round up to power of two for fast modulo, at least 16.
-        int cap = Integer.highestOneBit(Math.max(16, windowSize)) << 1;
-        this.windowSize = cap;
-        this.ring = new long[cap];
+        this.windowSize = Math.max(16, windowSize);
+        this.ring = new long[this.windowSize];
     }
 
     /**
-     * Record a latency sample in milliseconds. Lock-free, zero allocation.
+     * Record a latency sample in milliseconds with zero allocation.
      */
-    public void record(long latencyMs) {
-        // Atomically claim the next slot. We pack head+tail into one AtomicLong
-        // so a single CAS reserves a slot without losing the head pointer.
-        // high 32 bits = head (next write index), low 32 bits = tail (oldest)
-        int mask = ring.length - 1;
-        while (true) {
-            long cur = headTail.get();
-            int head = (int) (cur >>> 32);
-            int tail = (int) cur;
-            int nextHead = (head + 1) & 0x7FFFFFFF;
-            int newTail = tail;
-            if ((nextHead - tail) > ring.length) {
-                // Buffer full: advance tail (overwrite oldest).
-                newTail = tail + 1;
-            }
-            long next = ((long) nextHead << 32) | (newTail & 0xFFFFFFFFL);
-            if (headTail.compareAndSet(cur, next)) {
-                ring[head & mask] = latencyMs;
-                break;
-            }
+    public synchronized void record(long latencyMs) {
+        ring[writeIndex] = latencyMs;
+        writeIndex++;
+        if (writeIndex == ring.length) {
+            writeIndex = 0;
+        }
+        if (sampleCount < ring.length) {
+            sampleCount++;
         }
         totalOperations.incrementAndGet();
     }
@@ -95,20 +78,16 @@ public class LatencyTracker {
      * Take a sorted snapshot of the current samples. Reused by {@link #logStats()}
      * and {@link #getPercentile(double)} to avoid re-sorting.
      */
-    private long[] sortedSnapshot() {
-        long cur = headTail.get();
-        int head = (int) (cur >>> 32);
-        int tail = (int) cur;
-        int count = head - tail;
-        if (count <= 0) {
+    private synchronized long[] sortedSnapshot() {
+        if (sampleCount == 0) {
             return new long[0];
         }
-        // Cap count to ring capacity (defensive — should already be ≤ ring.length).
-        count = Math.min(count, ring.length);
-        long[] copy = new long[count];
-        int mask = ring.length - 1;
-        for (int i = 0; i < count; i++) {
-            copy[i] = ring[(tail + i) & mask];
+        long[] copy = new long[sampleCount];
+        int oldest = sampleCount == ring.length ? writeIndex : 0;
+        for (int i = 0; i < sampleCount; i++) {
+            int index = oldest + i;
+            if (index >= ring.length) index -= ring.length;
+            copy[i] = ring[index];
         }
         Arrays.sort(copy);
         return copy;
@@ -180,11 +159,7 @@ public class LatencyTracker {
             operationName, p50, p99, p999, arr.length, totalErrors.get());
     }
 
-    public int getSampleCount() {
-        long cur = headTail.get();
-        int head = (int) (cur >>> 32);
-        int tail = (int) cur;
-        int count = head - tail;
-        return Math.max(0, Math.min(count, ring.length));
+    public synchronized int getSampleCount() {
+        return sampleCount;
     }
 }

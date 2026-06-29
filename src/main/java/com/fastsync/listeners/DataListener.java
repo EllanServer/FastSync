@@ -10,6 +10,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.world.WorldSaveEvent;
 import org.bukkit.plugin.Plugin;
 
@@ -44,8 +45,12 @@ public class DataListener implements Listener {
     /**
      * Save a player's data when they die (save cause: "death").
      */
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlayerDeath(PlayerDeathEvent event) {
+        // Paper's ServerPlayer.reset() applies these event-derived values only
+        // when the player respawns. Capture them now so a death-screen quit or
+        // cross-server transfer persists the expected post-respawn state.
+        syncManager.recordDeathState(event);
         if (!config.isSaveOnDeath()) {
             return;
         }
@@ -54,11 +59,20 @@ public class DataListener implements Listener {
         // Pass SaveKind.DEATH so that snapshot.save-trigger: "death" works,
         // operation logs record the correct cause, and dirty/component
         // strategies can distinguish death saves from periodic saves.
-        syncManager.savePlayerAsync(player, SyncManager.SaveKind.DEATH);
+        // ServerPlayer clears non-kept inventory only after PlayerDeathEvent
+        // returns. Defer collection by one entity tick so the saved snapshot
+        // matches the state Minecraft will actually respawn with.
+        SchedulerUtil.runAtEntityDelayed(plugin, player,
+            () -> syncManager.savePlayerAsync(player, SyncManager.SaveKind.DEATH), 1L);
 
         if (config.isDebug()) {
             logger.info("[FastSync] Saved data for " + player.getUniqueId() + " on death.");
         }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPlayerRespawn(PlayerRespawnEvent event) {
+        syncManager.clearDeathState(event.getPlayer().getUniqueId());
     }
 
     /**

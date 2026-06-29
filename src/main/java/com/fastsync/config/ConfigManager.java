@@ -69,7 +69,6 @@ public class ConfigManager {
     private boolean syncGameMode;
     private boolean syncFireTicks;
     private boolean syncAir;
-    private boolean syncExtraData;
     private int lockTimeout;
     private long lockRetryIntervalMs;
     private int lockMaxRetries;
@@ -429,7 +428,6 @@ public class ConfigManager {
         syncGameMode = source.getBoolean("sync.sync-game-mode", true);
         syncFireTicks = source.getBoolean("sync.sync-fire-ticks", true);
         syncAir = source.getBoolean("sync.sync-air", true);
-        syncExtraData = source.getBoolean("sync.sync-extra-data", true);
         lockTimeout = source.getInt("sync.lock-timeout", 60);
         // Round 16 (P1 #5): tightened defaults. Previously 1000ms x 30 = 30s
         // worst-case pre-login block, which caused severe UX under login storms
@@ -723,7 +721,6 @@ public class ConfigManager {
     public boolean isSyncGameMode() { return syncGameMode; }
     public boolean isSyncFireTicks() { return syncFireTicks; }
     public boolean isSyncAir() { return syncAir; }
-    public boolean isSyncExtraData() { return syncExtraData; }
     public int getLockTimeout() { return lockTimeout; }
     public long getLockRetryIntervalMs() { return lockRetryIntervalMs; }
     public int getLockMaxRetries() { return lockMaxRetries; }

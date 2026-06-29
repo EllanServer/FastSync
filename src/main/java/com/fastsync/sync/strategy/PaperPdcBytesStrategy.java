@@ -39,8 +39,9 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
             // sync was attempted and should call restore() to clear the target.
             return pdc.serializeToBytes();
         } catch (Exception e) {
-            if (debug) logger.log(Level.FINE, "[PDC] serializeToBytes failed: " + e.getMessage(), e);
-            return null;
+            logger.log(debug ? Level.WARNING : Level.SEVERE,
+                "[PDC] serializeToBytes failed; refusing to save a stale/empty PDC", e);
+            throw new IllegalStateException("Failed to serialize player PDC", e);
         }
     }
 
@@ -49,22 +50,27 @@ public class PaperPdcBytesStrategy implements PdcSyncStrategy {
         if (data == null) return;
         PersistentDataContainer pdc = player.getPersistentDataContainer();
 
-        // Empty payload means "source PDC is empty" — clear the target container
-        // to remove ghost keys that were deleted on the source server.
+        // serializeToBytes() writes a valid NBT compound even for an empty PDC;
+        // zero bytes can therefore only be malformed input.
         if (data.length == 0) {
-            if (clearBeforeRestore) {
-                clearContainer(pdc);
-            }
-            return;
+            throw new IllegalArgumentException("PDC payload is empty");
         }
 
         try {
-            // Public API: readFromBytes(byte[], boolean clear)
-            // clear=true wipes the container before reading (full sync).
-            // clear=false appends/overwrites existing keys (merge mode).
-            pdc.readFromBytes(data, clearBeforeRestore);
+            // CraftPersistentDataContainer clears itself BEFORE parsing when
+            // readFromBytes(data, true) is used. Decode into a temporary public-
+            // API container first so malformed NBT cannot wipe live player data.
+            PersistentDataContainer decoded =
+                pdc.getAdapterContext().newPersistentDataContainer();
+            decoded.readFromBytes(data, true);
+            if (clearBeforeRestore) {
+                clearContainer(pdc);
+            }
+            decoded.copyTo(pdc, true);
         } catch (Exception e) {
-            if (debug) logger.log(Level.FINE, "[PDC] readFromBytes failed: " + e.getMessage(), e);
+            logger.log(debug ? Level.WARNING : Level.SEVERE,
+                "[PDC] readFromBytes failed before live-container mutation", e);
+            throw new IllegalStateException("Failed to restore player PDC", e);
         }
     }
 

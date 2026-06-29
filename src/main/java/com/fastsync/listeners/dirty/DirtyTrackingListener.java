@@ -211,13 +211,16 @@ public class DirtyTrackingListener implements Listener {
 
     // ==================== Death / Respawn ====================
 
-    @EventHandler(priority = EventPriority.MONITOR)
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onDeath(PlayerDeathEvent event) {
-        // Death changes inventory (drops), vitals, food, experience
+        // ServerPlayer.reset changes all of these on respawn.
         markDirty(event.getEntity(), Component.INVENTORY);
         markDirty(event.getEntity(), Component.VITALS);
         markDirty(event.getEntity(), Component.FOOD);
         markDirty(event.getEntity(), Component.EXPERIENCE);
+        markDirty(event.getEntity(), Component.POTION_EFFECTS);
+        markDirty(event.getEntity(), Component.FIRE_TICKS);
+        markDirty(event.getEntity(), Component.AIR);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -226,6 +229,7 @@ public class DirtyTrackingListener implements Listener {
         markDirty(event.getPlayer(), Component.VITALS);
         markDirty(event.getPlayer(), Component.FOOD);
         markDirty(event.getPlayer(), Component.FIRE_TICKS);
+        markDirty(event.getPlayer(), Component.AIR);
         markDirty(event.getPlayer(), Component.POTION_EFFECTS);
         markDirty(event.getPlayer(), Component.LOCATION);
     }

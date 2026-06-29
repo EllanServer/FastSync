@@ -187,10 +187,9 @@ redis:
 | `sync-game-mode` | `true` | 同步游戏模式 |
 | `sync-fire-ticks` | `true` | 同步火焰 tick |
 | `sync-air` | `true` | 同步氧气值 |
-| `sync-extra-data` | `true` | 同步额外数据 |
 | `sync-advancements` | `true` | 同步成就 |
 | `sync-statistics` | `true` | 同步统计 |
-| `sync-attributes` | `true` | 同步属性 |
+| `sync-attributes` | `true` | 同步属性基础值（Paper API 无法区分永久/临时 modifier，故不复制 modifier） |
 | `sync-flight` | `true` | 同步飞行状态 |
 | `sync-pdc` | `true` | 同步 PersistentDataContainer |
 | `sync-location` | `false` | 同步位置（需同世界名+UUID 匹配） |

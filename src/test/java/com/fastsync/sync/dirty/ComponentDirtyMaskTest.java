@@ -353,6 +353,18 @@ class ComponentDirtyMaskTest {
             "QUIT clearAll should clear all dirty state — player is leaving");
     }
 
+    @Test
+    void applySuppressionIgnoresSelfGeneratedEvents() {
+        mask.beginApply(player1);
+        mask.markDirty(player1, ComponentDirtyMask.Component.GAME_MODE);
+        mask.markAllDirty(player1);
+        assertFalse(mask.isAnyDirty(player1));
+
+        mask.endApply(player1);
+        mask.markDirty(player1, ComponentDirtyMask.Component.GAME_MODE);
+        assertTrue(mask.isAnyDirty(player1));
+    }
+
     /**
      * Multi-component variant: only the component whose epoch was bumped
      * during the save survives the epoch-protected clear.

@@ -394,6 +394,7 @@ public final class FinalSaveSpool {
 
         Path tmp = file.resolveSibling(file.getFileName() + "." + UUID.randomUUID() + ".rewrite.tmp");
         long oldSize = safeSize(file);
+        boolean moved = false;
         try {
             writeRecord(tmp, updated);
             long newSize = Files.size(tmp);
@@ -403,11 +404,19 @@ public final class FinalSaveSpool {
                     + projectedBytes + " > " + maxBytes);
             }
             commitPendingAtomically(tmp, file);
+            moved = true;
             fsyncDirectory(pendingDir);
             totalBytes.updateAndGet(value -> Math.max(0, value - oldSize + newSize));
         } finally {
-            // tmp was atomically moved — nothing to clean up on success.
-            // On failure, the caller (replay service) will handle the error.
+            if (!moved) {
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException cleanupError) {
+                    logger.log(Level.WARNING,
+                        "[FinalSaveSpool] Failed to delete incomplete rewrite: " + tmp,
+                        cleanupError);
+                }
+            }
         }
     }
 

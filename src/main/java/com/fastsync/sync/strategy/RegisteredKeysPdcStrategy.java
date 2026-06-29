@@ -115,69 +115,97 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
             out.flush();
             return baos.toByteArray();
         } catch (IOException e) {
-            if (debug) logger.log(Level.FINE, "[PDC] registered dump failed: " + e.getMessage(), e);
-            return null;
+            logger.log(debug ? Level.WARNING : Level.SEVERE,
+                "[PDC] registered dump failed; refusing to save stale PDC state", e);
+            throw new IllegalStateException("Failed to serialize registered PDC keys", e);
         }
     }
 
     @Override
     @SuppressWarnings({"rawtypes", "unchecked"})
     public void restore(Player player, byte[] data) {
-        if (data == null || data.length == 0) return;
+        if (data == null) return;
+        if (data.length == 0) {
+            throw new IllegalArgumentException("Registered PDC payload is empty");
+        }
 
-        // Validate the entry count BEFORE touching the player's PDC. A
-        // corrupted payload with an out-of-bounds count is rejected without
-        // even reading the container, so a bad sync cannot wipe good local
-        // data. (The legitimate empty-payload case — count == 0 — is still
-        // allowed through and clears all registered keys below.)
-        int count;
+        // Decode and validate the complete payload before mutating the player's
+        // container. A truncated entry or type mismatch must not clear valid
+        // target data and leave only a partially restored prefix.
+        Map<NamespacedKey, DecodedValue> decoded = new HashMap<>();
         try (var bais = new ByteArrayInputStream(data);
              var in = new DataInputStream(bais)) {
-            count = in.readInt();
-        } catch (IOException e) {
-            if (debug) logger.log(Level.FINE, "[PDC] registered restore rejected (could not read count): " + e.getMessage(), e);
-            return;
-        }
-        if (count < 0 || count > MAX_PDC_ENTRIES) {
-            if (debug) logger.log(Level.FINE, "[PDC] registered restore rejected: count="
-                + count + " out of bounds (max " + MAX_PDC_ENTRIES + ")");
-            return;
-        }
-
-        // Count validated — now safe to touch the player's container.
-        PersistentDataContainer pdc = player.getPersistentDataContainer();
-
-        // Clear all registered keys before restore to prevent "ghost keys" —
-        // keys that exist on the target server but were removed on the source
-        // server. Without this clear, stale PDC values from a previous session
-        // on this server would persist after the restore.
-        for (NamespacedKey registeredKey : registeredKeys.keySet()) {
-            pdc.remove(registeredKey);
-        }
-
-        try (var bais = new ByteArrayInputStream(data);
-             var in = new DataInputStream(bais)) {
-            // Re-read and discard the (already-validated) count.
-            in.readInt();
+            int count = in.readInt();
+            if (count < 0 || count > MAX_PDC_ENTRIES || count > registeredKeys.size()) {
+                throw new IOException("entry count " + count + " out of bounds");
+            }
             for (int i = 0; i < count; i++) {
                 String keyStr = in.readUTF();
                 byte typeId = in.readByte();
-                Object val = readValue(in, typeId);
-                if (val == null) continue;
+                Object value = readValue(in, typeId);
+                if (value == null) {
+                    throw new IOException("unknown type id " + typeId + " for " + keyStr);
+                }
 
                 NamespacedKey key = NamespacedKey.fromString(keyStr);
-                if (key == null) continue;
-                PersistentDataType type = registeredKeys.get(key);
-                if (type == null) continue;
-
-                try {
-                    pdc.set(key, type, val);
-                } catch (Exception ignored) {}
+                PersistentDataType type = key != null ? registeredKeys.get(key) : null;
+                if (type == null) {
+                    throw new IOException("unregistered PDC key " + keyStr);
+                }
+                if (typeIdOf(type) != typeId) {
+                    throw new IOException("type mismatch for " + keyStr);
+                }
+                if (decoded.put(key, new DecodedValue(type, value)) != null) {
+                    throw new IOException("duplicate PDC key " + keyStr);
+                }
+            }
+            if (in.available() != 0) {
+                throw new IOException("trailing bytes after PDC payload");
             }
         } catch (IOException e) {
-            if (debug) logger.log(Level.FINE, "[PDC] registered restore failed: " + e.getMessage(), e);
+            logger.log(debug ? Level.WARNING : Level.SEVERE,
+                "[PDC] registered restore rejected before mutation: " + e.getMessage(), e);
+            throw new IllegalArgumentException("Invalid registered PDC payload", e);
+        }
+
+        // The complete payload is valid; apply it with full-replace semantics.
+        PersistentDataContainer pdc = player.getPersistentDataContainer();
+        Map<NamespacedKey, DecodedValue> previous = new HashMap<>();
+        for (Map.Entry<NamespacedKey, PersistentDataType<?, ?>> entry : registeredKeys.entrySet()) {
+            PersistentDataType type = entry.getValue();
+            Object value = pdc.get(entry.getKey(), type);
+            if (value != null) {
+                previous.put(entry.getKey(), new DecodedValue(type, value));
+            }
+        }
+        try {
+            for (NamespacedKey registeredKey : registeredKeys.keySet()) {
+                pdc.remove(registeredKey);
+            }
+            for (Map.Entry<NamespacedKey, DecodedValue> entry : decoded.entrySet()) {
+                DecodedValue value = entry.getValue();
+                pdc.set(entry.getKey(), value.type(), value.value());
+            }
+        } catch (RuntimeException applyFailure) {
+            // Best-effort rollback: a custom PersistentDataType implementation
+            // must not leave a half-applied registered-key set.
+            try {
+                for (NamespacedKey registeredKey : registeredKeys.keySet()) {
+                    pdc.remove(registeredKey);
+                }
+                for (Map.Entry<NamespacedKey, DecodedValue> entry : previous.entrySet()) {
+                    DecodedValue value = entry.getValue();
+                    pdc.set(entry.getKey(), value.type(), value.value());
+                }
+            } catch (RuntimeException rollbackFailure) {
+                applyFailure.addSuppressed(rollbackFailure);
+            }
+            throw applyFailure;
         }
     }
+
+    @SuppressWarnings("rawtypes")
+    private record DecodedValue(PersistentDataType type, Object value) {}
 
     // ==================== Binary Type Dispatch ====================
 

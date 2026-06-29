@@ -48,7 +48,8 @@ public class PlayerData {
     // Uses Bukkit Statistic enum names
     private Map<String, Map<String, Integer>> statistics;
 
-    // Attributes: map of attribute key -> base value + modifiers
+    // Attribute base values. Runtime modifiers are intentionally not copied:
+    // Paper's public API does not expose permanent vs transient membership.
     private List<AttributeData> attributes;
 
     // Flight status
@@ -60,11 +61,9 @@ public class PlayerData {
 
     // Location (optional, for mirror worlds)
     private String worldName;
+    private String worldUuid;
     private double x, y, z;
     private float yaw, pitch;
-
-    // Locked maps: list of map NBT byte arrays
-    private List<byte[]> lockedMaps;
 
     /**
      * Wall-clock timestamp when this data was collected.
@@ -84,7 +83,6 @@ public class PlayerData {
         this.statistics = new HashMap<>();
         this.attributes = new ArrayList<>();
         this.persistentDataContainer = new HashMap<>();
-        this.lockedMaps = new ArrayList<>();
         this.timestamp = System.currentTimeMillis();
         this.version = 0;
         this.fencingToken = 0;
@@ -164,6 +162,8 @@ public class PlayerData {
 
     public String getWorldName() { return worldName; }
     public void setWorldName(String worldName) { this.worldName = worldName; }
+    public String getWorldUuid() { return worldUuid; }
+    public void setWorldUuid(String worldUuid) { this.worldUuid = worldUuid; }
 
     public double getX() { return x; }
     public void setX(double x) { this.x = x; }
@@ -179,9 +179,6 @@ public class PlayerData {
 
     public float getPitch() { return pitch; }
     public void setPitch(float pitch) { this.pitch = pitch; }
-
-    public List<byte[]> getLockedMaps() { return lockedMaps; }
-    public void setLockedMaps(List<byte[]> lockedMaps) { this.lockedMaps = lockedMaps; }
 
     public long getTimestamp() { return timestamp; }
     public void setTimestamp(long timestamp) { this.timestamp = timestamp; }
@@ -226,54 +223,13 @@ public class PlayerData {
     public static class AttributeData {
         private final String attributeKey;
         private final double baseValue;
-        private final List<ModifierData> modifiers;
 
-        public AttributeData(String attributeKey, double baseValue, List<ModifierData> modifiers) {
+        public AttributeData(String attributeKey, double baseValue) {
             this.attributeKey = attributeKey;
             this.baseValue = baseValue;
-            this.modifiers = modifiers;
         }
 
         public String getAttributeKey() { return attributeKey; }
         public double getBaseValue() { return baseValue; }
-        public List<ModifierData> getModifiers() { return modifiers; }
-    }
-
-    public static class ModifierData {
-        // Namespaced modifier key in current payloads; legacy payloads contain UUIDs.
-        private final String uuid;
-        private final String name;
-        private final double amount;
-        private final String operation; // ADD_NUMBER, ADD_SCALAR, MULTIPLY_SCALAR_1
-        // Holds the EquipmentSlotGroup name (UTF-8 encoded) for MC 1.21+,
-        // so slot-restricted modifiers (e.g. helmet-only +max_health) round-trip
-        // correctly. Null or empty for legacy payloads — apply path treats
-        // those as ANY (matching the old 4-arg constructor behavior).
-        // (Field renamed from "raw NBT for complex modifiers" — the original
-        // intent was never implemented; repurposed for slotGroup in issue #56.)
-        private final byte[] serializedData;
-
-        public ModifierData(String uuid, String name, double amount, String operation, byte[] serializedData) {
-            this.uuid = uuid;
-            this.name = name;
-            this.amount = amount;
-            this.operation = operation;
-            this.serializedData = serializedData;
-        }
-
-        public String getUuid() { return uuid; }
-        public String getName() { return name; }
-        public double getAmount() { return amount; }
-        public String getOperation() { return operation; }
-        public byte[] getSerializedData() { return serializedData; }
-        /** Decode the slot group name from serializedData; null if absent/empty. */
-        public String getSlotGroupName() {
-            if (serializedData == null || serializedData.length == 0) return null;
-            try {
-                return new String(serializedData, java.nio.charset.StandardCharsets.UTF_8);
-            } catch (Exception e) {
-                return null;
-            }
-        }
     }
 }

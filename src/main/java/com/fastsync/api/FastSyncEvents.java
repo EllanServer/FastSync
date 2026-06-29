@@ -131,7 +131,9 @@ public final class FastSyncEvents {
      *
      * <p>Cancelling this event prevents FastSync from persisting the player's
      * data for this save cycle. The exposed {@link PlayerData} may be mutated by
-     * listeners before it is serialized.</p>
+     * listeners before it is serialized. Cancelling a final quit/shutdown save
+     * also makes FastSync release its coordination lock; the listener is then
+     * responsible for any persistence it requires.</p>
      */
     public static class FastSyncSaveEvent extends Event implements Cancellable {
 
