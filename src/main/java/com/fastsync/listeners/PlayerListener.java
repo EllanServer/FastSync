@@ -3,6 +3,7 @@ package com.fastsync.listeners;
 import com.fastsync.FastSync;
 import com.fastsync.sync.SyncManager;
 import net.kyori.adventure.text.Component;
+import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -51,15 +52,23 @@ public class PlayerListener implements Listener {
 
         if (!result.isSuccess()) {
             Component kickMessage;
+            // Try to get the player object for per-player locale support.
+            // At pre-login stage, the player may not be online yet, so we
+            // fall back to the global language if the player object is unavailable.
+            Player player = Bukkit.getPlayer(uuid);
             if (result.getStatus() == SyncManager.LoadResult.Status.LOCKED) {
-                kickMessage = plugin.getMessageManager().component("player.kick.lock-timeout");
+                kickMessage = player != null
+                    ? plugin.getMessageManager().component(player, "player.kick.lock-timeout")
+                    : plugin.getMessageManager().component("player.kick.lock-timeout");
             } else if (result.getStatus() == SyncManager.LoadResult.Status.BUSY) {
-                // Login backpressure: too many concurrent loads. Use the
-                // dedicated busy-kick-message so players know to retry.
-                kickMessage = plugin.getMessageManager().component("player.kick.busy");
+                kickMessage = player != null
+                    ? plugin.getMessageManager().component(player, "player.kick.busy")
+                    : plugin.getMessageManager().component("player.kick.busy");
             } else {
                 plugin.getLogger().warning("Failed to load data for " + uuid + ": " + result.getMessage());
-                kickMessage = plugin.getMessageManager().component("player.kick.load-fail");
+                kickMessage = player != null
+                    ? plugin.getMessageManager().component(player, "player.kick.load-fail")
+                    : plugin.getMessageManager().component("player.kick.load-fail");
             }
             event.disallow(
                 AsyncPlayerPreLoginEvent.Result.KICK_OTHER,

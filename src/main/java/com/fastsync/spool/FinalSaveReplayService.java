@@ -1,5 +1,6 @@
 package com.fastsync.spool;
 
+import com.fastsync.cache.QueryCache;
 import com.fastsync.database.DatabaseManager;
 import com.fastsync.util.SchedulerUtil;
 import org.bukkit.plugin.Plugin;
@@ -51,6 +52,11 @@ public class FinalSaveReplayService {
     /** Called with the player UUID after a successful replay so other servers
      *  on Redis pub/sub are notified the lock was released. May be null. */
     private final Consumer<UUID> lockReleasedCallback;
+    /** Short-TTL cache for lock-state queries during replay classification.
+     *  Multiple pending files for the same UUID within a 2s window share
+     *  a single DB round-trip. */
+    private final QueryCache<UUID, DatabaseManager.LockState> lockStateCache =
+        new QueryCache<>("LockState", java.time.Duration.ofSeconds(2), 1024);
     private Object task;
     private volatile boolean running = false;
     private final AtomicBoolean replaying = new AtomicBoolean(false);
@@ -177,7 +183,20 @@ public class FinalSaveReplayService {
                     // succeed.
                     DatabaseManager.LockState state;
                     try {
-                        state = databaseManager.getLockState(rec.uuid());
+                        state = lockStateCache.get(rec.uuid(), uuid -> {
+                            try {
+                                return databaseManager.getLockState(uuid);
+                            } catch (java.sql.SQLException e) {
+                                // Cache a null to signal "query failed" —
+                                // the caller will handle it below.
+                                return null;
+                            }
+                        });
+                        if (state == null) {
+                            // The cache loader swallowed the SQLException.
+                            // Re-throw to trigger the catch block below.
+                            throw new java.sql.SQLException("Lock state query returned null (cached failure)");
+                        }
                     } catch (java.sql.SQLException dbEx) {
                         // DB unavailable during the diagnostic read — keep the
                         // file in pending and retry next cycle. Moving it to

@@ -2,6 +2,10 @@
 # FastSync Configuration
 # ============================================================
 
+# Configuration version (managed by the plugin — do not edit manually)
+# The plugin uses this to automatically migrate config when upgrading.
+config_version: 2
+
 # Unique server identifier (must be unique across all servers in the network)
 server-name: "survival-1"
 
@@ -371,11 +375,18 @@ snapshot:
 # Compression Settings
 # ------------------------------------------------------------
 compression:
-  # Whether to enable LZ4 compression
+  # Whether to enable compression
   enabled: true
 
-  # Compression type: LZ4 (only LZ4 is supported currently)
+  # Compression algorithm: LZ4 (fast, default) or ZSTD (higher ratio, ~30-50% smaller)
+  # LZ4 is recommended for hot paths (login/save). ZSTD is better for disk-bound
+  # paths (spool, snapshots) where CPU cost is less critical than storage size.
   type: "LZ4"
+
+  # ZSTD compression level (1-22). Higher = better ratio but slower.
+  # Level 3 is a good default. Level 19+ is extremely slow.
+  # Only used when type is ZSTD.
+  zstd-level: 3
 
   # Minimum data size in bytes before compression is applied (smaller data won't be compressed)
   min-size: 128

@@ -1,17 +1,19 @@
 package com.fastsync.serialization;
 
+import com.github.luben.zstd.Zstd;
+import com.github.luben.zstd.ZstdException;
 import net.jpountz.lz4.LZ4Compressor;
 import net.jpountz.lz4.LZ4Exception;
 import net.jpountz.lz4.LZ4Factory;
 import net.jpountz.lz4.LZ4FastDecompressor;
 
 /**
- * LZ4 compression utility with format version and flags header.
+ * Compression utility with format version and algorithm-selection header.
  *
  * <p>Binary format:
  * <pre>
  *   [1 byte: FORMAT_VERSION]
- *   [1 byte: FLAGS (bit 0: compressed)]
+ *   [1 byte: FLAGS (bit 0: compressed, bits 1-2: algorithm)]
  *   if compressed:
  *     [4 bytes: original length (big-endian int)]
  *     [... compressed data ...]
@@ -19,81 +21,96 @@ import net.jpountz.lz4.LZ4FastDecompressor;
  *     [... raw data ...]
  * </pre>
  *
- * <p>This avoids the base64 string encoding overhead that plagues other sync plugins.
- * LZ4 provides ~3-5x compression on NBT data with extremely fast decompression.
+ * <p>Algorithm encoding in FLAGS bits 1-2:
+ * <ul>
+ *   <li>0b00 = LZ4 (fast, default for hot path)</li>
+ *   <li>0b01 = ZSTD (high ratio, for spool/snapshot)</li>
+ * </ul>
+ *
+ * <p>The algorithm is selected via {@link #setAlgorithm(CompressionAlgorithm)}
+ * and defaults to LZ4 for backward compatibility. ZSTD provides ~30-50% better
+ * compression ratio on NBT data at slightly higher CPU cost, making it ideal
+ * for disk-bound paths (FinalSaveSpool, SnapshotManager).
  *
  * <h2>Bounds checking</h2>
  * The decompression path reads {@code originalLength} straight out of the blob
  * header. A corrupted / poisoned DB row could therefore declare a huge length
- * and trigger an OOM (or a {@code NegativeArraySizeException} for negative
- * values) on the login thread. {@link #unwrap(byte[])} enforces upper bounds
- * on both the wrapped payload and the declared original length before any
- * allocation, and converts any LZ4 failure into a {@link CorruptDataException}
- * so the load path fails closed (releases the lock, refuses the payload)
- * instead of propagating a random exception.
- *
- * <p>Limits are configurable via {@link #configureLimits(int, int)} and default
- * to conservative values (1 MiB raw / 2.5 MiB wrapped). The plugin's
- * {@code ConfigManager} applies the configured values on startup.
+ * and trigger an OOM. {@link #unwrap(byte[])} enforces upper bounds on both
+ * the wrapped payload and the declared original length before any allocation.
  */
 public class CompressionUtil {
 
-    public static final byte FORMAT_VERSION = 1;
+    public static final byte FORMAT_VERSION = 2;
     public static final byte FLAG_COMPRESSED = 0x01;
+    public static final byte FLAG_ALGORITHM_MASK = 0x06; // bits 1-2
+    public static final byte FLAG_ALGORITHM_LZ4 = 0x00;
+    public static final byte FLAG_ALGORITHM_ZSTD = 0x02;
+
+    // Legacy format version 1 (LZ4 only) — still readable by unwrap()
+    public static final byte FORMAT_VERSION_LEGACY = 1;
 
     private static final LZ4Factory factory = LZ4Factory.fastestInstance();
-    private static final LZ4Compressor compressor = factory.fastCompressor();
-    private static final LZ4FastDecompressor decompressor = factory.fastDecompressor();
+    private static final LZ4Compressor lz4Compressor = factory.fastCompressor();
+    private static final LZ4FastDecompressor lz4Decompressor = factory.fastDecompressor();
 
-    // ThreadLocal scratch buffer — avoids allocating a new byte[] on every
-    // compress call. LZ4's worst-case bound is input.length + some overhead,
-    // so we grow the buffer lazily as needed.
+    // ThreadLocal scratch buffer for LZ4
     private static final ThreadLocal<byte[]> scratchBuffer = ThreadLocal.withInitial(() -> new byte[8192]);
 
-    /**
-     * Default cap on the declared decompressed (raw) length, in bytes.
-     * A player data Blob should never legitimately approach this; the cap
-     * exists purely to bound memory in the face of corrupted data.
-     */
     static final int DEFAULT_MAX_RAW_BYTES = 1 << 20;            // 1 MiB
-    /**
-     * Default cap on the wrapped (on-disk) payload length, in bytes.
-     * Slightly larger than the raw cap so legitimately-compressed data still
-     * fits, but still bounded.
-     */
     static final int DEFAULT_MAX_WRAPPED_BYTES = 5 * (1 << 19);  // 2.5 MiB
 
     private static volatile int maxRawBytes = DEFAULT_MAX_RAW_BYTES;
     private static volatile int maxWrappedBytes = DEFAULT_MAX_WRAPPED_BYTES;
 
+    // Default algorithm — LZ4 for backward compatibility and hot-path speed
+    private static volatile CompressionAlgorithm algorithm = CompressionAlgorithm.LZ4;
+
+    // ZSTD compression level (1-22, higher = better ratio but slower)
+    private static volatile int zstdLevel = 3;
+
+    public enum CompressionAlgorithm {
+        LZ4,
+        ZSTD
+    }
+
     private CompressionUtil() {}
 
     /**
-     * Apply configured decompression bounds. Called once from {@code ConfigManager}
-     * at load time. Values {@code <= 0} are ignored (keeps the prior limit) so a
-     * misconfigured file can't disable the guard.
+     * Set the compression algorithm used by {@link #wrap(byte[], int)}.
+     *
+     * @param algorithm the algorithm to use (LZ4 or ZSTD)
      */
+    public static void setAlgorithm(CompressionAlgorithm algorithm) {
+        CompressionUtil.algorithm = algorithm;
+    }
+
+    /**
+     * Get the currently configured compression algorithm.
+     */
+    public static CompressionAlgorithm getAlgorithm() {
+        return algorithm;
+    }
+
+    /**
+     * Set the ZSTD compression level (1-22).
+     * Level 3 is the default (good balance of ratio and speed).
+     *
+     * @param level ZSTD compression level
+     */
+    public static void setZstdLevel(int level) {
+        zstdLevel = Math.max(1, Math.min(22, level));
+    }
+
     public static void configureLimits(int maxRawBytes, int maxWrappedBytes) {
         if (maxRawBytes > 0) CompressionUtil.maxRawBytes = maxRawBytes;
         if (maxWrappedBytes > 0) CompressionUtil.maxWrappedBytes = maxWrappedBytes;
     }
 
-    /** Current cap on declared raw length (for tests / diagnostics). */
     public static int getMaxRawBytes() { return maxRawBytes; }
-    /** Current cap on wrapped payload length (for tests / diagnostics). */
     public static int getMaxWrappedBytes() { return maxWrappedBytes; }
 
     /**
-     * Wraps raw data with header and optionally compresses with LZ4.
-     *
-     * <p><b>Allocation note (kept honest):</b> this method performs two
-     * allocations on the compressed path — a scratch buffer sized to LZ4's
-     * worst-case bound, then a trimmed result buffer into which the compressed
-     * bytes are copied. The class-level doc previously claimed a single-buffer
-     * {@code ByteArrayOutputStream} implementation; that was inaccurate, so the
-     * claim has been removed rather than left as misleading documentation. The
-     * extra copy is small relative to a DB round-trip and is not on a hot
-     * enough path to justify a ThreadLocal scratch buffer yet.
+     * Wraps raw data with header and optionally compresses.
      *
      * @param data      raw serialized data
      * @param minSize   minimum data size to trigger compression (bytes)
@@ -110,33 +127,10 @@ public class CompressionUtil {
 
         boolean shouldCompress = data.length >= minSize;
         if (shouldCompress) {
-            int maxCompressedLen = compressor.maxCompressedLength(data.length);
-            // Reuse ThreadLocal scratch buffer — avoids per-call allocation.
-            // Grow if needed (rare: only when player data exceeds prior max).
-            byte[] tmp = scratchBuffer.get();
-            if (tmp.length < maxCompressedLen) {
-                tmp = new byte[maxCompressedLen];
-                scratchBuffer.set(tmp);
-            }
-            int compressedLen = compressor.compress(data, 0, data.length,
-                tmp, 0, maxCompressedLen);
-
-            // Only use compression if it actually reduces size
-            // (account for 4-byte original-length header).
-            if (compressedLen + 6 < data.length + 2) {
-                byte[] result = new byte[6 + compressedLen];
-                result[0] = FORMAT_VERSION;
-                result[1] = FLAG_COMPRESSED;
-                result[2] = (byte) (data.length >>> 24);
-                result[3] = (byte) (data.length >>> 16);
-                result[4] = (byte) (data.length >>> 8);
-                result[5] = (byte) (data.length);
-                System.arraycopy(tmp, 0, result, 6, compressedLen);
-                if (result.length > maxWrappedBytes) {
-                    throw new CorruptDataException("Wrapped payload exceeds configured limit: "
-                        + result.length + " > " + maxWrappedBytes + " bytes");
-                }
-                return result;
+            if (algorithm == CompressionAlgorithm.ZSTD) {
+                return wrapZstd(data);
+            } else {
+                return wrapLz4(data);
             }
         }
 
@@ -152,22 +146,79 @@ public class CompressionUtil {
         return result;
     }
 
+    private static byte[] wrapLz4(byte[] data) {
+        int maxCompressedLen = lz4Compressor.maxCompressedLength(data.length);
+        byte[] tmp = scratchBuffer.get();
+        if (tmp.length < maxCompressedLen) {
+            tmp = new byte[maxCompressedLen];
+            scratchBuffer.set(tmp);
+        }
+        int compressedLen = lz4Compressor.compress(data, 0, data.length,
+            tmp, 0, maxCompressedLen);
+
+        if (compressedLen + 6 < data.length + 2) {
+            byte[] result = new byte[6 + compressedLen];
+            result[0] = FORMAT_VERSION;
+            result[1] = (byte) (FLAG_COMPRESSED | FLAG_ALGORITHM_LZ4);
+            result[2] = (byte) (data.length >>> 24);
+            result[3] = (byte) (data.length >>> 16);
+            result[4] = (byte) (data.length >>> 8);
+            result[5] = (byte) (data.length);
+            System.arraycopy(tmp, 0, result, 6, compressedLen);
+            if (result.length > maxWrappedBytes) {
+                throw new CorruptDataException("Wrapped payload exceeds configured limit: "
+                    + result.length + " > " + maxWrappedBytes + " bytes");
+            }
+            return result;
+        }
+        // Compression didn't help — fall through to uncompressed
+        return uncompressed(data);
+    }
+
+    private static byte[] wrapZstd(byte[] data) {
+        byte[] compressed = Zstd.compress(data, zstdLevel);
+
+        if (compressed.length + 6 < data.length + 2) {
+            byte[] result = new byte[6 + compressed.length];
+            result[0] = FORMAT_VERSION;
+            result[1] = (byte) (FLAG_COMPRESSED | FLAG_ALGORITHM_ZSTD);
+            result[2] = (byte) (data.length >>> 24);
+            result[3] = (byte) (data.length >>> 16);
+            result[4] = (byte) (data.length >>> 8);
+            result[5] = (byte) (data.length);
+            System.arraycopy(compressed, 0, result, 6, compressed.length);
+            if (result.length > maxWrappedBytes) {
+                throw new CorruptDataException("Wrapped payload exceeds configured limit: "
+                    + result.length + " > " + maxWrappedBytes + " bytes");
+            }
+            return result;
+        }
+        // Compression didn't help — fall through to uncompressed
+        return uncompressed(data);
+    }
+
+    private static byte[] uncompressed(byte[] data) {
+        byte[] result = new byte[2 + data.length];
+        result[0] = FORMAT_VERSION;
+        result[1] = 0;
+        System.arraycopy(data, 0, result, 2, data.length);
+        if (result.length > maxWrappedBytes) {
+            throw new CorruptDataException("Wrapped payload exceeds configured limit: "
+                + result.length + " > " + maxWrappedBytes + " bytes");
+        }
+        return result;
+    }
+
     /**
      * Unwraps and optionally decompresses data.
      *
-     * <p>Zero-copy on the compressed path: passes the wrapped buffer directly
-     * to the LZ4 decompressor with the correct offset, avoiding a
-     * {@code Arrays.copyOfRange}.
-     *
-     * <p>Bounds-checked: the wrapped payload length and the declared original
-     * length are validated <em>before</em> the destination array is allocated,
-     * so a corrupted header cannot cause an OOM or {@code NegativeArraySize}.
-     * Any LZ4 decompression failure is wrapped in a {@link CorruptDataException}.
+     * <p>Supports both format version 1 (legacy LZ4-only) and version 2
+     * (multi-algorithm). This ensures backward compatibility with data
+     * written by older plugin versions.
      *
      * @param wrappedData data produced by {@link #wrap}
      * @return raw serialized data
-     * @throws CorruptDataException if the payload is too short, the declared
-     *         length is out of bounds, or LZ4 decompression fails
+     * @throws CorruptDataException if the payload is corrupted
      */
     public static byte[] unwrap(byte[] wrappedData) {
         if (wrappedData == null || wrappedData.length < 2) {
@@ -183,13 +234,10 @@ public class CompressionUtil {
         byte version = wrappedData[0];
         byte flags = wrappedData[1];
 
-        if (version != FORMAT_VERSION) {
+        // Support legacy format version 1 (LZ4 only, no algorithm bits)
+        if (version != FORMAT_VERSION && version != FORMAT_VERSION_LEGACY) {
             throw new CorruptDataException("Unsupported format version: " + version
-                + " (expected " + FORMAT_VERSION + ")");
-        }
-        if ((flags & ~FLAG_COMPRESSED) != 0) {
-            throw new CorruptDataException("Unsupported compression flags: 0x"
-                + Integer.toHexString(flags & 0xFF));
+                + " (expected " + FORMAT_VERSION + " or " + FORMAT_VERSION_LEGACY + ")");
         }
 
         boolean compressed = (flags & FLAG_COMPRESSED) != 0;
@@ -212,20 +260,43 @@ public class CompressionUtil {
                     + originalLength + " > " + maxRawBytes + " bytes");
             }
 
+            // Determine algorithm: legacy v1 always LZ4; v2 uses flag bits
+            byte algoBits;
+            if (version == FORMAT_VERSION_LEGACY) {
+                algoBits = FLAG_ALGORITHM_LZ4;
+            } else {
+                algoBits = (byte) (flags & FLAG_ALGORITHM_MASK);
+            }
+
             byte[] restored = new byte[originalLength];
-            // Decompress directly from wrappedData[6..] — no intermediate copy.
-            try {
-                decompressor.decompress(wrappedData, 6, restored, 0, originalLength);
-            } catch (LZ4Exception e) {
-                throw new CorruptDataException(
-                    "LZ4 decompression failed (declared length=" + originalLength
-                        + ", available=" + (wrappedData.length - 6) + "): " + e.getMessage(), e);
-            } catch (ArrayIndexOutOfBoundsException e) {
-                // LZ4 fast decompressor reads exactly originalLength; a
-                // truncated/corrupt source can still throw here.
-                throw new CorruptDataException(
-                    "LZ4 source truncated (declared length=" + originalLength
-                        + ", available=" + (wrappedData.length - 6) + "): " + e.getMessage(), e);
+
+            if (algoBits == FLAG_ALGORITHM_ZSTD) {
+                try {
+                    int decompressed = Zstd.decompress(restored, wrappedData,
+                        6, wrappedData.length - 6, originalLength);
+                    if (decompressed != originalLength) {
+                        throw new CorruptDataException(
+                            "ZSTD decompression size mismatch (expected=" + originalLength
+                                + ", actual=" + decompressed + ")");
+                    }
+                } catch (ZstdException e) {
+                    throw new CorruptDataException(
+                        "ZSTD decompression failed (declared length=" + originalLength
+                            + ", available=" + (wrappedData.length - 6) + "): " + e.getMessage(), e);
+                }
+            } else {
+                // LZ4 (default)
+                try {
+                    lz4Decompressor.decompress(wrappedData, 6, restored, 0, originalLength);
+                } catch (LZ4Exception e) {
+                    throw new CorruptDataException(
+                        "LZ4 decompression failed (declared length=" + originalLength
+                            + ", available=" + (wrappedData.length - 6) + "): " + e.getMessage(), e);
+                } catch (ArrayIndexOutOfBoundsException e) {
+                    throw new CorruptDataException(
+                        "LZ4 source truncated (declared length=" + originalLength
+                            + ", available=" + (wrappedData.length - 6) + "): " + e.getMessage(), e);
+                }
             }
             return restored;
         } else {
@@ -234,8 +305,6 @@ public class CompressionUtil {
                 throw new CorruptDataException("Raw payload exceeds limit: "
                     + rawLength + " > " + maxRawBytes + " bytes");
             }
-            // Uncompressed path: still need a copy because callers may mutate
-            // the returned array, but it's a single allocation.
             byte[] result = new byte[wrappedData.length - 2];
             System.arraycopy(wrappedData, 2, result, 0, result.length);
             return result;
@@ -243,7 +312,7 @@ public class CompressionUtil {
     }
 
     /**
-     * Returns the format version byte.
+     * Returns the current format version byte.
      */
     public static byte getFormatVersion() {
         return FORMAT_VERSION;

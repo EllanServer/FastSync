@@ -37,7 +37,7 @@ import static org.jooq.impl.DSL.using;
  * equivalent. Each operation borrows a single connection from HikariCP and wraps
  * it in a per-call {@code DSLContext} via {@code DSL.using(connection, SQLDialect.MYSQL)}.
  */
-public class DatabaseManager {
+public class DatabaseManager implements DatabaseBackend {
 
     // ---- jOOQ table/column references (no code generation) ----
     // Column names are prefix-independent; only the table name carries the

@@ -68,6 +68,7 @@ dependencies {
     // in shadowJar to avoid classpath conflicts with other plugins.
     implementation("com.zaxxer:HikariCP:7.1.0")
     implementation("at.yawk.lz4:lz4-java:1.11.0")
+    implementation("com.github.luben:zstd-jni:1.5.6-3")
     implementation("org.jooq:jooq:3.21.6")
     // jOOQ marks JAXB annotations as optional, but its public class files use
     // them. Keep the API on the compile classpath so clean -Xlint builds can
@@ -119,6 +120,7 @@ dependencies {
     testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
     testImplementation("com.zaxxer:HikariCP:7.1.0")
     testImplementation("at.yawk.lz4:lz4-java:1.11.0")
+    testImplementation("com.github.luben:zstd-jni:1.5.6-3")
     testImplementation("com.mysql:mysql-connector-j:9.7.0")
     testImplementation("org.redisson:redisson:4.6.1")
     testImplementation("org.jooq:jooq:3.21.6")
@@ -288,6 +290,7 @@ tasks.shadowJar {
     // io.r2dbc is intentionally NOT relocated — see comment above.
     relocate("com.zaxxer.hikari", "com.fastsync.libs.hikari")
     relocate("net.jpountz", "com.fastsync.libs.lz4")
+    relocate("com.github.luben", "com.fastsync.libs.zstd")
     relocate("org.jooq", "com.fastsync.libs.jooq")
     relocate("com.github.benmanes.caffeine", "com.fastsync.libs.caffeine")
 

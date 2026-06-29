@@ -3,7 +3,9 @@ package com.fastsync.i18n;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
@@ -55,8 +57,10 @@ public class MessageManager {
         PlainTextComponentSerializer.plainText();
 
     private final Map<String, String> messages = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, String>> localeOverrides = new ConcurrentHashMap<>();
     private final Logger logger;
     private final String language;
+    private final JavaPlugin plugin;
 
     /**
      * Create and initialize the message manager.
@@ -66,6 +70,7 @@ public class MessageManager {
      * @param language the language code (e.g. "en", "zh_CN")
      */
     public MessageManager(JavaPlugin plugin, Logger logger, String language) {
+        this.plugin = plugin;
         this.logger = logger;
         this.language = (language == null || language.isBlank()) ? "en" : language;
 
@@ -114,6 +119,37 @@ public class MessageManager {
      */
     public Component component(String key, Object... args) {
         return MINI_MESSAGE.deserialize(raw(key, args));
+    }
+
+    /**
+     * Get a message as an Adventure Component, using the recipient's locale
+     * if available. Falls back to the configured global language.
+     *
+     * <p>For {@link Player} recipients, this method attempts to use the player's
+     * client locale (e.g. "zh_CN", "en_US") by loading the corresponding
+     * {@code messages_<locale>.yml} resource. If no matching resource exists,
+     * it falls back to the global language.
+     *
+     * @param recipient the message recipient (Player or CommandSender)
+     * @param key       the message key
+     * @param args      placeholder values
+     * @return the deserialized Component in the recipient's locale
+     */
+    public Component component(CommandSender recipient, String key, Object... args) {
+        if (recipient instanceof Player player) {
+            Map<String, String> localeMessages = getLocaleMessages(player);
+            String template = localeMessages.get(key);
+            if (template == null) {
+                template = messages.get(key);
+            }
+            if (template == null) {
+                template = key;
+            }
+            String text = args.length == 0 ? template : format(template, args);
+            return MINI_MESSAGE.deserialize(text);
+        }
+        // Non-player senders (console, command block) use the global language
+        return component(key, args);
     }
 
     /**
@@ -169,6 +205,83 @@ public class MessageManager {
     }
 
     // ==================== Internal ====================
+
+    /**
+     * Get the message map for a player's locale, loading it lazily.
+     * Falls back to the global messages map if no locale-specific resource exists.
+     */
+    private Map<String, String> getLocaleMessages(Player player) {
+        String locale;
+        try {
+            // Paper API: player.locale() returns a Locale object
+            locale = player.locale().toString();
+        } catch (Throwable t) {
+            // Pre-1.12 or non-Paper: fall back to global language
+            return messages;
+        }
+        if (locale == null || locale.isBlank() || locale.equals(language)) {
+            return messages;
+        }
+
+        // Check if we already loaded this locale
+        return localeOverrides.computeIfAbsent(locale, loc -> {
+            String resourceFile = "messages_" + loc + ".yml";
+            if (plugin.getResource(resourceFile) == null) {
+                // Try short form (e.g. "zh" instead of "zh_CN")
+                String shortLocale = loc.contains("_") ? loc.substring(0, loc.indexOf('_')) : loc;
+                resourceFile = "messages_" + shortLocale + ".yml";
+                if (plugin.getResource(resourceFile) == null) {
+                    // No locale-specific resource — use global messages
+                    return messages;
+                }
+            }
+
+            // Load locale-specific messages on top of English fallback
+            Map<String, String> localeMessages = new ConcurrentHashMap<>();
+            // Start with English as fallback
+            flattenYamlTo("", loadYamlResource("messages_en.yml"), localeMessages);
+            // Override with locale-specific
+            flattenYamlTo("", loadYamlResource(resourceFile), localeMessages);
+            return localeMessages;
+        });
+    }
+
+    private YamlConfiguration loadYamlResource(String resourceFile) {
+        try (InputStream in = plugin.getResource(resourceFile);
+             InputStreamReader reader = in != null
+             ? new InputStreamReader(in, StandardCharsets.UTF_8) : null) {
+            if (reader == null) {
+                return new YamlConfiguration();
+            }
+            return YamlConfiguration.loadConfiguration(reader);
+        } catch (Exception e) {
+            logger.log(Level.WARNING, "[i18n] Failed to load resource: " + resourceFile, e);
+            return new YamlConfiguration();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void flattenYamlTo(String prefix, YamlConfiguration yaml, Map<String, String> target) {
+        for (String key : yaml.getKeys(false)) {
+            String fullKey = prefix.isEmpty() ? key : prefix + "." + key;
+            Object value = yaml.get(key);
+            if (value instanceof org.bukkit.configuration.ConfigurationSection section) {
+                for (String subKey : section.getKeys(false)) {
+                    String subFullKey = fullKey + "." + subKey;
+                    Object subValue = section.get(subKey);
+                    if (subValue instanceof org.bukkit.configuration.ConfigurationSection) {
+                        YamlConfiguration subYaml = new YamlConfiguration();
+                        subYaml.set("", subValue);
+                        flattenYamlTo(fullKey, subYaml, target);
+                    } else {
+                        target.put(subFullKey, String.valueOf(subValue));
+                    }
+                }
+            } else {
+                target.put(fullKey, String.valueOf(value));
+            }
+        }
+    }
 
     private void loadFromResource(JavaPlugin plugin, String resourceFile) {
         try (InputStream in = plugin.getResource(resourceFile);

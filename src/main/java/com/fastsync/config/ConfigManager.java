@@ -163,6 +163,7 @@ public class ConfigManager {
     private boolean compressionEnabled;
     private String compressionType;
     private int compressionMinSize;
+    private int zstdLevel = 3;
 
     // Serialization
     private byte formatVersion;
@@ -212,6 +213,8 @@ public class ConfigManager {
         this.logger = Logger.getLogger("FastSync");
     }
 
+    private static final int CURRENT_CONFIG_VERSION = 2;
+
     public void load() {
         // Copy config.yml from the JAR if it does not already exist (Bukkit handles this)
         plugin.saveDefaultConfig();
@@ -229,6 +232,13 @@ public class ConfigManager {
             throw new RuntimeException("Failed to parse config.yml with sparrow-yaml: "
                 + e.getMessage(), e);
         }
+
+        // Config version migration — handle renamed/removed/added keys
+        int configVersion = loaded.getInt("config_version", 1);
+        if (configVersion < CURRENT_CONFIG_VERSION) {
+            migrateConfig(loaded, configVersion, configFile);
+        }
+
         this.doc = loaded;
 
         assignValues(new SparrowConfigSource(loaded));
@@ -237,6 +247,49 @@ public class ConfigManager {
     public void reload() {
         // Re-read the config file (sparrow-yaml re-parses it inside load())
         load();
+    }
+
+    /**
+     * Migrate config from old version to current version.
+     * Handles renamed/removed/added keys between versions.
+     *
+     * @param doc           the loaded YAML document
+     * @param fromVersion   the current config version in the file
+     * @param configFile    the config file path (for saving)
+     */
+    private void migrateConfig(YamlDocument doc, int fromVersion, File configFile) {
+        plugin.getLogger().info("[Config] Migrating config from v" + fromVersion
+            + " to v" + CURRENT_CONFIG_VERSION);
+
+        // v1 → v2: Added config_version, language, zstd-level, compression type update
+        if (fromVersion < 2) {
+            // Ensure language key exists
+            if (doc.get("language") == null) {
+                doc.set("language", "en");
+            }
+            // Ensure compression.zstd-level exists
+            if (doc.get("compression.zstd-level") == null) {
+                doc.set("compression.zstd-level", 3);
+            }
+            // Update compression type comment if it still says "only LZ4"
+            String compType = doc.getString("compression.type", "LZ4");
+            if (compType == null || compType.isBlank()) {
+                doc.set("compression.type", "LZ4");
+            }
+        }
+
+        // Update config version
+        doc.set("config_version", CURRENT_CONFIG_VERSION);
+
+        // Save migrated config
+        try {
+            doc.save(configFile);
+            plugin.getLogger().info("[Config] Migration to v" + CURRENT_CONFIG_VERSION
+                + " completed successfully.");
+        } catch (IOException e) {
+            plugin.getLogger().warning("[Config] Failed to save migrated config: "
+                + e.getMessage() + " — using in-memory values.");
+        }
     }
 
     /**
@@ -655,6 +708,7 @@ public class ConfigManager {
         compressionEnabled = source.getBoolean("compression.enabled", true);
         compressionType = source.getString("compression.type", "LZ4");
         compressionMinSize = source.getInt("compression.min-size", 128);
+        zstdLevel = source.getInt("compression.zstd-level", 3);
 
         // Serialization
         formatVersion = (byte) source.getInt("serialization.format-version", 1);
@@ -666,6 +720,18 @@ public class ConfigManager {
         if (serializationMaxWrappedBytes <= 0) serializationMaxWrappedBytes = 5 * (1 << 19);
         com.fastsync.serialization.CompressionUtil.configureLimits(
             serializationMaxRawBytes, serializationMaxWrappedBytes);
+
+        // Configure compression algorithm
+        if (compressionEnabled) {
+            if (isZstdCompression()) {
+                com.fastsync.serialization.CompressionUtil.setAlgorithm(
+                    com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.ZSTD);
+                com.fastsync.serialization.CompressionUtil.setZstdLevel(zstdLevel);
+            } else {
+                com.fastsync.serialization.CompressionUtil.setAlgorithm(
+                    com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.LZ4);
+            }
+        }
 
         // Debug
         debug = source.getBoolean("debug", false);
@@ -809,6 +875,8 @@ public class ConfigManager {
     public boolean isCompressionEnabled() { return compressionEnabled; }
     public String getCompressionType() { return compressionType; }
     public int getCompressionMinSize() { return compressionMinSize; }
+    public int getZstdLevel() { return zstdLevel; }
+    public boolean isZstdCompression() { return "ZSTD".equalsIgnoreCase(compressionType); }
 
     public byte getFormatVersion() { return formatVersion; }
     public int getSerializationMaxRawBytes() { return serializationMaxRawBytes; }
