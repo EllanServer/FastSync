@@ -32,3 +32,7 @@ Thumbs.db
 target/
 *.bak
 build.gradle.kts.bak
+
+# Local Paper E2E artifacts
+e2e/plugins/
+e2e/tools/

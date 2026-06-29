@@ -19,14 +19,21 @@ Blob (~5-20KB).
 - New `persistComponentsOnly` fast path in `SyncManager.persistCollectedData`
 - Triggers when `component-storage.enabled=true` AND dirty mask has entries
   AND save kind is online (PERIODIC/DEATH/WORLD_SAVE, not QUIT)
+- Collects only dirty components on the Paper/Folia entity thread; unrelated
+  inventory, advancement, statistics, attribute and PDC APIs are not touched
 - Serializes only dirty components via `PlayerDataSerializer.serializeComponent`
-- Batch upserts in one transaction via `upsertComponentsBatch`
+- Successful DB hot path is two statements: fenced metadata CAS UPDATE +
+  batched component upsert (no DB-time SELECT or SELECT FOR UPDATE)
 - Updates `component_bitmap` to mark newly-migrated components
 - Clears dirty mask, returns `SaveResult`
-- Returns null on any failure → falls back to full Blob save transparently
+- Full-validation/all-dirty cycles deliberately refresh one full Blob instead
+  of writing all 15 component rows
+- Partial collections are fail-closed and can never fall back into a full-Blob write
 
 **Load path**:
 - After deserializing the full Blob, checks `component_bitmap`
+- Always honors a persisted non-zero bitmap even when new component writes are
+  disabled after restart/config rollback
 - If non-zero, batch-loads migrated components from `player_component`
 - Calls `PlayerDataSerializer.deserializeComponent` to overwrite the
   corresponding fields — result is freshest state = Blob base + overrides
@@ -86,6 +93,14 @@ The big win is on **active servers with mixed workloads**:
 - All failures fall back to full Blob save transparently
 - QUIT saves always use full Blob (atomic lock release required)
 - `validation-interval` still forces full saves every Nth cycle (phase 1 safety net)
+
+### Final hot-path shape
+
+- Dirty state uses one atomic CAS word per component (dirty flag + epoch),
+  eliminating both boxed snapshot epochs and the mark-vs-clear lost-update race
+- Normal one-component saves perform one component-specific entity-thread read,
+  one encode/compress/checksum, and one two-statement MySQL transaction
+- Failure classification performs an extra metadata SELECT only on the cold path
 
 ---
 

@@ -63,17 +63,17 @@
 
 ### 2.3 FoodData 内部 tick timer 未同步（P1-4）
 
-MC 1.21+ `FoodData` 新增字段：`foodTickTimer`、`starveTickTimer`、`lastFoodLevel`。Bukkit API 不暴露。跨服同步后这些 timer 重置为 0 — 玩家在 A 服饿了 30 秒即将扣血，跳到 B 服后 B 服 timer 从 0 重新计数 30 秒才扣血。轻微不公平但不会丢数据。
+Paper 1.21.11 / Mojang-mapped `FoodData` 使用一个内部 `tickTimer` 驱动自然回血与饥饿伤害；Bukkit API 不暴露它。跨服同步后 timer 重置为 0，会让下一次回血/饥饿伤害最多延后一个周期。轻微不公平但不会丢数据。
 
-**修复方向**：NMS 反射读写 `FoodData.foodTickTimer` 等字段。
+**修复方向**：通过 paperweight-userdev 的 Mojang mappings 读写 `FoodData.tickTimer`，并随 Paper 升级重新核对字段语义；不要沿用旧版本猜测的多 timer 字段名。
 
 **临时缓解**：文档说明 "food 同步不保留内部 tick timer"。这是 MC sync 插件通病，HuskSync / PlayerSync 等都有此问题。
 
-### 2.4 `ComponentDirtyMask.Component` ordinal 用作 bitmap 位（P2-2）
+### 2.4 `ComponentDirtyMask.Component` bitmap 位已显式固定（P2-2，已修复）
 
-`Component` 枚举顺序就是 `component_bitmap` 的位定义。如果将来在中间插入 `RECIPE_BOOK`，所有 ordinal 偏移，**DB 里旧的 component_bitmap 全错**。
+`Component` 现在通过构造参数显式声明 `storageBit`，数据库 bitmap 不再依赖 enum ordinal。重排 Java 枚举不会改变已有数据含义。
 
-**当前约束**：**只能在枚举末尾追加新 Component**，不能在中间插入。已有位定义：
+**当前约束**：新 Component 必须分配一个从未使用过的 storage bit，已有 bit 不能复用或改号。已有位定义：
 
 | Bit | Component | 加入版本 |
 |---|---|---|
@@ -94,7 +94,7 @@ MC 1.21+ `FoodData` 新增字段：`foodTickTimer`、`starveTickTimer`、`lastFo
 | 14 | LOCATION | Round 2 |
 | 15+ | (reserved) | — |
 
-**长期修复方向**：用 enum 显式编号（`INVENTORY(1), ENDER_CHEST(2), ...`），或用 String key 替代 bitmap。
+**实现**：`INVENTORY(0), ENDER_CHEST(1), ... LOCATION(14)`；写入与读取统一使用 `storageMask()`。
 
 ### 2.5 `verifyComponentOverlayCompleteness` 严格 fail-closed 的 GC race（P2-4）
 
@@ -115,7 +115,9 @@ MC 1.21+ `FoodData` 新增字段：`foodTickTimer`、`starveTickTimer`、`lastFo
 
 3. **Fail-closed 优于 fail-silent**。component 反序列化失败时，应该让整个 load 失败 + kick 玩家，而不是 silently 应用 baseline。`verifyComponentOverlayCompleteness` 就是这个原则的体现。
 
-4. **Clean-slate 优于 legacy compat**。FastSync 没有生产数据要兼容，所以对老格式的 payload 直接 throw 而不是静默 fallback。例如 `enderChestPresent` flag 缺失时 throw，而不是"假设 baseline 是对的"。
+4. **读取 persisted bitmap 不受当前开关控制**。`component-storage.enabled=false` 只能停止新组件写入；如果 DB bitmap 非零，load 仍必须 overlay，否则崩溃后关闭开关会回滚到旧 baseline。随后一次 full save 会清零 bitmap 并推进 generation。
+
+5. **Clean-slate 优于 legacy compat**。FastSync 没有生产数据要兼容，所以对老格式的 payload 直接 throw 而不是静默 fallback。例如 `enderChestPresent` flag 缺失时 throw，而不是"假设 baseline 是对的"。
 
 ### 3.2 修改 `serializeComponentFields` / `deserializeComponentFields`
 
@@ -138,13 +140,14 @@ MC 1.21+ `FoodData` 新增字段：`foodTickTimer`、`starveTickTimer`、`lastFo
 
 ### 3.4 修改 `DatabaseManager.upsertComponentsIfLockHeld`
 
-1. **必须用事务**。SELECT FOR UPDATE → 校验 → upsert component rows → UPDATE player_data metadata → commit。任何中途失败必须 rollback。
+1. **必须用事务**。当前热路径是带完整 CAS 条件的 `UPDATE player_data`（同时取得 InnoDB 行锁）→ batch upsert component rows → commit。任何中途失败必须 rollback；只有 CAS 失败的冷路径才额外 SELECT 元数据用于分类。
 2. **校验四元组**：`locked_by + fencing_token + lock_session_id + expected_version`。少一个都会让旧会话写入。
 3. **`expectedVersion` 检查是 STALE_VERSION rejection 的关键**。如果不检查，一个 stale component snapshot 会 bump version 并 mask 一个 still in flight 的 newer component save。
+4. **`expectedGeneration` 也是 CAS 条件**。组件行必须写入登录时读取、并随 full save 单调推进的 generation；不能在热路径重新猜测或裸查询后写入。
 
 ### 3.5 添加新 Component
 
-1. **追加到 `ComponentDirtyMask.Component` 枚举末尾**（不要中间插入，参见 §2.4）。
+1. **在 `ComponentDirtyMask.Component` 分配新的、从未使用过的 `storageBit`**（参见 §2.4）；枚举位置不再影响 DB，但 bit 编号永久稳定。
 2. **同步更新 `BASIC` 集合**（如果适用）。
 3. **同步更新 `serializeComponentFields` / `deserializeComponentFields`**。
 4. **同步更新 `isComponentSyncEnabled`**（在 SyncManager 里映射到 config 项）。
@@ -238,7 +241,15 @@ updated_at    BIGINT — 最后更新时间
 - **Java 21**（toolchain）
 - **Folia 兼容**（`folia-supported: true` in plugin.yml）
 
-### 6.2 1.21+ 已废弃但仍在用的 API（需要未来迁移）
+### 6.2 本轮源码对照基线（2026-06-29）
+
+- Paper 官方 `ver/1.21.11`，commit `c5eb0790f199da6c38d0a650e1e5cd5415b28185`
+- `CraftInventory#getStorageContents`：数组是新建的，但非空元素是 live NMS stack 的 `CraftItemStack` mirror；采集阶段必须在 entity thread clone 后再交给异步编码器
+- NMS `Inventory.save/load`：只处理 non-equipment `items`，load 先 clear；对应实现使用 `getStorageContents/setStorageContents`，armor/offhand 单独处理
+- NMS `FoodData`：1.21.11 是单个内部 `tickTimer`，不是旧审查笔记曾猜测的多个 food/starve timer
+- `ItemStack.serializeAsBytes`：经 `Bukkit.getUnsafe().serializeItem` 使用服务器 registry codec；FastSync 只在已脱离 live handle 的快照上异步调用
+
+### 6.3 1.21+ 已废弃但仍在用的 API（需要未来迁移）
 
 | API | 替代 | 状态 |
 |---|---|---|
@@ -249,7 +260,7 @@ updated_at    BIGINT — 最后更新时间
 | `AttributeModifier` 4-arg 构造器 | 5-arg 带 `EquipmentSlotGroup` | ⚠️ fallback 用于 legacy payload（#56） |
 | `Player.getHealth()` / `setMaxHealth()` | `Attribute.GENERIC_MAX_HEALTH` | ⚠️ 仍在用，1.22+ 可能废弃 |
 
-### 6.3 1.22+ 升级路径
+### 6.4 1.22+ 升级路径
 
 当 Paper 1.22 发布时，预期需要：
 1. 移除 `Attribute.values()` 的 legacy fallback（如果 Paper 完全删除）
@@ -289,4 +300,4 @@ updated_at    BIGINT — 最后更新时间
 
 ---
 
-**最后更新**：2026-06-28（PR #61 + 本 PR）
+**最后更新**：2026-06-29（component-storage final hot path + Paper 1.21.11 source audit）

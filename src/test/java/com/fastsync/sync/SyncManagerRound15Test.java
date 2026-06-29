@@ -323,6 +323,56 @@ class SyncManagerRound15Test {
 
     // ==================== Component Rejection Classification Tests ====================
 
+    @Test
+    void selectiveComponentCollectDoesNotReadUnrelatedPaperState() throws Exception {
+        UUID uuid = UUID.randomUUID();
+        org.bukkit.entity.Player player = mock(org.bukkit.entity.Player.class);
+        when(player.getUniqueId()).thenReturn(uuid);
+        when(player.isDead()).thenReturn(false);
+        when(player.getFoodLevel()).thenReturn(17);
+        when(player.getSaturation()).thenReturn(4.5F);
+        when(player.getExhaustion()).thenReturn(0.25F);
+        when(config.isSyncFood()).thenReturn(true);
+
+        com.fastsync.sync.dirty.ComponentDirtyMask mask =
+            new com.fastsync.sync.dirty.ComponentDirtyMask(5);
+        mask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FOOD);
+        var snapshot = mask.snapshotDirty(uuid);
+
+        Method method = SyncManager.class.getDeclaredMethod("collectPlayerData",
+            org.bukkit.entity.Player.class,
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.class);
+        method.setAccessible(true);
+        PlayerData data = (PlayerData) method.invoke(syncManager, player, snapshot);
+
+        assertTrue(data.isComponentSubset());
+        assertEquals(17, data.getFoodLevel());
+        assertEquals(4.5F, data.getSaturation());
+        assertNull(data.getInventory());
+        assertNull(data.getAdvancements(), "unrequested collections should not be allocated");
+        verify(player, never()).getInventory();
+        verify(player, never()).getEnderChest();
+        verify(player, never()).getActivePotionEffects();
+        verify(player, never()).getLocation();
+    }
+
+    @Test
+    void partialComponentCarrierCanNeverFallThroughToFullBlob() throws Exception {
+        UUID uuid = UUID.randomUUID();
+        PlayerData partial = PlayerData.forComponentSubset();
+        partial.setVersion(2);
+        partial.setFencingToken(3);
+        when(config.isComponentStorageEnabled()).thenReturn(false);
+
+        SyncManager.SaveResult result = invokePersistCollectedData(
+            uuid, partial, SyncManager.SaveKind.PERIODIC,
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
+
+        assertFalse(result.success());
+        verify(databaseManager, never()).saveDataKeepLockClearComponents(
+            any(), any(), anyLong(), anyLong(), anyLong(), any(), any());
+    }
+
     /**
      * Round 15 test: componentStaleVersionDoesNotFallbackFullBlob.
      *

@@ -110,7 +110,7 @@ class ComponentStorageChaosTest {
             player.componentVersions.merge(component, 1L, Long::sum);
             player.componentGenerations.put(component, player.componentGeneration);
             player.version++;
-            player.componentBitmap |= 1L; // INVENTORY = ordinal 0
+            player.componentBitmap |= 1L; // INVENTORY = stable storage bit 0
         }
         // If lock doesn't match, the save is rejected (no state change)
     }

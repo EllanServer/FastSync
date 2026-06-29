@@ -218,7 +218,7 @@ redis:
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `enabled` | `false` | 组件级写入（Phase 2，灰度前不要开） |
+| `enabled` | `false` | 组件级写入；已完成选择性采集与 fenced CAS 热路径，仍建议先灰度 |
 | `batch-size` | `15` | 每事务最大组件数 |
 
 ### 关闭超时 (`shutdown:`)
@@ -423,7 +423,7 @@ A: 插件已自动适配 Folia 区域调度器，无需额外配置。
 A: `plugins/FastSync/data/player-log/{uuid}.log`，每玩家独立 append-only 文件。可安全删除整个目录清理历史。
 
 **Q: component-storage 什么时候可以开？**
-A: 等 full Blob 路径在生产稳定后，再单独灰度组件存储。第一波生产建议关闭。
+A: 当前实现已做到脏组件选择性采集、两语句 fenced CAS 事务和全量校验回写 full Blob；建议先在预生产跑 Paper E2E + DB stress，再按节点灰度开启并观察冲突与 overlay 指标。
 
 ## 致谢
 
