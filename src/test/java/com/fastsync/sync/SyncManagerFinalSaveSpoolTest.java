@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.UUID;
 import java.util.logging.Logger;
 
@@ -58,6 +59,49 @@ class SyncManagerFinalSaveSpoolTest {
         assertEquals(12, record.expectedVersion());
         assertEquals(34, record.fencingToken());
         assertEquals("QUIT", record.saveKind());
+    }
+
+    @Test
+    void databaseFailureInFinalSavePathIsAutomaticallySpooled() throws Exception {
+        ConfigManager config = mock(ConfigManager.class);
+        when(config.getClusterId()).thenReturn("cluster-a");
+        when(config.getServerName()).thenReturn("server-a");
+        when(config.getCompressionMinSize()).thenReturn(0);
+        when(config.getLockTimeout()).thenReturn(60);
+
+        DatabaseManager database = mock(DatabaseManager.class);
+        when(database.saveDataAndReleaseLockClearComponents(
+                any(UUID.class), any(byte[].class), anyLong(), anyLong(), anyLong(),
+                eq("server-a"), eq("session-a")))
+            .thenThrow(new SQLException("database offline", "08006"));
+
+        SyncManager manager = new SyncManager(plugin(), config, database);
+        FinalSaveSpool spool = new FinalSaveSpool(
+            Logger.getLogger("final-save-spool-test"), tempDir, false, 10, 1_000_000, 7);
+        setField(manager, "finalSaveSpool", spool);
+
+        @SuppressWarnings("unchecked")
+        ConcurrentHashMap<UUID, String> sessions =
+            (ConcurrentHashMap<UUID, String>) getField(manager, "playerLockSessions");
+        UUID uuid = UUID.randomUUID();
+        sessions.put(uuid, "session-a");
+
+        PlayerData data = new PlayerData();
+        data.setVersion(12);
+        data.setFencingToken(34);
+
+        SyncManager.SaveResult result = manager.persistFinalSaveWithSpool(
+            uuid, data, SyncManager.SaveKind.QUIT,
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY,
+            "integration test failure");
+
+        assertFalse(result.success());
+        assertEquals(SyncManager.SaveFailureReason.DB_UNAVAILABLE, result.failureReason());
+        assertEquals(1, spool.getPendingCount());
+        FinalSaveSpoolRecord record = spool.read(spool.listPending(1).getFirst());
+        assertEquals(12, record.expectedVersion());
+        assertEquals(34, record.fencingToken());
+        assertEquals("session-a", record.lockSessionId());
     }
 
     @Test

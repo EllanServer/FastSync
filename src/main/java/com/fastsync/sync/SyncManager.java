@@ -256,38 +256,19 @@ public class SyncManager {
     private static final java.util.Map<org.bukkit.inventory.EquipmentSlotGroup, byte[]>
         SLOT_GROUP_BYTES_CACHE = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
-    // P0 (issue #63): Attribute.MAX_HEALTH is a deprecated legacy field on
-    // Paper 1.21+ (Attribute is no longer an enum). Resolve once via the
-    // Registry API with a legacy fallback so we don't crash on Paper 1.22+
-    // when the field is removed. Initialized lazily to avoid class-load order
-    // issues (Registry.ATTRIBUTE may not be populated during plugin class init).
+    // Paper 1.21.11 registry entry, resolved lazily to avoid class-load order
+    // issues during plugin construction.
     private static volatile Attribute MAX_HEALTH_ATTR;
     private static Attribute loadMaxHealthAttribute() {
         Attribute cached = MAX_HEALTH_ATTR;
         if (cached != null) return cached;
-        try {
-            Attribute resolved = org.bukkit.Registry.ATTRIBUTE.get(
-                org.bukkit.NamespacedKey.minecraft("max_health"));
-            if (resolved != null) {
-                MAX_HEALTH_ATTR = resolved;
-                return resolved;
-            }
-        } catch (Throwable ignored) {
-            // Pre-1.21 Paper — Registry.ATTRIBUTE may not exist or key may not resolve.
+        Attribute resolved = org.bukkit.Registry.ATTRIBUTE.get(
+            org.bukkit.NamespacedKey.minecraft("max_health"));
+        if (resolved == null) {
+            throw new IllegalStateException("Paper attribute minecraft:max_health is unavailable");
         }
-        // Legacy fallback: Attribute.MAX_HEALTH static field (deprecated but
-        // still present on Paper 1.21.x). On Paper 1.22+ when this field is
-        // removed, the catch above is the only path — and if Registry.ATTRIBUTE
-        // also doesn't have it, the plugin will fail at apply time with NPE.
-        // That's an acceptable fail-closed: the operator sees the error and
-        // files a bug rather than silent data corruption.
-        try {
-            Attribute legacy = Attribute.MAX_HEALTH;
-            MAX_HEALTH_ATTR = legacy;
-            return legacy;
-        } catch (NoSuchFieldError | Exception ignored) {
-            return null;
-        }
+        MAX_HEALTH_ATTR = resolved;
+        return resolved;
     }
 
     // Pre-grouped statistic registries (avoids Statistic.values() + type check on every save).
@@ -909,18 +890,21 @@ public class SyncManager {
 
         long startTime = config.isLogTiming() ? System.nanoTime() : 0;
         try {
-        // Clear current state to prevent duplication
+        // Greenfield payloads fully replace enabled components below. Avoid
+        // clearing complete payloads first: CraftInventoryPlayer's
+        // setStorageContents/setArmorContents implementations already walk and
+        // replace every owned slot, so a pre-clear would double slot writes and
+        // client update packets. Keep clear-before-apply only as a fail-closed
+        // behavior for an unexpectedly absent component.
         if (config.isClearBeforeApply()) {
             if (config.isSyncInventory()) {
-                player.getInventory().clear();
-                player.getInventory().setArmorContents(null);
-                player.getInventory().setItemInOffHand(null);
+                if (data.getInventory() == null) player.getInventory().clear();
+                if (data.getArmor() == null) player.getInventory().setArmorContents(null);
             }
-            if (config.isSyncEnderChest()) {
+            if (config.isSyncEnderChest() && data.getEnderChest() == null) {
                 player.getEnderChest().clear();
             }
-            if (config.isSyncPotionEffects()) {
-                // Avoid allocating an ArrayList copy when there are no effects.
+            if (config.isSyncPotionEffects() && data.getPotionEffects() == null) {
                 java.util.Collection<PotionEffect> active = player.getActivePotionEffects();
                 if (!active.isEmpty()) {
                     for (PotionEffect effect : active) {
@@ -932,7 +916,7 @@ public class SyncManager {
 
         // Inventory
         if (config.isSyncInventory() && data.getInventory() != null) {
-            setInventoryContents(player, data.getInventory());
+            setInventoryContents(player.getInventory(), data.getInventory());
         }
 
         // Armor
@@ -950,31 +934,34 @@ public class SyncManager {
         // came from a full Blob that did not contain an offhand field.
         //
         // The component-storage path's offhandPresent flag (see PlayerDataSerializer)
-        // distinguishes "explicitly empty" from "legacy/no data" at serialize time;
-        // here we just apply whatever data.getOffhand() returns, including null.
+        // makes the field mandatory in the greenfield format; apply its value,
+        // including null, directly.
         if (config.isSyncInventory()) {
             player.getInventory().setItemInOffHand(data.getOffhand());
         }
 
         // Ender chest
         if (config.isSyncEnderChest() && data.getEnderChest() != null) {
-            setEnderChestContents(player, data.getEnderChest());
+            setEnderChestContents(player.getEnderChest(), data.getEnderChest());
+        }
+
+        // Restore attributes before health. Minecraft validates setHealth
+        // against the effective max-health value (base + modifiers), so all
+        // saved modifiers must be present before health is clamped/applied.
+        if (config.isSyncAttributes() && data.getAttributes() != null) {
+            applyAttributes(player, data);
         }
 
         // Health
         if (config.isSyncHealth()) {
             double targetMaxHealth = data.getMaxHealth();
-            try {
-                Attribute maxHealthAttr = loadMaxHealthAttribute();
-                if (maxHealthAttr != null) {
-                    AttributeInstance maxHealth = player.getAttribute(maxHealthAttr);
-                    if (maxHealth != null && data.getMaxHealth() > 0) {
-                        maxHealth.setBaseValue(data.getMaxHealth());
-                        targetMaxHealth = maxHealth.getValue();
-                    }
-                }
-            } catch (Exception ignored) {
-                // Attribute may be unavailable on an incompatible server build.
+            AttributeInstance maxHealth = player.getAttribute(loadMaxHealthAttribute());
+            if (maxHealth == null) {
+                throw new IllegalStateException("Player has no minecraft:max_health attribute instance");
+            }
+            if (data.getMaxHealth() > 0) {
+                maxHealth.setBaseValue(data.getMaxHealth());
+                targetMaxHealth = maxHealth.getValue();
             }
             double health = Math.min(data.getHealth(), targetMaxHealth);
             if (health > 0) {
@@ -1053,11 +1040,6 @@ public class SyncManager {
         // Statistics
         if (config.isSyncStatistics() && data.getStatistics() != null) {
             applyStatistics(player, data);
-        }
-
-        // Attributes
-        if (config.isSyncAttributes() && data.getAttributes() != null) {
-            applyAttributes(player, data);
         }
 
         // Persistent Data Container (via strategy)
@@ -1276,7 +1258,10 @@ public class SyncManager {
                 // lock was acquired, fail the CAS, and release the lock
                 // without saving — losing the player's final state.
                 refreshVersionAndFencingToken(uuid, data);
-                persistCollectedData(uuid, data, SaveKind.QUIT, com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
+                persistFinalSaveWithSpool(
+                    uuid, data, SaveKind.QUIT,
+                    com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY,
+                    "asynchronous quit save failed");
             } finally {
                 saveLock.unlock();
                 // Do NOT remove lock from map — prevents lock-object split if
@@ -1343,7 +1328,10 @@ public class SyncManager {
             saveLock.lock();
             try {
                 refreshVersionAndFencingToken(uuid, data);
-                persistCollectedData(uuid, data, SaveKind.QUIT, com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
+                persistFinalSaveWithSpool(
+                    uuid, data, SaveKind.QUIT,
+                    com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY,
+                    "synchronous queue-full quit fallback failed");
             } finally {
                 saveLock.unlock();
                 playerVersions.remove(uuid);
@@ -1438,7 +1426,10 @@ public class SyncManager {
             // Refresh version/fencingToken after acquiring lock — same rationale
             // as the async QUIT path: an in-flight save may have advanced the version.
             refreshVersionAndFencingToken(uuid, data);
-            persistCollectedData(uuid, data, SaveKind.QUIT, com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
+            persistFinalSaveWithSpool(
+                uuid, data, SaveKind.QUIT,
+                com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY,
+                "synchronous retired-entity quit save failed");
         } finally {
             saveLock.unlock();
             playerVersions.remove(uuid);
@@ -1587,23 +1578,30 @@ public class SyncManager {
         // All basic fields are now gated by config checks — disabling sync items
         // genuinely reduces serialization cost, NBT size, and DB write size.
         if (config.isSyncInventory()) {
-            data.setInventory(player.getInventory().getContents());
-            data.setArmor(player.getInventory().getArmorContents());
-            org.bukkit.inventory.ItemStack offhand = player.getInventory().getItemInOffHand();
+            // Armor and offhand are persisted separately below. Collect only
+            // storage slots here so the payload matches setStorageContents()
+            // exactly, rather than the all-contents view that also contains
+            // equipment slots. This also avoids serializing duplicates.
+            org.bukkit.inventory.PlayerInventory inventory = player.getInventory();
+            data.setInventory(inventory.getStorageContents());
+            data.setArmor(inventory.getArmorContents());
+            org.bukkit.inventory.ItemStack offhand = inventory.getItemInOffHand();
             data.setOffhand(offhand != null && offhand.getType().isAir() ? null : offhand);
         }
 
         // Ender chest
         if (config.isSyncEnderChest()) {
-            data.setEnderChest(player.getEnderChest().getContents());
+            data.setEnderChest(player.getEnderChest().getStorageContents());
         }
 
         // Vitals
         if (config.isSyncHealth()) {
-            // Use Attribute API (not deprecated getMaxHealth()) to get max health.
-            Attribute resolvedAttr = loadMaxHealthAttribute();
-            AttributeInstance maxHealthAttr = resolvedAttr != null ? player.getAttribute(resolvedAttr) : null;
-            double maxHealth = maxHealthAttr != null ? maxHealthAttr.getBaseValue() : player.getMaxHealth();
+            AttributeInstance maxHealthAttr = player.getAttribute(loadMaxHealthAttribute());
+            if (maxHealthAttr == null) {
+                throw new IllegalStateException("Player has no minecraft:max_health attribute instance");
+            }
+            double baseMaxHealth = maxHealthAttr.getBaseValue();
+            double effectiveMaxHealth = maxHealthAttr.getValue();
             double currentHealth = player.getHealth();
             // P1 (issue #60): when a player is dead (health <= 0) at collect
             // time — e.g. they died and immediately quit before respawn —
@@ -1622,8 +1620,8 @@ public class SyncManager {
             // against the (theoretical) case where health <= 0 but isDead()
             // returns false (e.g. plugin-managed fake death).
             boolean dead = player.isDead() || currentHealth <= 0;
-            data.setHealth(dead ? maxHealth : currentHealth);
-            data.setMaxHealth(maxHealth);
+            data.setHealth(healthForSave(dead, currentHealth, effectiveMaxHealth));
+            data.setMaxHealth(baseMaxHealth);
         }
         if (config.isSyncFood()) {
             data.setFoodLevel(player.getFoodLevel());
@@ -1826,6 +1824,11 @@ public class SyncManager {
         }
     }
 
+    /** Minecraft respawns dead players at the effective max-health value. */
+    static double healthForSave(boolean dead, double currentHealth, double effectiveMaxHealth) {
+        return dead ? effectiveMaxHealth : currentHealth;
+    }
+
     private void collectStatistics(Player player, PlayerData data) {
         ensureRegistryCache();
         try {
@@ -1866,14 +1869,7 @@ public class SyncManager {
             // after FastSync onEnable are picked up.
             if (cachedAttributes == null) {
                 java.util.List<Attribute> list = new java.util.ArrayList<>();
-                try {
-                    org.bukkit.Registry.ATTRIBUTE.forEach(list::add);
-                } catch (NoSuchFieldError | Exception ignored) {
-                    // Pre-1.21 fallback — Attribute was an enum then.
-                    // Safe to use values() on legacy versions.
-                    list.clear();
-                    for (Attribute a : Attribute.values()) list.add(a);
-                }
+                org.bukkit.Registry.ATTRIBUTE.forEach(list::add);
                 cachedAttributes = list.toArray(new Attribute[0]);
             }
             for (Attribute attr : cachedAttributes) {
@@ -2349,7 +2345,11 @@ public class SyncManager {
                                     // an in-flight save may have advanced the version
                                     // while we waited for the lock.
                                     refreshVersionAndFencingToken(uuid, data);
-                                    result = persistCollectedData(uuid, data, kind, preSaveSnapshot);
+                                    result = kind.releaseLock
+                                        ? persistFinalSaveWithSpool(
+                                            uuid, data, kind, preSaveSnapshot,
+                                            kind + " asynchronous save failed")
+                                        : persistCollectedData(uuid, data, kind, preSaveSnapshot);
                                 } finally {
                                     saveLock.unlock();
                                 }
@@ -2384,7 +2384,9 @@ public class SyncManager {
                                 saveLock.lock();
                                 try {
                                     refreshVersionAndFencingToken(uuid, data);
-                                    result = persistCollectedData(uuid, data, kind, preSaveSnapshot);
+                                    result = persistFinalSaveWithSpool(
+                                        uuid, data, kind, preSaveSnapshot,
+                                        kind + " synchronous queue-full fallback failed");
                                 } finally {
                                     saveLock.unlock();
                                 }
@@ -4029,7 +4031,7 @@ public class SyncManager {
                 }
             }
             // Online save: keep lock on error — will retry on next periodic save or quit
-            return SaveResult.error(e.getMessage(), SaveFailureReason.DB_UNAVAILABLE);
+            return SaveResult.error(e.getMessage(), classifySaveException(e));
         }
     }
 
@@ -4092,41 +4094,25 @@ public class SyncManager {
      * <p>Null {@code contents} is a no-op — the caller is expected to have
      * cleared the inventory separately (e.g. via clear-before-apply) if needed.
      */
-    private void setInventoryContents(Player player, org.bukkit.inventory.ItemStack[] contents) {
+    private void setInventoryContents(
+            org.bukkit.inventory.PlayerInventory inventory,
+            org.bukkit.inventory.ItemStack[] contents) {
         if (contents == null) return;
-        // Performance: use setStorageContents for bulk write instead of per-slot
-        // setItem() calls. This reduces N inventory-update events to a single
-        // batch update, cutting apply latency significantly on login.
-        // Full-replace semantics (P0 issue #57) are preserved: if the saved
-        // array is shorter than the inventory, we pad with nulls first.
-        org.bukkit.inventory.ItemStack[] current = player.getInventory().getContents();
-        if (contents.length >= current.length) {
-            // Saved array covers all slots — direct bulk write.
-            player.getInventory().setStorageContents(contents);
-        } else {
-            // Saved array is shorter — pad to full length to clear trailing slots.
-            org.bukkit.inventory.ItemStack[] padded = new org.bukkit.inventory.ItemStack[current.length];
-            System.arraycopy(contents, 0, padded, 0, contents.length);
-            // Remaining slots default to null (full-replace semantics).
-            player.getInventory().setStorageContents(padded);
-        }
+        // Greenfield format stores exactly NMS non-equipment items. Paper's
+        // storage-specific API keeps armor/offhand out of this write and clears
+        // every storage slot; pass through without a compatibility copy.
+        inventory.setStorageContents(contents);
     }
 
     /**
      * Apply the saved ender chest contents with full-replace semantics.
      * See {@link #setInventoryContents} for the P0 (issue #57) rationale.
      */
-    private void setEnderChestContents(Player player, org.bukkit.inventory.ItemStack[] contents) {
+    private void setEnderChestContents(
+            org.bukkit.inventory.Inventory enderChest,
+            org.bukkit.inventory.ItemStack[] contents) {
         if (contents == null) return;
-        // Performance: use setStorageContents for bulk write (see setInventoryContents).
-        org.bukkit.inventory.ItemStack[] current = player.getEnderChest().getContents();
-        if (contents.length >= current.length) {
-            player.getEnderChest().setStorageContents(contents);
-        } else {
-            org.bukkit.inventory.ItemStack[] padded = new org.bukkit.inventory.ItemStack[current.length];
-            System.arraycopy(contents, 0, padded, 0, contents.length);
-            player.getEnderChest().setStorageContents(padded);
-        }
+        enderChest.setStorageContents(contents);
     }
 
     /**
@@ -4329,6 +4315,29 @@ public class SyncManager {
     }
     public String getFinalSaveSpoolLastError() {
         return finalSaveSpool != null ? finalSaveSpool.getLastError() : null;
+    }
+
+    /**
+     * Persist a final save and spool only failures that are safe to replay.
+     *
+     * <p>This wrapper is deliberately kept off the successful hot path beyond
+     * one result branch. Encoding the spool record happens only after a
+     * retryable failure, so normal quit/shutdown saves do not pay a second
+     * serialization cost.
+     */
+    SaveResult persistFinalSaveWithSpool(
+            UUID uuid, PlayerData data, SaveKind kind,
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot,
+            String detail) {
+        if (!kind.releaseLock) {
+            throw new IllegalArgumentException("persistFinalSaveWithSpool requires a final save kind");
+        }
+        SaveResult result = persistCollectedData(uuid, data, kind, preSaveSnapshot);
+        if (result.isRetryable()) {
+            spoolRetryableFinalSave(
+                uuid, data, kind, result, playerLockSessions.get(uuid), detail);
+        }
+        return result;
     }
 
     /**

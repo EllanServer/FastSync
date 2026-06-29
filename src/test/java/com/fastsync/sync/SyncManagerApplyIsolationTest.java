@@ -6,6 +6,9 @@ import com.fastsync.data.PlayerData;
 import com.fastsync.database.DatabaseManager;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.plugin.PluginManager;
 import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
@@ -50,6 +53,53 @@ class SyncManagerApplyIsolationTest {
         verify(player, never()).getEnderChest();
         verify(player, never()).getActivePotionEffects();
         verify(pluginManager).callEvent(any());
+        assertTrue(manager.isPlayerActive(uuid));
+    }
+
+    @Test
+    void completeGreenfieldPayloadIsNotPreCleared() throws Exception {
+        FastSync plugin = mock(FastSync.class);
+        when(plugin.getLogger()).thenReturn(Logger.getLogger("apply-no-double-clear-test"));
+        ConfigManager config = mock(ConfigManager.class);
+        when(config.isClearBeforeApply()).thenReturn(true);
+        when(config.isSyncInventory()).thenReturn(true);
+        when(config.isSyncEnderChest()).thenReturn(true);
+        when(config.isSyncPotionEffects()).thenReturn(true);
+
+        SyncManager manager = new SyncManager(plugin, config, mock(DatabaseManager.class));
+        Player player = mock(Player.class);
+        PlayerInventory inventory = mock(PlayerInventory.class);
+        Inventory enderChest = mock(Inventory.class);
+        UUID uuid = UUID.randomUUID();
+        when(player.getUniqueId()).thenReturn(uuid);
+        when(player.getInventory()).thenReturn(inventory);
+        when(player.getEnderChest()).thenReturn(enderChest);
+        when(player.getActivePotionEffects()).thenReturn(java.util.Set.of());
+
+        ItemStack[] storage = new ItemStack[36];
+        ItemStack[] armor = new ItemStack[4];
+        ItemStack[] ender = new ItemStack[27];
+        PlayerData data = new PlayerData();
+        data.setInventory(storage);
+        data.setArmor(armor);
+        data.setEnderChest(ender);
+        data.setVersion(4);
+        data.setFencingToken(8);
+        pendingData(manager).put(uuid, data);
+
+        PluginManager pluginManager = mock(PluginManager.class);
+        try (MockedStatic<Bukkit> bukkit = mockStatic(Bukkit.class)) {
+            bukkit.when(Bukkit::getPluginManager).thenReturn(pluginManager);
+            manager.applyPlayerData(player);
+        }
+
+        verify(inventory, never()).clear();
+        verify(enderChest, never()).clear();
+        verify(inventory).setStorageContents(same(storage));
+        verify(inventory).setArmorContents(same(armor));
+        verify(inventory).setItemInOffHand(null);
+        verify(enderChest).setStorageContents(same(ender));
+        verify(player, times(1)).getActivePotionEffects();
         assertTrue(manager.isPlayerActive(uuid));
     }
 
