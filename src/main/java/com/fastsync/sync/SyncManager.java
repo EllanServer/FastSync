@@ -1981,9 +1981,6 @@ public class SyncManager {
     record DeathState(int level, float progress, int totalExperience) {}
 
     private boolean fireSaveEvent(Player player, PlayerData data, SaveKind kind) {
-        if (FastSyncEvents.FastSyncSaveEvent.getHandlerList().getRegisteredListeners().length == 0) {
-            return true;
-        }
         FastSyncEvents.FastSyncSaveEvent event =
             new FastSyncEvents.FastSyncSaveEvent(player, data, kind.causeName);
         Bukkit.getPluginManager().callEvent(event);
