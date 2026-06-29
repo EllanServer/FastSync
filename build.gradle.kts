@@ -72,7 +72,7 @@ dependencies {
     // jOOQ marks JAXB annotations as optional, but its public class files use
     // them. Keep the API on the compile classpath so clean -Xlint builds can
     // inspect those annotations without emitting missing-class warnings.
-    compileOnly("jakarta.xml.bind:jakarta.xml.bind-api:4.0.2")
+    compileOnly("jakarta.xml.bind:jakarta.xml.bind-api:4.0.5")
     implementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
     // jOOQ 3.21 has a transitive dependency on io.r2dbc:r2dbc-spi (jOOQ's R2DBC
     // support). jOOQ's static initializer references io.r2dbc.spi.ConnectionFactory
