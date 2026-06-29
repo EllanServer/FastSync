@@ -76,17 +76,32 @@ public class PlayerData {
     private long version;
     private long fencingToken; // Kleppmann fencing token for stale-write defence
     private String saveCause; // disconnect, death, world_save, shutdown, api, etc.
+    // Runtime-only marker: this instance contains only a dirty component
+    // subset and must never be serialized as the authoritative full Blob.
+    private boolean componentSubset;
 
     public PlayerData() {
-        this.potionEffects = new ArrayList<>();
-        this.advancements = new HashMap<>();
-        this.statistics = new HashMap<>();
-        this.attributes = new ArrayList<>();
-        this.persistentDataContainer = new HashMap<>();
+        this(true);
+    }
+
+    private PlayerData(boolean initializeCollections) {
+        if (initializeCollections) {
+            this.potionEffects = new ArrayList<>();
+            this.advancements = new HashMap<>();
+            this.statistics = new HashMap<>();
+            this.attributes = new ArrayList<>();
+            this.persistentDataContainer = new HashMap<>();
+        }
         this.timestamp = System.currentTimeMillis();
         this.version = 0;
         this.fencingToken = 0;
         this.saveCause = "disconnect";
+        this.componentSubset = !initializeCollections;
+    }
+
+    /** Allocation-minimal carrier for a component-only save. */
+    public static PlayerData forComponentSubset() {
+        return new PlayerData(false);
     }
 
     // ==================== Getters & Setters ====================
@@ -191,6 +206,9 @@ public class PlayerData {
 
     public String getSaveCause() { return saveCause; }
     public void setSaveCause(String saveCause) { this.saveCause = saveCause; }
+
+    public boolean isComponentSubset() { return componentSubset; }
+    public void setComponentSubset(boolean componentSubset) { this.componentSubset = componentSubset; }
 
     // ==================== Inner Data Classes ====================
 

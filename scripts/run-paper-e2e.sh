@@ -4,7 +4,7 @@ set -euo pipefail
 # =============================================================================
 # FastSync Paper 端到端测试脚本
 # =============================================================================
-# 启动两套真实的 Paper 1.21.4 服务器，并通过 RCON 验证 FastSync 加载、
+# 启动两套真实的 Paper 1.21.11 服务器，并通过 RCON 验证 FastSync 加载、
 # 数据库连接和基础命令响应。需要本地安装 Docker + docker compose。
 #
 # 用法：
@@ -68,8 +68,11 @@ wait_for_log() {
 }
 
 echo "[4/5] Waiting for Paper servers to finish startup..."
-wait_for_log "fastsync-paper-a" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help\""
-wait_for_log "fastsync-paper-b" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help\""
+# A cold CI worker may need to download Paper, remap the server and resolve the
+# plugin libraries before world generation. Three minutes was too tight for two
+# simultaneous first boots; five minutes still fails promptly on a real hang.
+wait_for_log "fastsync-paper-a" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help\"" 300
+wait_for_log "fastsync-paper-b" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help\"" 300
 
 echo "[5/5] Running E2E verification..."
 "${SCRIPT_DIR}/e2e-verify.sh"

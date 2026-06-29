@@ -24,6 +24,18 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class ComponentDirtyMaskTest {
 
+    @Test
+    void storageBitsAreUniqueAndStable() {
+        long seen = 0L;
+        for (ComponentDirtyMask.Component component : ComponentDirtyMask.Component.values()) {
+            assertEquals(0L, seen & component.storageMask(),
+                "Duplicate storage bit for " + component);
+            seen |= component.storageMask();
+        }
+        assertEquals(0, ComponentDirtyMask.Component.INVENTORY.storageBit());
+        assertEquals(14, ComponentDirtyMask.Component.LOCATION.storageBit());
+    }
+
     private ComponentDirtyMask mask;
     private UUID player1;
     private UUID player2;

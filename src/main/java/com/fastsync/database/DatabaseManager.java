@@ -1122,7 +1122,7 @@ public class DatabaseManager {
      * Read the {@code component_bitmap} column for a player.
      *
      * <p>Each bit corresponds to one {@link com.fastsync.sync.dirty.ComponentDirtyMask.Component}
-     * (bit position = {@code Component.ordinal()}). A set bit means that
+     * (bit position = the component's stable {@code storageBit}). A set bit means that
      * component has a row in the {@code player_component} table at the current
      * generation and should be overlaid on top of the full Blob baseline.
      *
@@ -1181,6 +1181,11 @@ public class DatabaseManager {
         public static ComponentBatchResult rejected(String msg, ComponentRejectReason reason) {
             return new ComponentBatchResult(false, -1, -1, 0, 0, msg, reason);
         }
+        public static ComponentBatchResult rejected(String msg, ComponentRejectReason reason,
+                long actualVersion, long bitmap, long generation) {
+            return new ComponentBatchResult(false, actualVersion, actualVersion,
+                bitmap, generation, msg, reason);
+        }
         public static ComponentBatchResult success(long oldVersion, long newVersion,
                 long bitmap, long generation) {
             return new ComponentBatchResult(true, oldVersion, newVersion, bitmap, generation, null,
@@ -1220,6 +1225,8 @@ public class DatabaseManager {
         SESSION_MISMATCH,
         /** DB version advanced past the collected version — stale snapshot. Skip. */
         STALE_VERSION,
+        /** Cached component generation no longer matches the baseline. */
+        STALE_GENERATION,
         /** player_data metadata UPDATE affected 0 rows (lock lost mid-tx). Fatal. */
         METADATA_UPDATE_FAILED,
         /** SQL exception during the transaction. Retryable with backoff. */
@@ -1381,7 +1388,7 @@ public class DatabaseManager {
      * requirement that component saves bump the global version), so the version
      * returned in the result must be used to update the local playerVersions map.
      *
-     * @param dirtyBits  bitmask of dirty component ordinals (for bitmap update)
+     * @param dirtyBits  bitmask of stable component storage bits (for bitmap update)
      * @return ComponentBatchResult with new version/bitmap/generation, or rejected
      */
     public ComponentBatchResult upsertComponentsIfLockHeld(
@@ -1537,6 +1544,160 @@ public class DatabaseManager {
                 throw e;
             }
         }
+    }
+
+    /**
+     * Component upsert hot path with caller-known generation metadata.
+     *
+     * <p>The load path already reads {@code version}, {@code component_bitmap},
+     * and {@code component_generation} together. Reusing that session-local
+     * cursor lets this transaction replace the successful-path
+     * {@code SELECT ... FOR UPDATE} with one conditional metadata UPDATE. The
+     * UPDATE acquires the same InnoDB row lock and validates the complete CAS;
+     * component rows are then batched before commit. A rejection performs a
+     * diagnostic SELECT only on the cold failure path.
+     */
+    public ComponentBatchResult upsertComponentsIfLockHeld(
+            UUID uuid,
+            java.util.Map<String, byte[]> componentsWithData,
+            java.util.Map<String, Long> componentsWithChecksum,
+            String serverName,
+            long fencingToken,
+            String lockSessionId,
+            long expectedVersion,
+            long dirtyBits,
+            long expectedGeneration,
+            long expectedBitmap) throws SQLException {
+        requireLockSession(lockSessionId, "upsertComponentsIfLockHeld");
+        if (componentsWithData == null || componentsWithData.isEmpty()) {
+            return ComponentBatchResult.rejected("no components to upsert", ComponentRejectReason.NO_COMPONENTS);
+        }
+
+        try (Connection conn = dataSource.getConnection()) {
+            boolean oldAutoCommit = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                // Lock and advance the authoritative row first. No preliminary
+                // SELECT and no separate DB-time query are needed on success.
+                String updateSql = String.format(
+                    "UPDATE `%s` SET `version` = `version` + 1, " +
+                    "`component_bitmap` = `component_bitmap` | ?, " +
+                    "`locked_at` = (UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000), " +
+                    "`last_updated` = (UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000), `last_server` = ? " +
+                    "WHERE `cluster_id` = ? AND `uuid` = ? AND `version` = ? " +
+                    "AND `component_generation` = ? AND `locked_by` = ? " +
+                    "AND `fencing_token` = ? AND `lock_session_id` = ?",
+                    dataTable);
+
+                int updated;
+                try (var ps = conn.prepareStatement(updateSql)) {
+                    ps.setLong(1, dirtyBits);
+                    ps.setString(2, serverName);
+                    ps.setString(3, clusterId);
+                    ps.setString(4, uuid.toString());
+                    ps.setLong(5, expectedVersion);
+                    ps.setLong(6, expectedGeneration);
+                    ps.setString(7, serverName);
+                    ps.setLong(8, fencingToken);
+                    ps.setString(9, lockSessionId);
+                    updated = ps.executeUpdate();
+                }
+
+                if (updated <= 0) {
+                    ComponentBatchResult rejection = classifyComponentCasFailure(
+                        conn, uuid, serverName, fencingToken, lockSessionId,
+                        expectedVersion, expectedGeneration);
+                    conn.rollback();
+                    conn.setAutoCommit(oldAutoCommit);
+                    return rejection;
+                }
+
+                String upsertSql = String.format("""
+                    INSERT INTO `%s` (cluster_id, uuid, component, generation, data, version, checksum, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, (UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000))
+                    ON DUPLICATE KEY UPDATE
+                        generation = VALUES(generation),
+                        data = VALUES(data),
+                        version = version + 1,
+                        checksum = VALUES(checksum),
+                        updated_at = VALUES(updated_at)
+                    """, componentTable);
+
+                try (var ps = conn.prepareStatement(upsertSql)) {
+                    for (var entry : componentsWithData.entrySet()) {
+                        String name = entry.getKey();
+                        ps.setString(1, clusterId);
+                        ps.setString(2, uuid.toString());
+                        ps.setString(3, name);
+                        ps.setLong(4, expectedGeneration);
+                        ps.setBytes(5, entry.getValue());
+                        ps.setLong(6, componentsWithChecksum.getOrDefault(name, 0L));
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+
+                conn.commit();
+                conn.setAutoCommit(oldAutoCommit);
+                return ComponentBatchResult.success(
+                    expectedVersion, expectedVersion + 1,
+                    expectedBitmap | dirtyBits, expectedGeneration);
+            } catch (SQLException | RuntimeException e) {
+                try { conn.rollback(); } catch (SQLException ignored) {}
+                try { conn.setAutoCommit(oldAutoCommit); } catch (SQLException ignored) {}
+                throw e;
+            }
+        }
+    }
+
+    private ComponentBatchResult classifyComponentCasFailure(
+            Connection conn, UUID uuid, String serverName, long fencingToken,
+            String lockSessionId, long expectedVersion, long expectedGeneration) throws SQLException {
+        String sql = String.format(
+            "SELECT `version`, `fencing_token`, `locked_by`, `lock_session_id`, " +
+            "`component_bitmap`, `component_generation` " +
+            "FROM `%s` WHERE `cluster_id` = ? AND `uuid` = ?", dataTable);
+        try (var ps = conn.prepareStatement(sql)) {
+            ps.setString(1, clusterId);
+            ps.setString(2, uuid.toString());
+            try (var rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return ComponentBatchResult.rejected("missing player_data row",
+                        ComponentRejectReason.MISSING_BASELINE_ROW);
+                }
+                long actualFencing = rs.getLong("fencing_token");
+                String actualOwner = rs.getString("locked_by");
+                String actualSession = rs.getString("lock_session_id");
+                long actualVersion = rs.getLong("version");
+                long actualBitmap = rs.getLong("component_bitmap");
+                long actualGeneration = rs.getLong("component_generation");
+                if (!serverName.equals(actualOwner) || actualFencing != fencingToken) {
+                    return ComponentBatchResult.rejected("lock/fencing mismatch (expected: "
+                        + serverName + "/ft" + fencingToken + ", actual: "
+                        + actualOwner + "/ft" + actualFencing + ")",
+                        ComponentRejectReason.LOCK_OR_FENCING_MISMATCH);
+                }
+                if (!lockSessionId.equals(actualSession)) {
+                    return ComponentBatchResult.rejected("lock_session_id mismatch (expected: "
+                        + lockSessionId + ", actual: " + actualSession + ")",
+                        ComponentRejectReason.SESSION_MISMATCH);
+                }
+                if (actualVersion != expectedVersion) {
+                    return ComponentBatchResult.rejected("stale collected version (expected: "
+                        + expectedVersion + ", actual: " + actualVersion + ")",
+                        ComponentRejectReason.STALE_VERSION, actualVersion,
+                        actualBitmap, actualGeneration);
+                }
+                if (actualGeneration != expectedGeneration) {
+                    return ComponentBatchResult.rejected("stale component generation (expected: "
+                        + expectedGeneration + ", actual: " + actualGeneration + ")",
+                        ComponentRejectReason.STALE_GENERATION, actualVersion,
+                        actualBitmap, actualGeneration);
+                }
+            }
+        }
+        return ComponentBatchResult.rejected("component metadata CAS affected no rows",
+            ComponentRejectReason.METADATA_UPDATE_FAILED);
     }
 
     /**
