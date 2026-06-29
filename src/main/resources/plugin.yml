@@ -1,11 +1,11 @@
 name: FastSync
-version: '${project.version}'
+version: '${version}'
 main: com.fastsync.FastSync
 api-version: '1.21'
 folia-supported: true
 authors: [FastSync]
-description: High-performance cross-server player data synchronization using NBT byte[] serialization with LZ4 compression
-website: https://github.com/Arbousier1/FastSync
+description: High-performance cross-server player data synchronization using NBT byte[] serialization with LZ4/ZSTD compression
+website: https://github.com/EllanServer/FastSync
 
 libraries:
   - com.mysql:mysql-connector-j:9.7.0

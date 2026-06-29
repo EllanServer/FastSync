@@ -4,11 +4,13 @@ set -euo pipefail
 # =============================================================================
 # FastSync Paper 端到端测试脚本
 # =============================================================================
-# 启动两套真实的 Paper 1.21.11 服务器，并通过 RCON 验证 FastSync 加载、
+# 启动两套真实 Paper 服务器，并通过 RCON 验证 FastSync 加载、
 # 数据库连接和基础命令响应。需要本地安装 Docker + docker compose。
 #
 # 用法：
 #   ./scripts/run-paper-e2e.sh
+#   PAPER_VERSION=26.2 MINECRAFT_IMAGE=itzg/minecraft-server:java25 \
+#     ./scripts/run-paper-e2e.sh
 #
 # 退出状态：
 #   0 - 所有检查通过
@@ -21,6 +23,17 @@ COMPOSE_FILE="${PROJECT_ROOT}/docker-compose.paper-test.yml"
 PLUGINS_DIR="${PROJECT_ROOT}/e2e/plugins"
 
 cd "${PROJECT_ROOT}"
+
+e2e_succeeded=false
+cleanup_on_exit() {
+    local status=$?
+    if [[ "${e2e_succeeded}" != "true" ]]; then
+        echo "E2E did not complete; removing test containers and volumes..."
+        docker compose -f "${COMPOSE_FILE}" down -v || true
+    fi
+    return "${status}"
+}
+trap cleanup_on_exit EXIT
 
 echo "[1/5] Building FastSync plugin..."
 ./gradlew build --no-daemon -x test
@@ -76,6 +89,8 @@ wait_for_log "fastsync-paper-b" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help
 
 echo "[5/5] Running E2E verification..."
 "${SCRIPT_DIR}/e2e-verify.sh"
+
+e2e_succeeded=true
 
 echo ""
 echo "============================================================================="

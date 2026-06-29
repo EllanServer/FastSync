@@ -26,6 +26,8 @@ class CompressionUtilBoundsTest {
         CompressionUtil.configureLimits(
             CompressionUtil.DEFAULT_MAX_RAW_BYTES,
             CompressionUtil.DEFAULT_MAX_WRAPPED_BYTES);
+        CompressionUtil.setEnabled(true);
+        CompressionUtil.setAlgorithm(CompressionUtil.CompressionAlgorithm.LZ4);
     }
 
     @Test
@@ -110,6 +112,31 @@ class CompressionUtilBoundsTest {
     }
 
     @Test
+    void unwrapRejectsUnknownAlgorithmBits() {
+        byte[] wrapped = {
+            CompressionUtil.FORMAT_VERSION,
+            (byte) (CompressionUtil.FLAG_COMPRESSED | 0x04),
+            0, 0, 0, 1,
+            0
+        };
+        CorruptDataException ex = assertThrows(CorruptDataException.class,
+            () -> CompressionUtil.unwrap(wrapped));
+        assertTrue(ex.getMessage().contains("Unsupported compression algorithm"));
+    }
+
+    @Test
+    void unwrapRejectsAlgorithmOnUncompressedPayload() {
+        byte[] wrapped = {
+            CompressionUtil.FORMAT_VERSION,
+            CompressionUtil.FLAG_ALGORITHM_ZSTD,
+            1, 2, 3
+        };
+        CorruptDataException ex = assertThrows(CorruptDataException.class,
+            () -> CompressionUtil.unwrap(wrapped));
+        assertTrue(ex.getMessage().contains("uncompressed payload"));
+    }
+
+    @Test
     void uncompressedPayloadAlsoHonorsRawLimit() {
         CompressionUtil.configureLimits(4, 100);
         byte[] wrapped = {CompressionUtil.FORMAT_VERSION, 0, 1, 2, 3, 4, 5};
@@ -158,5 +185,32 @@ class CompressionUtilBoundsTest {
         byte[] wrapped = CompressionUtil.wrap(raw, 128);
         byte[] restored = CompressionUtil.unwrap(wrapped);
         assertArrayEquals(raw, restored);
+    }
+
+    @Test
+    void zstdRoundTripUsesV2AlgorithmFlag() {
+        byte[] raw = new byte[64 * 1024];
+        for (int i = 0; i < raw.length; i++) raw[i] = (byte) (i % 11);
+        CompressionUtil.setAlgorithm(CompressionUtil.CompressionAlgorithm.ZSTD);
+
+        byte[] wrapped = CompressionUtil.wrap(raw, 0);
+
+        assertEquals(CompressionUtil.FORMAT_VERSION, wrapped[0]);
+        assertEquals(CompressionUtil.FLAG_COMPRESSED | CompressionUtil.FLAG_ALGORITHM_ZSTD,
+            wrapped[1]);
+        assertArrayEquals(raw, CompressionUtil.unwrap(wrapped));
+    }
+
+    @Test
+    void disabledCompressionAlwaysWritesRawPayload() {
+        byte[] raw = new byte[4096];
+        CompressionUtil.setAlgorithm(CompressionUtil.CompressionAlgorithm.ZSTD);
+        CompressionUtil.setEnabled(false);
+
+        byte[] wrapped = CompressionUtil.wrap(raw, 0);
+
+        assertEquals(0, wrapped[1]);
+        assertEquals(raw.length + 2, wrapped.length);
+        assertArrayEquals(raw, CompressionUtil.unwrap(wrapped));
     }
 }

@@ -4,7 +4,7 @@
 
 # Configuration version (managed by the plugin — do not edit manually)
 # The plugin uses this to automatically migrate config when upgrading.
-config_version: 2
+config_version: 3
 
 # Unique server identifier (must be unique across all servers in the network)
 server-name: "survival-1"
@@ -235,7 +235,7 @@ sync:
     validation-interval: 5  # every 5th save = full checksum validation
 
   # ------------------------------------------------------------
-  # Component Storage (Phase 2)
+  # Component Storage
   # ------------------------------------------------------------
   # When enabled, dirty components are written to the player_component
   # table instead of rewriting the full player_data Blob on every save.
@@ -249,11 +249,11 @@ sync:
   # QUIT saves always write the full Blob (atomic lock release + version CAS).
   # Periodic/death/world_save saves use component storage when beneficial.
   #
-  # Disabled by default — opt-in until battle-tested in production.
-  # When disabled, behavior is identical to phase 1 (dirty tracking skips
-  # saves but writes full Blob when it does save).
+  # Enabled by default. Set false for an emergency rollback of new component
+  # writes; persisted bitmap rows are still read until the next full save
+  # safely folds them back into the baseline Blob.
   component-storage:
-    enabled: false
+    enabled: true
     batch-size: 15  # max components per transaction; full save if exceeded
 
   # ------------------------------------------------------------
@@ -306,7 +306,7 @@ shutdown:
 # ------------------------------------------------------------
 # Controls how custom PersistentDataContainer data is synchronized.
 #   off              - No PDC sync
-#   safe-all-paper   - Use Paper 1.21.11+ public PDC byte API
+#   safe-all-paper   - Use Paper 1.21.11-26.2 public PDC byte API
 #                      (PersistentDataContainerView.serializeToBytes /
 #                       readFromBytes). No reflection. Older Paper versions
 #                      are not supported and will fail at class-load time.
@@ -395,9 +395,9 @@ compression:
 # Serialization Settings
 # ------------------------------------------------------------
 serialization:
-  # Format version (stored in the first byte of serialized data)
-  # Used for future migration support
-  format-version: 1
+  # Format version (stored in the first byte of serialized data).
+  # Managed by FastSync; v2 reads both legacy v1 LZ4 and v2 LZ4/ZSTD blobs.
+  format-version: 2
 
   # Decompression bounds — guard against corrupted / poisoned DB blobs
   # triggering OOM (or NegativeArraySize) on the login thread. The unwrap

@@ -347,8 +347,8 @@ public class FastSyncProxy {
      *
      * <p>Templates are loaded from {@code proxy-messages.yml} (bundled in the
      * jar). Placeholders use {@code {0}}, {@code {1}}, ... notation and are
-     * replaced before color-code parsing, so argument values may themselves
-     * contain {@code &} color codes.
+     * replaced before MiniMessage parsing, so trusted formatting arguments may
+     * themselves contain MiniMessage tags.
      *
      * @param key  the dot-notation message key (e.g. "proxy.status.header")
      * @param args placeholder values for {0}, {1}, ...
@@ -462,8 +462,8 @@ public class FastSyncProxy {
                 for (HandoffProtocol.StatusResponseData s : results) {
                     source.sendMessage(msg("proxy.status.backend",
                         s.serverName(),
-                        s.dbHealthy() ? "&aOK" : "&cFAIL",
-                        s.redisHealthy() ? "&aOK" : "&cFAIL",
+                        s.dbHealthy() ? "<green>OK" : "<red>FAIL",
+                        s.redisHealthy() ? "<green>OK" : "<red>FAIL",
                         s.playerCount(),
                         s.pendingSaves(),
                         s.pendingLoads()));

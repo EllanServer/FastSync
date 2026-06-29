@@ -19,6 +19,7 @@ MCRCON="${TOOLS_DIR}/mcrcon"
 RCON_PASSWORD="fastsync-test"
 RCON_A_PORT=25575
 RCON_B_PORT=25576
+EXPECTED_PAPER_VERSION="${PAPER_VERSION:-1.21.11}"
 
 ensure_mcrcon() {
     if command -v mcrcon >/dev/null 2>&1; then
@@ -64,11 +65,44 @@ wait_for_rcon() {
 verify_plugin_loaded() {
     local name="$1"
     local container="$2"
+    local port="$3"
     echo "Checking FastSync plugin loaded in ${name}..."
-    if docker logs "${container}" 2>&1 | grep -qiE "FastSync.*enabled|Enabling FastSync|Loading server plugin FastSync"; then
-        echo "  OK: FastSync loaded in ${name}"
-    else
-        echo "  WARN: FastSync load message not found in ${name} logs (plugin may still work)"
+    local plugins
+    plugins="$(rcon "${port}" "plugins")"
+    if ! grep -qi "FastSync" <<<"${plugins}"; then
+        echo "  ERROR: FastSync absent from ${name} plugin list: ${plugins}"
+        return 1
+    fi
+    if docker logs "${container}" 2>&1 | grep -qiE \
+        'Error occurred while enabling FastSync|Could not load.*FastSync|NoClassDefFoundError.*fastsync|UnsatisfiedLinkError|FastSync v?\$\{'; then
+        echo "  ERROR: FastSync linkage/enable failure found in ${name} logs"
+        docker logs "${container}" --tail 120
+        return 1
+    fi
+    echo "  OK: FastSync loaded in ${name}"
+}
+
+verify_server_version() {
+    local name="$1"
+    local container="$2"
+    local version_output
+    version_output="$(docker logs "${container}" 2>&1)"
+    if ! grep -Fq "Loading Paper ${EXPECTED_PAPER_VERSION}" <<<"${version_output}"; then
+        echo "ERROR: ${name} startup log does not report Paper ${EXPECTED_PAPER_VERSION}"
+        return 1
+    fi
+    echo "  OK: ${name} reports ${EXPECTED_PAPER_VERSION}"
+}
+
+verify_status() {
+    local name="$1"
+    local port="$2"
+    local output
+    output="$(rcon "${port}" "fastsync status")"
+    echo "${output}"
+    if ! grep -qi "FastSync" <<<"${output}" || grep -qi "unknown command" <<<"${output}"; then
+        echo "ERROR: FastSync status command failed on ${name}"
+        return 1
     fi
 }
 
@@ -76,16 +110,18 @@ ensure_mcrcon
 wait_for_rcon "${RCON_A_PORT}"
 wait_for_rcon "${RCON_B_PORT}"
 
-verify_plugin_loaded "paper-a" "fastsync-paper-a"
-verify_plugin_loaded "paper-b" "fastsync-paper-b"
+verify_server_version "paper-a" "fastsync-paper-a"
+verify_server_version "paper-b" "fastsync-paper-b"
+verify_plugin_loaded "paper-a" "fastsync-paper-a" "${RCON_A_PORT}"
+verify_plugin_loaded "paper-b" "fastsync-paper-b" "${RCON_B_PORT}"
 
 echo ""
 echo "Pinging FastSync status on paper-a..."
-rcon "${RCON_A_PORT}" "fastsync status"
+verify_status "paper-a" "${RCON_A_PORT}"
 
 echo ""
 echo "Pinging FastSync status on paper-b..."
-rcon "${RCON_B_PORT}" "fastsync status"
+verify_status "paper-b" "${RCON_B_PORT}"
 
 echo ""
 echo "Checking database tables were created..."

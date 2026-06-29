@@ -17,9 +17,23 @@ env:
 
 jobs:
   paper-e2e:
-    name: Real Paper Server E2E
+    name: Paper ${{ matrix.paper-version }} E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - paper-version: "1.21.11"
+            minecraft-image: "itzg/minecraft-server"
+            paper-memory: "512M"
+          - paper-version: "26.2"
+            minecraft-image: "itzg/minecraft-server:java25"
+            paper-memory: "512M"
+    env:
+      PAPER_VERSION: ${{ matrix.paper-version }}
+      MINECRAFT_IMAGE: ${{ matrix.minecraft-image }}
+      PAPER_MEMORY: ${{ matrix.paper-memory }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -76,8 +90,8 @@ jobs:
             docker logs "$container" --tail 80
             return 1
           }
-          wait_for_log "fastsync-paper-a" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help\""
-          wait_for_log "fastsync-paper-b" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help\""
+          wait_for_log "fastsync-paper-a" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help\"" 300
+          wait_for_log "fastsync-paper-b" "Done \([0-9]+\.[0-9]+s\)! For help, type \"help\"" 300
 
       - name: Run E2E verification
         run: ./scripts/e2e-verify.sh

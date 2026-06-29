@@ -17,6 +17,35 @@ env:
   JAVA_VERSION: 21
 
 jobs:
+  # Compile against both ends of the supported Paper API range. Paper 26.2
+  # publishes Java 25 class files, while FastSync keeps Java 21 bytecode.
+  api-compat:
+    name: Paper ${{ matrix.paper-version }} API
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - paper-version: "1.21.11"
+            java-version: "21"
+          - paper-version: "26.2.build.40-alpha"
+            java-version: "25"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ matrix.java-version }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+
+      - name: Compile against Paper API
+        run: >-
+          ./gradlew clean compileJava compileTestJava verifyJava21Bytecode --no-daemon --stacktrace
+          -Ppaper.version=${{ matrix.paper-version }}
+
   # ---------------------------------------------------------------------------
   # Job 1: build — compile, run unit tests, and assemble JARs
   # ---------------------------------------------------------------------------

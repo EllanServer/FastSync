@@ -1,5 +1,46 @@
 # FastSync CHANGELOG
 
+## [Unreleased] — Upstream regression and Paper 26.2 audit
+
+- Completed the component-storage hot path and enabled it by default for fresh
+  or key-less configurations. Disabling new writes remains a safe rollback:
+  persisted bitmap overlays are still read until a full save folds them in.
+- Packed each player's 15 dirty epochs plus save/API-scan counters into one
+  `AtomicLongArray`, eliminating the per-player forest of atomic objects and
+  the second counter map. Added a focused JMH benchmark (mark ~10.5 ns,
+  dirty check ~4.9 ns on the audit host).
+- Replaced the normal component batch's two hash maps and boxed checksums with
+  one ordered `ComponentWrite` list; the MySQL cursor path remains a metadata
+  CAS plus one rewritten JDBC batch in a single transaction.
+- Component overlays now fail closed when their NBT envelope, component root,
+  or mandatory `_present` marker is absent, preventing a malformed row from
+  silently leaving stale baseline fields in place.
+- Added one-JAR compatibility gates for Paper/Folia 1.21.11 through 26.2:
+  baseline builds emit Java 21 bytecode; the 26.2 API check uses JDK 25 to
+  consume `26.2.build.40-alpha` without raising the artifact bytecode level.
+- Added real Paper E2E matrix entries for 1.21.11 and 26.2 (Java 25 image),
+  with strict server-version, plugin-list, linkage-error, command and schema checks.
+- Fixed ZSTD in the final shadow JAR. `zstd-jni` must not be relocated because
+  native symbols bind to `com.github.luben.zstd`; the previous artifact failed
+  on first ZSTD use with `UnsatisfiedLinkError`.
+- Replaced per-call ZSTD native contexts with one-shot compression into a
+  reusable thread-local scratch buffer. Added a final-artifact JNI probe.
+- `compression.enabled=false` now really disables compression, including after
+  reload. Codec names/levels are validated and status reports LZ4 versus ZSTD.
+- Compression v2 now rejects unknown algorithm encodings and algorithm bits on
+  uncompressed frames; ZSTD native error codes fail closed. Legacy v1 LZ4 remains readable.
+- Removed the spool lock-state TTL cache. Ownership/fencing state is a safety
+  decision and must be read fresh; the implementation invalidated after every
+  successful lookup anyway, so it provided no hits while adding stale-state risk.
+- Fixed config migration ordering (migrate before parsing) and bumped config
+  schema to v3 to advertise wrapper format v2 correctly.
+- Fixed recursive i18n flattening, locale-cache invalidation on reload, and
+  leftover legacy Velocity color arguments after the MiniMessage migration.
+- Fixed `plugin.yml` version expansion and added a final-JAR metadata gate so
+  unresolved Gradle placeholders cannot reach a Paper server again.
+- Hardened the real-server harness for cold boots: 512 MiB per no-player JVM,
+  exact startup-version checks, failure cleanup, and serialized server startup.
+
 ## [Unreleased] — PR: Component Storage (Phase 2)
 
 ### Phase 2: Per-Component Storage

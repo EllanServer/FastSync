@@ -1147,11 +1147,6 @@ public class SyncManager {
     // ==================== Save (Quit) ====================
 
     /**
-     * Collect player data and save it asynchronously.
-     * Collection happens on the main thread; serialization and DB save happen async.
-     * After save, notifies Redis so waiting servers can acquire the lock immediately.
-     */
-    /**
      * Refresh the version and fencing token in a PlayerData object from the
      * current in-memory maps. This MUST be called after acquiring the per-UUID
      * saveLock but before calling {@link #persistCollectedData}, to ensure the
@@ -2313,14 +2308,6 @@ public class SyncManager {
      * @param kind BULK for /saveall (keep lock), SHUTDOWN for onDisable (release lock)
      * @return result with total/success/failed counts and per-UUID failure reasons
      */
-    /**
-     * Save all online players' data synchronously (for shutdown).
-     * This method calls Bukkit.getOnlinePlayers() and MUST be called on the
-     * main thread or global region thread.
-     *
-     * @see #savePlayersSnapshot(List, SaveKind) for the thread-safe variant
-     *       that accepts a pre-collected player list.
-     */
     public SaveAllResult saveAllOnlinePlayers(SaveKind kind) {
         if (kind == SaveKind.SHUTDOWN) {
             shuttingDown = true;
@@ -2878,17 +2865,6 @@ public class SyncManager {
     // ==================== Cleanup ====================
 
     /**
-     * Clean up stale pending data entries (players who connected but never joined).
-     *
-     * <p><b>Spanner note:</b> This uses wall-clock timestamps for a <b>liveness</b>
-     * check (timeout-based cleanup), which is acceptable. Spanner's lesson is that
-     * wall-clock must not be used for <b>safety</b> decisions (e.g., "which data
-     * is newer"). Here we're only deciding "is this entry old enough to clean up?"
-     * — a timeout, not an ordering. Clock skew may cause cleanup to happen slightly
-     * early or late, but cannot cause data corruption.
-     */
-
-    /**
      * Determine whether a SQLException represents a connection-level failure
      * (as opposed to a statement-level error like a syntax error or deadlock).
      *
@@ -3116,6 +3092,10 @@ public class SyncManager {
         });
     }
 
+    /**
+     * Clean up stale pending data entries (players who connected but never joined).
+     * Wall clock is used only for this liveness timeout, never for data ordering.
+     */
     public void cleanupStaleEntries() {
         long now = System.currentTimeMillis();
         long staleThreshold = 5 * 60 * 1000; // 5 minutes
@@ -3405,34 +3385,18 @@ public class SyncManager {
         Throwable cause = e;
         while (cause != null) {
             if (cause instanceof SQLException) return SaveFailureReason.DB_UNAVAILABLE;
-            if (cause instanceof IOException) return SaveFailureReason.SERIALIZATION_ERROR;
+            if (cause instanceof IOException
+                    || cause instanceof com.fastsync.serialization.CorruptDataException
+                    || cause instanceof com.fastsync.serialization.ItemSerializationException
+                    || cause instanceof com.github.luben.zstd.ZstdException
+                    || cause instanceof net.jpountz.lz4.LZ4Exception) {
+                return SaveFailureReason.SERIALIZATION_ERROR;
+            }
             cause = cause.getCause();
         }
         return SaveFailureReason.UNKNOWN;
     }
 
-    /**
-     * Phase 2: per-component storage fast path.
-     *
-     * <p>Serializes only the dirty components and upserts them into the
-     * {@code player_component} table. Does NOT rewrite the full player_data
-     * Blob — the Blob keeps the last full-save state, and non-migrated
-     * components continue to be read from there on next load.
-     *
-     * <p>After a successful component-only save, the dirty mask for this
-     * player is cleared, and the component_bitmap on player_data is updated
-     * to mark the newly-migrated components.
-     *
-     * <p>Limitations:
-     * <ul>
-     *   <li>Only called for online saves (PERIODIC/DEATH/WORLD_SAVE), never QUIT</li>
-     *   <li>Returns null on any failure — caller falls back to full Blob save</li>
-     *   <li>Lock heartbeat still runs independently (component save doesn't refresh locked_at;
-     *       that's intentional — the lock is already held, heartbeat keeps it alive)</li>
-     * </ul>
-     *
-     * @return SaveResult on success, null to fall back to full save
-     */
     /**
      * Component-only save with an explicit pre-collect dirty snapshot.
      *
@@ -3498,9 +3462,10 @@ public class SyncManager {
             }
 
             long startSer = System.nanoTime();
-            java.util.Map<String, byte[]> componentBlobs = new java.util.HashMap<>();
-            java.util.Map<String, Long> componentChecksums = new java.util.HashMap<>();
+            java.util.List<com.fastsync.database.DatabaseManager.ComponentWrite> componentWrites =
+                new java.util.ArrayList<>(dirty.size());
             int totalCompressedSize = 0;
+            long dirtyBits = 0L;
 
             for (com.fastsync.sync.dirty.ComponentDirtyMask.Component c : dirty) {
                 String name = c.name();
@@ -3513,16 +3478,15 @@ public class SyncManager {
                 byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
                 long checksum = DatabaseManager.computeChecksum(serialized);
 
-                componentBlobs.put(name, compressed);
-                componentChecksums.put(name, checksum);
+                componentWrites.add(new com.fastsync.database.DatabaseManager.ComponentWrite(
+                    name, compressed, checksum));
                 totalCompressedSize += compressed.length;
+                dirtyBits |= c.storageMask();
             }
 
-            if (componentBlobs.isEmpty()) {
-                // All dirty components produced no payload (e.g. all empty AND
-                // the serializer returned null for them — currently INVENTORY's
-                // offhand, ENDER_CHEST, POTION_EFFECTS, ADVANCEMENTS, STATS,
-                // ATTRIBUTES, PDC all return null when empty).
+            if (componentWrites.isEmpty()) {
+                // No enabled/recognized dirty component produced a payload.
+                // Valid empty state still produces an explicit _present row.
                 //
                 // Do NOT clear dirty flags here and pretend success — that would
                 // discard the dirty signal without bumping player_data.version
@@ -3541,25 +3505,16 @@ public class SyncManager {
             long serElapsed = (System.nanoTime() - startSer) / 1_000_000;
             if (serializeLatency != null) serializeLatency.record(serElapsed);
 
-            // Calculate dirtyBits bitmask for component_bitmap update
-            long dirtyBits = 0L;
-            for (com.fastsync.sync.dirty.ComponentDirtyMask.Component c : dirty) {
-                if (componentBlobs.containsKey(c.name())) {
-                    dirtyBits |= c.storageMask();
-                }
-            }
-
-            // Single-transaction component upsert with fencing validation.
-            // This method does SELECT FOR UPDATE + validates locked_by/fencing_token
-            // + upserts component rows + updates player_data.version/bitmap/locked_at
-            // all in one DB transaction. If the lock was lost (GC pause, heartbeat
-            // timeout), the transaction is rolled back and no component rows are written.
+            // Single-transaction component upsert with fencing validation. The
+            // cursor hot path conditionally advances the metadata row first,
+            // then batches component rows before commit. A failed CAS performs
+            // a diagnostic SELECT only on the cold rejection path.
             long dbStart = System.nanoTime();
             ComponentCursor cursor = componentCursors.get(uuid);
             com.fastsync.database.DatabaseManager.ComponentBatchResult batchResult;
             if (cursor != null) {
                 batchResult = databaseManager.upsertComponentsIfLockHeld(
-                    uuid, componentBlobs, componentChecksums,
+                    uuid, componentWrites,
                     config.getServerName(), data.getFencingToken(),
                     playerLockSessions.get(uuid), data.getVersion(), dirtyBits,
                     cursor.generation(), cursor.bitmap());
@@ -3567,6 +3522,14 @@ public class SyncManager {
                 // Defensive compatibility path for an in-memory session that
                 // predates cursor initialization (e.g. hot reload). Normal
                 // post-login traffic always takes the overload above.
+                java.util.Map<String, byte[]> componentBlobs =
+                    new java.util.HashMap<>(componentWrites.size());
+                java.util.Map<String, Long> componentChecksums =
+                    new java.util.HashMap<>(componentWrites.size());
+                for (com.fastsync.database.DatabaseManager.ComponentWrite write : componentWrites) {
+                    componentBlobs.put(write.name(), write.data());
+                    componentChecksums.put(write.name(), write.checksum());
+                }
                 batchResult = databaseManager.upsertComponentsIfLockHeld(
                     uuid, componentBlobs, componentChecksums,
                     config.getServerName(), data.getFencingToken(),
@@ -3660,7 +3623,7 @@ public class SyncManager {
 
             if (config.isDebug()) {
                 logger.info("Component save " + kind + " for " + uuid + ": "
-                    + componentBlobs.size() + " components, "
+                    + componentWrites.size() + " components, "
                     + totalCompressedSize + " bytes, "
                     + "ser=" + serElapsed + "ms db=" + dbElapsed + "ms"
                     + " v" + batchResult.oldVersion() + "->v" + batchResult.newVersion()
@@ -3671,7 +3634,7 @@ public class SyncManager {
             // Log operation
             logOperation(uuid, OperationType.SAVE, data.getFencingToken(),
                 batchResult.newVersion(), totalCompressedSize,
-                "Component save " + kind + " (" + componentBlobs.size() + " components, gen=" + batchResult.generation() + ")");
+                "Component save " + kind + " (" + componentWrites.size() + " components, gen=" + batchResult.generation() + ")");
 
             return ComponentSaveOutcome.success(
                 SaveResult.success(batchResult.oldVersion(), batchResult.newVersion(), totalCompressedSize));
@@ -3796,40 +3759,6 @@ public class SyncManager {
         dirtyMask.markDirty(uuid, component);
     }
 
-    /**
-     * Unified save path: serialize → compress → checksum → DB CAS → conflict/advance/lock-release.
-     *
-     * <p>All save paths (quit, periodic, bulk, world_save, death) converge here to prevent
-     * "fix one, forget the other" drift. The caller is responsible for:
-     * <ul>
-     *   <li>Per-UUID locking (quit: lock+wait, periodic: tryLock+skip)</li>
-     *   <li>pendingSaveCount management</li>
-     *   <li>playerVersions/playerFencingTokens cleanup (quit only)</li>
-     * </ul>
-     *
-     * <p>Lock semantics are determined by {@link SaveKind#releaseLock}:
-     * <ul>
-     *   <li>{@code releaseLock=true} (QUIT): after save, lock is released and Redis notified.</li>
-     *   <li>{@code releaseLock=false} (PERIODIC/BULK/WORLD_SAVE/DEATH): lock is kept,
-     *       {@code locked_at} refreshed. No Redis notification — other servers should not
-     *       attempt to acquire the lock while the player is still online on this server.</li>
-     * </ul>
-     */
-    /**
-     * Full-Blob save with an explicit pre-collect dirty snapshot.
-     *
-     * <p>Callers that have access to the dirty mask BEFORE calling
-     * {@link #collectPlayerData(Player)} should pass the snapshot they took
-     * at that point — this gives the tightest epoch protection (covers the
-     * collect window too). The 3-arg overload {@link #persistCollectedData(
-     * UUID, PlayerData, SaveKind)} is a convenience that takes the snapshot
-     * inside the method, which still protects the serialize + DB-write window
-     * but not the collect window.
-     *
-     * @param preSaveSnapshot dirty state captured before collectPlayerData.
-     *                        Ignored when {@code kind.releaseLock == true}
-     *                        (QUIT/SHUTDOWN uses clearAll instead).
-     */
     /** Encoded player-data blob: raw serialized bytes, compressed bytes, and checksum. */
     private record EncodedBlob(byte[] serialized, byte[] compressed, long checksum) {}
 
@@ -3848,6 +3777,13 @@ public class SyncManager {
         return new EncodedBlob(serialized, compressed, checksum);
     }
 
+    /**
+     * Unified save path: serialize, compress, checksum, fenced DB CAS, then
+     * conflict/version/lock handling. A caller-provided dirty snapshot must be
+     * captured before collection so changes arriving during collection or I/O
+     * cannot be cleared accidentally. Final saves ignore it and write a full
+     * Blob while releasing the lock atomically.
+     */
     private SaveResult persistCollectedData(UUID uuid, PlayerData data, SaveKind kind,
             com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot) {
         long startTime = System.nanoTime();

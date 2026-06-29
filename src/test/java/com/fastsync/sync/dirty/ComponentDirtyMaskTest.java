@@ -124,6 +124,17 @@ class ComponentDirtyMaskTest {
     }
 
     @Test
+    void apiMutationScanCounterResetsAtIntervalAndIsPerPlayer() {
+        assertFalse(mask.recordApiMutationScanAndCheck(player1, 3));
+        assertFalse(mask.recordApiMutationScanAndCheck(player1, 3));
+        assertFalse(mask.recordApiMutationScanAndCheck(player2, 3));
+        assertTrue(mask.recordApiMutationScanAndCheck(player1, 3));
+        assertFalse(mask.recordApiMutationScanAndCheck(player1, 3));
+        assertFalse(mask.recordApiMutationScanAndCheck(player2, 3));
+        assertTrue(mask.recordApiMutationScanAndCheck(player2, 3));
+    }
+
+    @Test
     void testRemoveClearsMask() {
         mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
         mask.markAllDirty(player1);

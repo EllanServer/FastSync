@@ -22,7 +22,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p>This is NOT a JMH benchmark — it is a lightweight JUnit test that runs in CI
  * and prints timing summaries. It verifies that the file-based operation log,
- * LZ4 compression, CRC32 checksum, and StreamEvent serialization perform within
+ * LZ4/ZSTD compression, CRC32 checksum, and StreamEvent serialization perform within
  * acceptable bounds.
  *
  * <p>All tests use only public Java APIs — no {@code --add-opens} required.
@@ -34,6 +34,8 @@ class PerformanceSmokeTest {
 
     @BeforeEach
     void setUp() throws Exception {
+        CompressionUtil.setEnabled(true);
+        CompressionUtil.setAlgorithm(CompressionUtil.CompressionAlgorithm.LZ4);
         tempDir = Files.createTempDirectory("perf-smoke");
         logManager = new FileOperationLogManager(tempDir, 500);
         logManager.initialize();
@@ -176,33 +178,42 @@ class PerformanceSmokeTest {
     void compression_throughput() {
         int[] sizes = {1024, 16384, 65536, 262144};
 
-        for (int size : sizes) {
-            byte[] data = generateCompressibleData(size);
+        for (CompressionUtil.CompressionAlgorithm algorithm
+                : CompressionUtil.CompressionAlgorithm.values()) {
+            CompressionUtil.setAlgorithm(algorithm);
+            for (int size : sizes) {
+                byte[] data = generateCompressibleData(size);
 
-            long start = System.nanoTime();
-            int iterations = 1000;
-            byte[] compressed = null;
-            for (int i = 0; i < iterations; i++) {
-                compressed = CompressionUtil.wrap(data, 128);
+                long start = System.nanoTime();
+                int iterations = 1000;
+                byte[] compressed = null;
+                for (int i = 0; i < iterations; i++) {
+                    compressed = CompressionUtil.wrap(data, 128);
+                }
+                long elapsed = System.nanoTime() - start;
+                double compressThroughput = (size * iterations)
+                    / (elapsed / 1_000_000_000.0) / (1024 * 1024);
+
+                byte[] finalCompressed = compressed;
+                long start2 = System.nanoTime();
+                for (int i = 0; i < iterations; i++) {
+                    CompressionUtil.unwrap(finalCompressed);
+                }
+                long elapsed2 = System.nanoTime() - start2;
+                double decompressThroughput = (size * iterations)
+                    / (elapsed2 / 1_000_000_000.0) / (1024 * 1024);
+
+                double ratio = (double) size / compressed.length;
+
+                System.out.printf("[%s] %6d bytes → %6d bytes (ratio %.1fx): compress %.0f MB/s, decompress %.0f MB/s%n",
+                    algorithm, size, compressed.length, ratio,
+                    compressThroughput, decompressThroughput);
+
+                assertTrue(ratio > 2.0,
+                    algorithm + " ratio too low for size " + size + ": " + ratio);
+                assertTrue(compressThroughput > 10,
+                    algorithm + " throughput too low: " + compressThroughput + " MB/s");
             }
-            long elapsed = System.nanoTime() - start;
-            double compressThroughput = (size * iterations) / (elapsed / 1_000_000_000.0) / (1024 * 1024);
-
-            byte[] finalCompressed = compressed;
-            long start2 = System.nanoTime();
-            for (int i = 0; i < iterations; i++) {
-                CompressionUtil.unwrap(finalCompressed);
-            }
-            long elapsed2 = System.nanoTime() - start2;
-            double decompressThroughput = (size * iterations) / (elapsed2 / 1_000_000_000.0) / (1024 * 1024);
-
-            double ratio = (double) size / compressed.length;
-
-            System.out.printf("[LZ4] %6d bytes → %6d bytes (ratio %.1fx): compress %.0f MB/s, decompress %.0f MB/s%n",
-                size, compressed.length, ratio, compressThroughput, decompressThroughput);
-
-            assertTrue(ratio > 2.0, "Compression ratio too low for size " + size + ": " + ratio);
-            assertTrue(compressThroughput > 10, "Compress throughput too low: " + compressThroughput + " MB/s");
         }
     }
 

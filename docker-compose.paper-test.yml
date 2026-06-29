@@ -2,7 +2,8 @@
 # FastSync Paper E2E 测试环境
 # =============================================================================
 #
-# 启动两套真实的 Paper 1.21.11 服务器，共享同一个 MySQL 和 Redis，
+# 启动两套真实的 Paper 服务器，共享同一个 MySQL 和 Redis。
+# PAPER_VERSION / MINECRAFT_IMAGE 可切换 1.21.11 与 26.2 验证矩阵。
 # 用于验证 FastSync 的跨服玩家数据同步。
 #
 # 使用方法：
@@ -11,8 +12,8 @@
 # 服务：
 #   - mysql:   MySQL 8.4 (fastsync 数据库)
 #   - redis:   Redis 7 (锁协调)
-#   - paper-a: Paper 1.21.11 服务器 A (游戏端口 25565, RCON 25575)
-#   - paper-b: Paper 1.21.11 服务器 B (游戏端口 25566, RCON 25576)
+#   - paper-a: Paper 测试服务器 A (游戏端口 25565, RCON 25575)
+#   - paper-b: Paper 测试服务器 B (游戏端口 25566, RCON 25576)
 # =============================================================================
 
 services:
@@ -46,7 +47,7 @@ services:
       retries: 10
 
   paper-a:
-    image: itzg/minecraft-server
+    image: "${MINECRAFT_IMAGE:-itzg/minecraft-server}"
     container_name: fastsync-paper-a
     depends_on:
       mysql:
@@ -56,14 +57,14 @@ services:
     environment:
       EULA: "TRUE"
       TYPE: "PAPER"
-      VERSION: "1.21.11"
+      VERSION: "${PAPER_VERSION:-1.21.11}"
       SERVER_NAME: "paper-a"
       RCON_PASSWORD: "fastsync-test"
       RCON_PORT: "25575"
       ENABLE_RCON: "true"
       ONLINE_MODE: "false"
       # E2E has no players; keep both JVMs resident on small shared CI runners.
-      MEMORY: "512M"
+      MEMORY: "${PAPER_MEMORY:-512M}"
       MAX_PLAYERS: "10"
       MOTD: "FastSync Test Server A"
       OPS: ""
@@ -78,7 +79,7 @@ services:
     tty: true
 
   paper-b:
-    image: itzg/minecraft-server
+    image: "${MINECRAFT_IMAGE:-itzg/minecraft-server}"
     container_name: fastsync-paper-b
     depends_on:
       mysql:
@@ -93,13 +94,13 @@ services:
     environment:
       EULA: "TRUE"
       TYPE: "PAPER"
-      VERSION: "1.21.11"
+      VERSION: "${PAPER_VERSION:-1.21.11}"
       SERVER_NAME: "paper-b"
       RCON_PASSWORD: "fastsync-test"
       RCON_PORT: "25576"
       ENABLE_RCON: "true"
       ONLINE_MODE: "false"
-      MEMORY: "512M"
+      MEMORY: "${PAPER_MEMORY:-512M}"
       MAX_PLAYERS: "10"
       MOTD: "FastSync Test Server B"
       OPS: ""

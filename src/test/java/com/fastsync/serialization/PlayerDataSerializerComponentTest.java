@@ -265,13 +265,39 @@ class PlayerDataSerializerComponentTest {
     }
 
     @Test
-    void testDeserializeEmptyBytesIsNoOp() throws IOException {
+    void testDeserializeEmptyBytesFailsClosed() {
         PlayerData target = new PlayerData();
         target.setHealth(10.0);
 
-        PlayerDataSerializer.deserializeComponent("VITALS", new byte[0], target);
-
+        assertThrows(IOException.class,
+            () -> PlayerDataSerializer.deserializeComponent("VITALS", new byte[0], target));
         assertEquals(10.0, target.getHealth(), 0.001);
+    }
+
+    @Test
+    void testDeserializeMissingComponentRootFailsClosed() throws IOException {
+        net.momirealms.sparrow.nbt.CompoundTag wrapper =
+            net.momirealms.sparrow.nbt.NBT.createCompound();
+        wrapper.put("FOOD", net.momirealms.sparrow.nbt.NBT.createCompound());
+        byte[] bytes = net.momirealms.sparrow.nbt.NBT.toBytes(wrapper);
+
+        assertThrows(IOException.class,
+            () -> PlayerDataSerializer.deserializeComponent("VITALS", bytes, new PlayerData()));
+    }
+
+    @Test
+    void testDeserializeMissingPresenceMarkerFailsClosed() throws IOException {
+        net.momirealms.sparrow.nbt.CompoundTag wrapper =
+            net.momirealms.sparrow.nbt.NBT.createCompound();
+        net.momirealms.sparrow.nbt.CompoundTag inner =
+            net.momirealms.sparrow.nbt.NBT.createCompound();
+        inner.putDouble("health", 10.0);
+        inner.putDouble("maxHealth", 20.0);
+        wrapper.put("VITALS", inner);
+        byte[] bytes = net.momirealms.sparrow.nbt.NBT.toBytes(wrapper);
+
+        assertThrows(IOException.class,
+            () -> PlayerDataSerializer.deserializeComponent("VITALS", bytes, new PlayerData()));
     }
 
     @Test

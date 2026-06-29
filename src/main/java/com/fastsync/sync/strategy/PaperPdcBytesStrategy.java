@@ -7,13 +7,13 @@ import java.util.logging.Logger;
 import java.util.logging.Level;
 
 /**
- * PDC sync via Paper 1.21.11+ public serializeToBytes() / readFromBytes() API.
+ * PDC sync via Paper 1.21.11-26.2 public serializeToBytes() / readFromBytes() API.
  *
  * <p>These methods are on the {@link PersistentDataContainerView} interface,
  * promoted to public in Paper 1.21.11. No reflection, no CraftBukkit internals.
  * If running on an older Paper that does not have these methods, the plugin
  * will fail at class-load time with a NoSuchMethodError — by design, since the
- * target version is Paper 1.21.11.
+ * minimum target version is Paper 1.21.11.
  */
 public class PaperPdcBytesStrategy implements PdcSyncStrategy {
 

@@ -1568,8 +1568,40 @@ public class DatabaseManager implements DatabaseBackend {
             long dirtyBits,
             long expectedGeneration,
             long expectedBitmap) throws SQLException {
-        requireLockSession(lockSessionId, "upsertComponentsIfLockHeld");
         if (componentsWithData == null || componentsWithData.isEmpty()) {
+            return ComponentBatchResult.rejected("no components to upsert",
+                ComponentRejectReason.NO_COMPONENTS);
+        }
+        java.util.List<ComponentWrite> writes = new java.util.ArrayList<>(componentsWithData.size());
+        for (var entry : componentsWithData.entrySet()) {
+            writes.add(new ComponentWrite(entry.getKey(), entry.getValue(),
+                componentsWithChecksum == null
+                    ? 0L : componentsWithChecksum.getOrDefault(entry.getKey(), 0L)));
+        }
+        return upsertComponentsIfLockHeld(uuid, writes, serverName, fencingToken,
+            lockSessionId, expectedVersion, dirtyBits, expectedGeneration, expectedBitmap);
+    }
+
+    /** Allocation-lean component write used by the normal cursor hot path. */
+    public record ComponentWrite(String name, byte[] data, long checksum) {
+        public ComponentWrite {
+            java.util.Objects.requireNonNull(name, "name");
+            java.util.Objects.requireNonNull(data, "data");
+        }
+    }
+
+    public ComponentBatchResult upsertComponentsIfLockHeld(
+            UUID uuid,
+            java.util.List<ComponentWrite> componentWrites,
+            String serverName,
+            long fencingToken,
+            String lockSessionId,
+            long expectedVersion,
+            long dirtyBits,
+            long expectedGeneration,
+            long expectedBitmap) throws SQLException {
+        requireLockSession(lockSessionId, "upsertComponentsIfLockHeld");
+        if (componentWrites == null || componentWrites.isEmpty()) {
             return ComponentBatchResult.rejected("no components to upsert", ComponentRejectReason.NO_COMPONENTS);
         }
 
@@ -1624,14 +1656,13 @@ public class DatabaseManager implements DatabaseBackend {
                     """, componentTable);
 
                 try (var ps = conn.prepareStatement(upsertSql)) {
-                    for (var entry : componentsWithData.entrySet()) {
-                        String name = entry.getKey();
+                    for (ComponentWrite write : componentWrites) {
                         ps.setString(1, clusterId);
                         ps.setString(2, uuid.toString());
-                        ps.setString(3, name);
+                        ps.setString(3, write.name());
                         ps.setLong(4, expectedGeneration);
-                        ps.setBytes(5, entry.getValue());
-                        ps.setLong(6, componentsWithChecksum.getOrDefault(name, 0L));
+                        ps.setBytes(5, write.data());
+                        ps.setLong(6, write.checksum());
                         ps.addBatch();
                     }
                     ps.executeBatch();

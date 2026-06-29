@@ -61,9 +61,10 @@ class PlayerDataSerializerLegacyRejectionTest {
      */
     @Test
     void deserializeComponentRejectsInventoryMissingOffhandPresent() throws IOException {
-        // Root: { "INVENTORY": { } } — empty component with no offhandPresent.
+        // Valid envelope/presence marker, but no offhandPresent field.
         CompoundTag root = NBT.createCompound();
         CompoundTag inventoryComponent = NBT.createCompound();
+        inventoryComponent.putBoolean("_present", true);
         root.put("INVENTORY", inventoryComponent);
         byte[] bytes = NBT.toBytes(root);
 

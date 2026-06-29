@@ -4,6 +4,7 @@ import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
+import org.openjdk.jmh.runner.options.ChainedOptionsBuilder;
 import org.openjdk.jmh.runner.options.TimeValue;
 
 /**
@@ -19,18 +20,25 @@ import org.openjdk.jmh.runner.options.TimeValue;
 public class BenchmarkRunner {
 
     public static void main(String[] args) throws RunnerException {
-        Options options = new OptionsBuilder()
-                .include(CompressionBenchmark.class.getSimpleName())
-                .include(ChecksumBenchmark.class.getSimpleName())
-                .include(StreamEventBenchmark.class.getSimpleName())
-                .include(LatencyTrackerBenchmark.class.getSimpleName())
+        ChainedOptionsBuilder builder = new OptionsBuilder()
                 .forks(0) // run in single JVM because jmh-core is test-scoped
                 .warmupIterations(2)
                 .warmupTime(TimeValue.seconds(1))
                 .measurementIterations(3)
                 .measurementTime(TimeValue.seconds(1))
-                .threads(1)
-                .build();
+                .threads(1);
+
+        if (args.length == 0) {
+            builder.include(CompressionBenchmark.class.getSimpleName())
+                .include(ChecksumBenchmark.class.getSimpleName())
+                .include(StreamEventBenchmark.class.getSimpleName())
+                .include(LatencyTrackerBenchmark.class.getSimpleName())
+                .include(ComponentDirtyMaskBenchmark.class.getSimpleName());
+        } else {
+            for (String include : args) builder.include(include);
+        }
+
+        Options options = builder.build();
 
         new Runner(options).run();
     }

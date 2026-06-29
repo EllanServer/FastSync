@@ -7,7 +7,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
- * JMH benchmark for LZ4 compression/decompression used in player data serialization.
+ * JMH benchmark for LZ4/ZSTD compression used in player data serialization.
  *
  * <p>Player NBT data typically has lots of zeros and repeated patterns, making it
  * highly compressible. This benchmark measures throughput and compression ratio
@@ -27,11 +27,17 @@ public class CompressionBenchmark {
     @Param({"0", "16", "128"})
     private int entropy; // bytes of randomness injected per block
 
+    @Param({"LZ4", "ZSTD"})
+    private String algorithm;
+
     private byte[] rawData;
     private byte[] wrappedData;
 
     @Setup
     public void setup() {
+        CompressionUtil.setEnabled(true);
+        CompressionUtil.setAlgorithm(
+            CompressionUtil.CompressionAlgorithm.valueOf(algorithm));
         rawData = new byte[dataSize];
         ThreadLocalRandom.current().nextBytes(rawData);
 
@@ -55,11 +61,4 @@ public class CompressionBenchmark {
         return CompressionUtil.unwrap(wrappedData);
     }
 
-    @Benchmark
-    @BenchmarkMode(Mode.SingleShotTime)
-    @OutputTimeUnit(TimeUnit.MICROSECONDS)
-    public double compressionRatio() {
-        byte[] compressed = CompressionUtil.wrap(rawData, 256);
-        return (double) rawData.length / compressed.length;
-    }
 }

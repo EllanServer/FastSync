@@ -60,7 +60,7 @@ command:
     oplog: "<yellow>操作日志: {0}队列={1}/{2}, 丢弃={3}"
     oplog-alert: "<red>操作日志警报：审计条目已被丢弃{0}。操作日志不完整，请谨慎用于事件审查。"
     oplog-disabled: "<yellow>操作日志: <gray>未启用"
-    compression-enabled: "<yellow>压缩: <green>LZ4"
+    compression-enabled: "<yellow>压缩: <green>{0}"
     compression-disabled: "<yellow>压缩: <red>未启用"
     debug-on: "<yellow>调试: <green>开启"
     debug-off: "<yellow>调试: <red>关闭"

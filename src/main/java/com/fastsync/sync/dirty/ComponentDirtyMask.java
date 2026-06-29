@@ -4,7 +4,7 @@ import java.util.UUID;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
  * Tracks which player data components have been modified since the last
@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <h2>Thread safety</h2>
  * <p>All operations are lock-free. Every component state uses an
- * {@link AtomicLong}, so {@code markDirty} (event thread) never blocks
+ * {@link AtomicLongArray}, so {@code markDirty} (event thread) never blocks
  * {@code snapshotDirty} / {@code clearDirty} (async save thread).
  */
 public class ComponentDirtyMask {
@@ -85,6 +85,9 @@ public class ComponentDirtyMask {
     );
 
     private static final int NUM_COMPONENTS = Component.values().length;
+    private static final int SAVE_COUNT_INDEX = NUM_COMPONENTS;
+    private static final int API_SCAN_COUNT_INDEX = NUM_COMPONENTS + 1;
+    private static final int STATE_WORDS = NUM_COMPONENTS + 2;
     private static final long DIRTY_FLAG = 1L;
     private static final long EPOCH_INCREMENT = 2L;
 
@@ -111,14 +114,14 @@ public class ComponentDirtyMask {
     public void markDirty(UUID uuid, Component component) {
         if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
-        state.states[component.ordinal()].getAndUpdate(ComponentDirtyMask::markState);
+        state.states.getAndUpdate(component.ordinal(), ComponentDirtyMask::markState);
     }
 
     public void markDirty(UUID uuid, Set<Component> components) {
         if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
         for (Component c : components) {
-            state.states[c.ordinal()].getAndUpdate(ComponentDirtyMask::markState);
+            state.states.getAndUpdate(c.ordinal(), ComponentDirtyMask::markState);
         }
     }
 
@@ -126,7 +129,7 @@ public class ComponentDirtyMask {
         if (suppressedPlayers.contains(uuid)) return;
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
         for (int i = 0; i < NUM_COMPONENTS; i++) {
-            state.states[i].getAndUpdate(ComponentDirtyMask::markState);
+            state.states.getAndUpdate(i, ComponentDirtyMask::markState);
         }
     }
 
@@ -184,27 +187,24 @@ public class ComponentDirtyMask {
 
     public boolean recordSaveAndCheckValidation(UUID uuid) {
         PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
-        long count = state.saveCount.incrementAndGet();
+        long count = state.states.incrementAndGet(SAVE_COUNT_INDEX);
         return (count % validationInterval) == 0;
     }
 
-    private final ConcurrentHashMap<UUID, java.util.concurrent.atomic.AtomicInteger> apiMutationScanCounters = new ConcurrentHashMap<>();
-
     public boolean recordApiMutationScanAndCheck(UUID uuid, int interval) {
         if (interval <= 1) return true;
-        java.util.concurrent.atomic.AtomicInteger counter =
-            apiMutationScanCounters.computeIfAbsent(uuid, k -> new java.util.concurrent.atomic.AtomicInteger());
-        int value = counter.incrementAndGet();
-        if (value >= interval) {
-            counter.set(0);
-            return true;
+        PlayerDirtyState state = masks.computeIfAbsent(uuid, k -> new PlayerDirtyState());
+        while (true) {
+            long current = state.states.get(API_SCAN_COUNT_INDEX);
+            long next = current + 1 >= interval ? 0 : current + 1;
+            if (state.states.compareAndSet(API_SCAN_COUNT_INDEX, current, next)) {
+                return next == 0;
+            }
         }
-        return false;
     }
 
     public void remove(UUID uuid) {
         masks.remove(uuid);
-        apiMutationScanCounters.remove(uuid);
         suppressedPlayers.remove(uuid);
     }
 
@@ -253,18 +253,14 @@ public class ComponentDirtyMask {
     // ==================== Per-player state (lock-free) ====================
 
     private static final class PlayerDirtyState {
-        final AtomicLong[] states = new AtomicLong[NUM_COMPONENTS];
-        final AtomicLong saveCount = new AtomicLong(0);
-
-        PlayerDirtyState() {
-            for (int i = 0; i < NUM_COMPONENTS; i++) {
-                states[i] = new AtomicLong(0);
-            }
-        }
+        // One primitive backing array replaces 15 AtomicLong objects plus two
+        // separate counter objects/maps per player. Component words occupy
+        // [0, NUM_COMPONENTS); the final two words are save/scan counters.
+        final AtomicLongArray states = new AtomicLongArray(STATE_WORDS);
 
         boolean isAnyDirty() {
-            for (AtomicLong state : states) {
-                if ((state.get() & DIRTY_FLAG) != 0) return true;
+            for (int i = 0; i < NUM_COMPONENTS; i++) {
+                if ((states.get(i) & DIRTY_FLAG) != 0) return true;
             }
             return false;
         }
@@ -272,7 +268,7 @@ public class ComponentDirtyMask {
         Set<Component> getDirtySet() {
             EnumSet<Component> set = EnumSet.noneOf(Component.class);
             for (Component c : Component.values()) {
-                if ((states[c.ordinal()].get() & DIRTY_FLAG) != 0) set.add(c);
+                if ((states.get(c.ordinal()) & DIRTY_FLAG) != 0) set.add(c);
             }
             return set;
         }
@@ -281,7 +277,7 @@ public class ComponentDirtyMask {
             long bits = 0L;
             long[] snapshotStates = new long[NUM_COMPONENTS];
             for (Component c : Component.values()) {
-                long value = states[c.ordinal()].get();
+                long value = states.get(c.ordinal());
                 if ((value & DIRTY_FLAG) != 0) {
                     bits |= bit(c);
                     snapshotStates[c.ordinal()] = value;
@@ -296,19 +292,19 @@ public class ComponentDirtyMask {
                 if (!snapshot.contains(component)) continue;
                 int index = component.ordinal();
                 long expected = snapshot.states[index];
-                states[index].compareAndSet(expected, expected & ~DIRTY_FLAG);
+                states.compareAndSet(index, expected, expected & ~DIRTY_FLAG);
             }
         }
 
         void clearBits(Set<Component> components) {
             for (Component component : components) {
-                states[component.ordinal()].getAndUpdate(value -> value & ~DIRTY_FLAG);
+                states.getAndUpdate(component.ordinal(), value -> value & ~DIRTY_FLAG);
             }
         }
 
         void clearAll() {
-            for (AtomicLong state : states) {
-                state.getAndUpdate(value -> value & ~DIRTY_FLAG);
+            for (int i = 0; i < NUM_COMPONENTS; i++) {
+                states.getAndUpdate(i, value -> value & ~DIRTY_FLAG);
             }
         }
     }

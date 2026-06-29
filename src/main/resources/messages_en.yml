@@ -60,7 +60,7 @@ command:
     oplog: "<yellow>OpLog: {0}queue={1}/{2}, dropped={3}"
     oplog-alert: "<red>OpLog ALERT: audit entries have been dropped{0}. Treat operation log as incomplete for incident review."
     oplog-disabled: "<yellow>OpLog: <gray>Disabled"
-    compression-enabled: "<yellow>Compression: <green>LZ4"
+    compression-enabled: "<yellow>Compression: <green>{0}"
     compression-disabled: "<yellow>Compression: <red>Disabled"
     debug-on: "<yellow>Debug: <green>ON"
     debug-off: "<yellow>Debug: <red>OFF"

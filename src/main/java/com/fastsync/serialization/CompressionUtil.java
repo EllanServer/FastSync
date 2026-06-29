@@ -7,6 +7,8 @@ import net.jpountz.lz4.LZ4Exception;
 import net.jpountz.lz4.LZ4Factory;
 import net.jpountz.lz4.LZ4FastDecompressor;
 
+import java.util.Objects;
+
 /**
  * Compression utility with format version and algorithm-selection header.
  *
@@ -53,14 +55,19 @@ public class CompressionUtil {
     private static final LZ4Compressor lz4Compressor = factory.fastCompressor();
     private static final LZ4FastDecompressor lz4Decompressor = factory.fastDecompressor();
 
-    // ThreadLocal scratch buffer for LZ4
-    private static final ThreadLocal<byte[]> scratchBuffer = ThreadLocal.withInitial(() -> new byte[8192]);
+    // Per-thread scratch buffers avoid both the worst-case temporary allocation
+    // and a native ZSTD context allocation on every player save.
+    private static final ThreadLocal<byte[]> lz4Scratch =
+        ThreadLocal.withInitial(() -> new byte[8192]);
+    private static final ThreadLocal<byte[]> zstdScratch =
+        ThreadLocal.withInitial(() -> new byte[8192]);
 
     static final int DEFAULT_MAX_RAW_BYTES = 1 << 20;            // 1 MiB
     static final int DEFAULT_MAX_WRAPPED_BYTES = 5 * (1 << 19);  // 2.5 MiB
 
     private static volatile int maxRawBytes = DEFAULT_MAX_RAW_BYTES;
     private static volatile int maxWrappedBytes = DEFAULT_MAX_WRAPPED_BYTES;
+    private static volatile boolean enabled = true;
 
     // Default algorithm — LZ4 for backward compatibility and hot-path speed
     private static volatile CompressionAlgorithm algorithm = CompressionAlgorithm.LZ4;
@@ -81,7 +88,7 @@ public class CompressionUtil {
      * @param algorithm the algorithm to use (LZ4 or ZSTD)
      */
     public static void setAlgorithm(CompressionAlgorithm algorithm) {
-        CompressionUtil.algorithm = algorithm;
+        CompressionUtil.algorithm = Objects.requireNonNull(algorithm, "algorithm");
     }
 
     /**
@@ -89,6 +96,35 @@ public class CompressionUtil {
      */
     public static CompressionAlgorithm getAlgorithm() {
         return algorithm;
+    }
+
+    public static void setEnabled(boolean enabled) {
+        CompressionUtil.enabled = enabled;
+    }
+
+    public static boolean isEnabled() {
+        return enabled;
+    }
+
+    /** Fail during plugin startup instead of on the first player save. */
+    public static void verifyConfiguredCodec() {
+        if (!enabled || algorithm != CompressionAlgorithm.ZSTD) return;
+        try {
+            byte[] source = new byte[64];
+            long bound = Zstd.compressBound(source.length);
+            if (bound <= 0 || bound > Integer.MAX_VALUE) {
+                throw new IllegalStateException("Invalid ZSTD compression bound: " + bound);
+            }
+            byte[] destination = new byte[(int) bound];
+            long result = Zstd.compressByteArray(destination, 0, destination.length,
+                source, 0, source.length, zstdLevel);
+            if (Zstd.isError(result)) {
+                throw new ZstdException(result, "ZSTD startup probe failed");
+            }
+        } catch (LinkageError | RuntimeException e) {
+            throw new IllegalStateException(
+                "ZSTD is configured but its native codec is unavailable", e);
+        }
     }
 
     /**
@@ -125,7 +161,7 @@ public class CompressionUtil {
                 + data.length + " > " + maxRawBytes + " bytes");
         }
 
-        boolean shouldCompress = data.length >= minSize;
+        boolean shouldCompress = enabled && data.length >= Math.max(0, minSize);
         if (shouldCompress) {
             if (algorithm == CompressionAlgorithm.ZSTD) {
                 return wrapZstd(data);
@@ -148,10 +184,10 @@ public class CompressionUtil {
 
     private static byte[] wrapLz4(byte[] data) {
         int maxCompressedLen = lz4Compressor.maxCompressedLength(data.length);
-        byte[] tmp = scratchBuffer.get();
+        byte[] tmp = lz4Scratch.get();
         if (tmp.length < maxCompressedLen) {
             tmp = new byte[maxCompressedLen];
-            scratchBuffer.set(tmp);
+            lz4Scratch.set(tmp);
         }
         int compressedLen = lz4Compressor.compress(data, 0, data.length,
             tmp, 0, maxCompressedLen);
@@ -176,17 +212,33 @@ public class CompressionUtil {
     }
 
     private static byte[] wrapZstd(byte[] data) {
-        byte[] compressed = Zstd.compress(data, zstdLevel);
+        long bound = Zstd.compressBound(data.length);
+        if (bound <= 0 || bound > Integer.MAX_VALUE) {
+            throw new CorruptDataException("Invalid ZSTD compression bound: " + bound);
+        }
+        int maxCompressedLen = (int) bound;
+        byte[] tmp = zstdScratch.get();
+        if (tmp.length < maxCompressedLen) {
+            tmp = new byte[maxCompressedLen];
+            zstdScratch.set(tmp);
+        }
 
-        if (compressed.length + 6 < data.length + 2) {
-            byte[] result = new byte[6 + compressed.length];
+        long compressedResult = Zstd.compressByteArray(
+            tmp, 0, maxCompressedLen, data, 0, data.length, zstdLevel);
+        if (Zstd.isError(compressedResult)) {
+            throw new ZstdException(compressedResult, "Failed to compress player data");
+        }
+        int compressedLength = Math.toIntExact(compressedResult);
+
+        if (compressedLength + 6 < data.length + 2) {
+            byte[] result = new byte[6 + compressedLength];
             result[0] = FORMAT_VERSION;
             result[1] = (byte) (FLAG_COMPRESSED | FLAG_ALGORITHM_ZSTD);
             result[2] = (byte) (data.length >>> 24);
             result[3] = (byte) (data.length >>> 16);
             result[4] = (byte) (data.length >>> 8);
             result[5] = (byte) (data.length);
-            System.arraycopy(compressed, 0, result, 6, compressed.length);
+            System.arraycopy(tmp, 0, result, 6, compressedLength);
             if (result.length > maxWrappedBytes) {
                 throw new CorruptDataException("Wrapped payload exceeds configured limit: "
                     + result.length + " > " + maxWrappedBytes + " bytes");
@@ -252,6 +304,19 @@ public class CompressionUtil {
         }
 
         boolean compressed = (flags & FLAG_COMPRESSED) != 0;
+        byte algoBits = version == FORMAT_VERSION_LEGACY
+            ? FLAG_ALGORITHM_LZ4
+            : (byte) (flags & FLAG_ALGORITHM_MASK);
+
+        if (!compressed && algoBits != FLAG_ALGORITHM_LZ4) {
+            throw new CorruptDataException("Compression algorithm set on uncompressed payload: 0x"
+                + Integer.toHexString(algoBits & 0xFF));
+        }
+        if (compressed && algoBits != FLAG_ALGORITHM_LZ4
+                && algoBits != FLAG_ALGORITHM_ZSTD) {
+            throw new CorruptDataException("Unsupported compression algorithm: 0x"
+                + Integer.toHexString(algoBits & 0xFF));
+        }
 
         if (compressed) {
             if (wrappedData.length < 6) {
@@ -271,20 +336,15 @@ public class CompressionUtil {
                     + originalLength + " > " + maxRawBytes + " bytes");
             }
 
-            // Determine algorithm: legacy v1 always LZ4; v2 uses flag bits
-            byte algoBits;
-            if (version == FORMAT_VERSION_LEGACY) {
-                algoBits = FLAG_ALGORITHM_LZ4;
-            } else {
-                algoBits = (byte) (flags & FLAG_ALGORITHM_MASK);
-            }
-
             byte[] restored = new byte[originalLength];
 
             if (algoBits == FLAG_ALGORITHM_ZSTD) {
                 try {
                     long decompressed = Zstd.decompressByteArray(restored, 0, originalLength, wrappedData, 6, wrappedData.length - 6);
-                    if ((int) decompressed != originalLength) {
+                    if (Zstd.isError(decompressed)) {
+                        throw new ZstdException(decompressed);
+                    }
+                    if (decompressed != originalLength) {
                         throw new CorruptDataException(
                             "ZSTD decompression size mismatch (expected=" + originalLength
                                 + ", actual=" + decompressed + ")");

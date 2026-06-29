@@ -430,8 +430,9 @@ public class PlayerDataSerializer {
      *
      * @param componentName one of {@link com.fastsync.sync.dirty.ComponentDirtyMask.Component#name()}
      * @param data          the full PlayerData (only the named component is read)
-     * @return NBT-encoded byte[] for the single component, or null if the
-     *         component is null/empty and should not be stored.
+     * @return NBT-encoded byte[] for the single component, including an
+     *         explicit presence marker for valid empty state; null only for
+     *         an unknown component name.
      */
     public static byte[] serializeComponent(String componentName, PlayerData data) throws IOException {
         CompoundTag root = NBT.createCompound();
@@ -446,11 +447,22 @@ public class PlayerDataSerializer {
      * provided PlayerData. Other fields in {@code data} are left untouched.
      */
     public static void deserializeComponent(String componentName, byte[] bytes, PlayerData data) throws IOException {
-        if (bytes == null || bytes.length == 0) return;
+        if (bytes == null || bytes.length == 0) {
+            throw new IOException("Empty component payload for '" + componentName + "'");
+        }
         CompoundTag root = NBT.fromBytes(bytes);
-        if (root == null) return;
+        if (root == null) {
+            throw new IOException("Invalid NBT root for component '" + componentName + "'");
+        }
         Tag tag = root.get(componentName);
-        if (!(tag instanceof CompoundTag componentRoot)) return;
+        if (!(tag instanceof CompoundTag componentRoot)) {
+            throw new IOException("Component payload missing compound root '"
+                + componentName + "'");
+        }
+        if (componentRoot.get("_present") == null || !componentRoot.getBoolean("_present")) {
+            throw new IOException("Component '" + componentName
+                + "' missing required _present marker");
+        }
         deserializeComponentFields(componentName, componentRoot, data);
     }
 

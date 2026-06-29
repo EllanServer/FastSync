@@ -4,6 +4,7 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -182,6 +183,10 @@ public class MessageManager {
      * @param plugin the plugin instance
      */
     public void reload(JavaPlugin plugin) {
+        // Locale maps are immutable snapshots layered over English. Keeping
+        // them would make /fastsync reload appear to work only for the global
+        // language while already-seen player locales stayed stale.
+        localeOverrides.clear();
         messages.clear();
         loadFromResource(plugin, "messages_en.yml");
         if (!language.equals("en")) {
@@ -260,27 +265,8 @@ public class MessageManager {
         }
     }
 
-    @SuppressWarnings("unchecked")
     private void flattenYamlTo(String prefix, YamlConfiguration yaml, Map<String, String> target) {
-        for (String key : yaml.getKeys(false)) {
-            String fullKey = prefix.isEmpty() ? key : prefix + "." + key;
-            Object value = yaml.get(key);
-            if (value instanceof org.bukkit.configuration.ConfigurationSection section) {
-                for (String subKey : section.getKeys(false)) {
-                    String subFullKey = fullKey + "." + subKey;
-                    Object subValue = section.get(subKey);
-                    if (subValue instanceof org.bukkit.configuration.ConfigurationSection) {
-                        YamlConfiguration subYaml = new YamlConfiguration();
-                        subYaml.set("", subValue);
-                        flattenYamlTo(fullKey, subYaml, target);
-                    } else {
-                        target.put(subFullKey, String.valueOf(subValue));
-                    }
-                }
-            } else {
-                target.put(fullKey, String.valueOf(value));
-            }
-        }
+        flattenSection(prefix, yaml, target);
     }
 
     private void loadFromResource(JavaPlugin plugin, String resourceFile) {
@@ -324,26 +310,18 @@ public class MessageManager {
     /**
      * Recursively flatten a YAML config into dot-notation keys.
      */
-    @SuppressWarnings("unchecked")
     private void flattenYaml(String prefix, YamlConfiguration yaml, Map<String, String> target) {
-        for (String key : yaml.getKeys(false)) {
+        flattenSection(prefix, yaml, target);
+    }
+
+    private static void flattenSection(String prefix, ConfigurationSection section,
+                                       Map<String, String> target) {
+        for (String key : section.getKeys(false)) {
             String fullKey = prefix.isEmpty() ? key : prefix + "." + key;
-            Object value = yaml.get(key);
-            if (value instanceof org.bukkit.configuration.ConfigurationSection section) {
-                // Recurse into nested section
-                for (String subKey : section.getKeys(false)) {
-                    String subFullKey = fullKey + "." + subKey;
-                    Object subValue = section.get(subKey);
-                    if (subValue instanceof org.bukkit.configuration.ConfigurationSection) {
-                        // Deeper nesting — use a sub-config
-                        YamlConfiguration subYaml = new YamlConfiguration();
-                        subYaml.set("", subValue);
-                        flattenYaml(fullKey, subYaml, target);
-                    } else {
-                        target.put(subFullKey, String.valueOf(subValue));
-                    }
-                }
-            } else {
+            Object value = section.get(key);
+            if (value instanceof ConfigurationSection child) {
+                flattenSection(fullKey, child, target);
+            } else if (value != null) {
                 target.put(fullKey, String.valueOf(value));
             }
         }

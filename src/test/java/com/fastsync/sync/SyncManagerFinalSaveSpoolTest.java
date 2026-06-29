@@ -157,6 +157,12 @@ class SyncManagerFinalSaveSpoolTest {
                 new RuntimeException("wrapped", new SQLException("db down"))));
         assertEquals(SyncManager.SaveFailureReason.SERIALIZATION_ERROR,
             SyncManager.classifySaveException(new IOException("cannot encode")));
+        assertEquals(SyncManager.SaveFailureReason.SERIALIZATION_ERROR,
+            SyncManager.classifySaveException(
+                new com.fastsync.serialization.CorruptDataException("bad compressed frame")));
+        assertEquals(SyncManager.SaveFailureReason.SERIALIZATION_ERROR,
+            SyncManager.classifySaveException(
+                new com.fastsync.serialization.ItemSerializationException("bad item")));
         assertEquals(SyncManager.SaveFailureReason.UNKNOWN,
             SyncManager.classifySaveException(new IllegalStateException("unexpected")));
     }

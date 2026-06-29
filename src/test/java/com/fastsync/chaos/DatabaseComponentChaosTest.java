@@ -137,12 +137,12 @@ class DatabaseComponentChaosTest {
         assertTrue(lock.acquired());
 
         DatabaseManager.PlayerDataRow cursor = databaseManager.loadPlayerDataRow(uuid);
-        Map<String, byte[]> components = Map.of("FOOD", new byte[]{4, 5, 6});
-        Map<String, Long> checksums = Map.of("FOOD", 456L);
+        java.util.List<DatabaseManager.ComponentWrite> components = java.util.List.of(
+            new DatabaseManager.ComponentWrite("FOOD", new byte[]{4, 5, 6}, 456L));
         long foodBit = 1L << 3;
 
         var saved = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, lock.fencingToken(), session,
+            uuid, components, server, lock.fencingToken(), session,
             cursor.version(), foodBit, cursor.componentGeneration(), cursor.componentBitmap());
 
         assertTrue(saved.success());
@@ -152,7 +152,7 @@ class DatabaseComponentChaosTest {
             uuid, java.util.Set.of("FOOD"), cursor.componentGeneration()).size());
 
         var rejected = databaseManager.upsertComponentsIfLockHeld(
-            uuid, components, checksums, server, lock.fencingToken(), session,
+            uuid, components, server, lock.fencingToken(), session,
             saved.newVersion(), foodBit, cursor.componentGeneration() + 1, saved.componentBitmap());
         assertFalse(rejected.success());
         assertEquals(DatabaseManager.ComponentRejectReason.STALE_GENERATION, rejected.reason());

@@ -6,11 +6,12 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * ItemStack serialization using Paper 1.21.11+ native NBT byte[] API.
+ * ItemStack serialization using Paper 1.21.11-26.2 native NBT byte[] API.
  *
  * <p>Uses {@code ItemStack.serializeAsBytes()} / {@code ItemStack.deserializeBytes()}
  * directly — no reflection, no Bukkit object serialization fallback, no NMS detection.
- * Target: Paper 1.21.11 (api-version in plugin.yml).
+ * Runtime range: Paper 1.21.11 through 26.2 (api-version stays 1.21 so the
+ * same Java 21 bytecode JAR loads at both ends).
  *
  * <p><b>Failure handling:</b> serialization / deserialization failures do
  * <em>not</em> return an empty array or {@code null}. Doing so would silently

@@ -1,5 +1,7 @@
 import org.gradle.api.file.DuplicatesStrategy
+import org.gradle.language.jvm.tasks.ProcessResources
 import java.time.Duration
+import java.util.zip.ZipFile
 
 plugins {
     java
@@ -21,6 +23,34 @@ repositories {
 group = property("group") as String
 version = property("version") as String
 val paperVersion: String = property("paper.version") as String
+// Paper changed its Maven versioning scheme after Minecraft 1.21.11:
+//   1.21.11 -> 1.21.11-R0.1-SNAPSHOT
+//   26.2    -> 26.2.build.<n>-alpha
+// Keep the property convenient for both schemes so CI can compile the same
+// source against the oldest and newest supported APIs.
+val paperApiVersion = if (paperVersion.startsWith("26.")) {
+    paperVersion
+} else {
+    "$paperVersion-R0.1-SNAPSHOT"
+}
+val paperJavaVersion = if (paperVersion.startsWith("26.")) 25 else 21
+
+// Gradle normally derives the consumer JVM attribute from --release (21),
+// which correctly protects runtime dependencies but prevents a Java 25
+// compiler from even reading Paper 26.2's Java 25 API artifact. For the 26.2
+// compatibility compile only, select Java 25 API variants while javac still
+// emits --release 21 plugin classes.
+if (paperJavaVersion == 25) {
+    listOf("compileClasspath", "testCompileClasspath", "testRuntimeClasspath")
+        .forEach { configurationName ->
+            configurations.named(configurationName) {
+                attributes.attribute(
+                    org.gradle.api.attributes.java.TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE,
+                    paperJavaVersion
+                )
+            }
+        }
+}
 
 // =============================================================================
 // Dependencies
@@ -29,9 +59,9 @@ val paperVersion: String = property("paper.version") as String
 // Strategy:
 //   - Sparrow-NBT / Sparrow-YAML (not on Maven Central) → implementation,
 //     shaded into the JAR by the shadowJar task.
-//   - Self-contained Maven Central libs (HikariCP, LZ4, jOOQ, Caffeine)
-//     → implementation, shaded + relocated into the JAR to avoid cold-start
-//     download dependency and classpath conflicts.
+//   - Self-contained Maven Central libs (HikariCP, LZ4, ZSTD, jOOQ)
+//     → implementation and shaded into the JAR; relocated where JNI/SPI rules
+//     permit, avoiding cold-start downloads and classpath conflicts.
 //   - Complex Maven Central libs (Redisson, MySQL connector, reactive-streams)
 //     → compileOnly for compilation; declared in plugin.yml `libraries:` so
 //     Paper downloads them at startup. These have deep transitive chains
@@ -40,7 +70,7 @@ val paperVersion: String = property("paper.version") as String
 // =============================================================================
 dependencies {
     // Compile-only: provided by Paper/Folia at runtime
-    compileOnly("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
+    compileOnly("io.papermc.paper:paper-api:$paperApiVersion")
 
     // Velocity proxy API. Velocity publishes ONLY snapshot artifacts (no stable
     // releases) — 3.5.0-SNAPSHOT is the current version on PaperMC's Maven repo
@@ -74,7 +104,6 @@ dependencies {
     // them. Keep the API on the compile classpath so clean -Xlint builds can
     // inspect those annotations without emitting missing-class warnings.
     compileOnly("jakarta.xml.bind:jakarta.xml.bind-api:4.0.5")
-    implementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
     // jOOQ 3.21 has a transitive dependency on io.r2dbc:r2dbc-spi (jOOQ's R2DBC
     // support). jOOQ's static initializer references io.r2dbc.spi.ConnectionFactory
     // even when only the JDBC DSL is used, so r2dbc-spi MUST be on the runtime
@@ -115,22 +144,23 @@ dependencies {
     testImplementation("org.mockito:mockito-core:5.23.0")
     testImplementation("org.mockito:mockito-junit-jupiter:5.23.0")
     testImplementation("org.openjdk.jmh:jmh-core:1.37")
-    testImplementation("org.openjdk.jmh:jmh-generator-annprocess:1.37")
+    testAnnotationProcessor("org.openjdk.jmh:jmh-generator-annprocess:1.37")
     // Paper API + Maven Central runtime deps needed at test runtime.
-    testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
+    testImplementation("io.papermc.paper:paper-api:$paperApiVersion")
     testImplementation("com.zaxxer:HikariCP:7.1.0")
     testImplementation("at.yawk.lz4:lz4-java:1.11.0")
     testImplementation("com.github.luben:zstd-jni:1.5.6-3")
     testImplementation("com.mysql:mysql-connector-j:9.7.0")
     testImplementation("org.redisson:redisson:4.6.1")
     testImplementation("org.jooq:jooq:3.21.6")
-    testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
     testImplementation("org.reactivestreams:reactive-streams:1.0.4")
 }
 
 java {
     toolchain {
-        languageVersion.set(JavaLanguageVersion.of(21))
+        // 26.2 API artifacts are Java 25 class files. The plugin itself still
+        // targets Java 21 bytecode so one JAR runs on Paper 1.21.11 and 26.2.
+        languageVersion.set(JavaLanguageVersion.of(paperJavaVersion))
     }
 }
 
@@ -149,6 +179,12 @@ tasks.withType<Test>().configureEach {
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = true
+    }
+}
+
+tasks.named<ProcessResources>("processResources") {
+    filesMatching("plugin.yml") {
+        expand("version" to project.version.toString())
     }
 }
 
@@ -255,8 +291,8 @@ val velocityJar = tasks.register<Jar>("velocityJar") {
 // =============================================================================
 // Main JAR: Paper/Folia backend plugin (shadowJar)
 // =============================================================================
-// Self-contained runtime deps (HikariCP, LZ4, jOOQ, Caffeine) + Sparrow
-// libraries are shaded into this JAR and relocated to com.fastsync.libs.*.
+// Self-contained runtime deps (HikariCP, LZ4, ZSTD, jOOQ) + Sparrow
+// libraries are shaded into this JAR and relocated where safe.
 // Complex deps (Redisson, MySQL connector, reactive-streams) are declared in
 // plugin.yml `libraries:` and auto-downloaded by Paper at startup. The manifest
 // declares `paperweight-mappings-namespace: mojang` so Paper skips its
@@ -281,7 +317,6 @@ tasks.shadowJar {
                 && !group.startsWith("com.zaxxer")
                 && !group.startsWith("at.yawk")
                 && !group.startsWith("org.jooq")
-                && !group.startsWith("com.github.ben-manes")
                 && !group.startsWith("com.github.luben")
                 && !group.startsWith("io.r2dbc")
         }
@@ -291,9 +326,9 @@ tasks.shadowJar {
     // io.r2dbc is intentionally NOT relocated — see comment above.
     relocate("com.zaxxer.hikari", "com.fastsync.libs.hikari")
     relocate("net.jpountz", "com.fastsync.libs.lz4")
-    relocate("com.github.luben", "com.fastsync.libs.zstd")
+    // Do NOT relocate zstd-jni. Its native symbols are bound to the original
+    // com.github.luben.zstd package; relocating it produces UnsatisfiedLinkError.
     relocate("org.jooq", "com.fastsync.libs.jooq")
-    relocate("com.github.benmanes.caffeine", "com.fastsync.libs.caffeine")
 
     // Strip META-INF signatures and duplicate metadata
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",
@@ -318,6 +353,63 @@ tasks.named("assemble") {
     dependsOn("shadowJar", velocityJar)
 }
 
+val verifyShadowRuntime = tasks.register<JavaExec>("verifyShadowRuntime") {
+    group = "verification"
+    description = "Loads the final shadow JAR and exercises JNI-backed ZSTD."
+    dependsOn("shadowJar", "testClasses")
+    classpath = files(tasks.shadowJar.flatMap { it.archiveFile }) + sourceSets["test"].output
+    mainClass.set("com.fastsync.serialization.ShadowRuntimeProbe")
+}
+
+val verifyPluginMetadata = tasks.register("verifyPluginMetadata") {
+    group = "verification"
+    description = "Verifies that plugin.yml in the final JAR contains resolved metadata."
+    dependsOn("shadowJar")
+    val shadowArchive = tasks.shadowJar.flatMap { it.archiveFile }
+    inputs.file(shadowArchive)
+    doLast {
+        val pluginYml = ZipFile(shadowArchive.get().asFile).use { zip ->
+            val entry = checkNotNull(zip.getEntry("plugin.yml")) {
+                "Final shadow JAR does not contain plugin.yml"
+            }
+            zip.getInputStream(entry).bufferedReader().use { it.readText() }
+        }
+        check("version: '${project.version}'" in pluginYml) {
+            "plugin.yml does not contain resolved project version ${project.version}"
+        }
+        check("\${" !in pluginYml) {
+            "plugin.yml still contains an unresolved template placeholder"
+        }
+    }
+}
+
+val verifyJava21Bytecode = tasks.register("verifyJava21Bytecode") {
+    group = "verification"
+    description = "Verifies FastSync remains Java 21 bytecode under every API toolchain."
+    dependsOn("classes")
+    val classFile = layout.buildDirectory.file(
+        "classes/java/main/com/fastsync/FastSync.class")
+    inputs.file(classFile)
+    doLast {
+        val bytes = classFile.get().asFile.readBytes()
+        check(bytes.size >= 8) { "FastSync.class is truncated" }
+        val major = ((bytes[6].toInt() and 0xff) shl 8) or
+            (bytes[7].toInt() and 0xff)
+        check(major == 65) {
+            "FastSync.class major version is $major; expected 65 (Java 21)"
+        }
+    }
+}
+
 tasks.named("check") {
-    dependsOn("test")
+    dependsOn("test", verifyShadowRuntime, verifyPluginMetadata, verifyJava21Bytecode)
+}
+
+val jmhBenchmark = tasks.register<JavaExec>("jmhBenchmark") {
+    group = "verification"
+    description = "Runs the focused JMH hot-path benchmark suite."
+    dependsOn("testClasses")
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.fastsync.benchmark.BenchmarkRunner")
+    providers.gradleProperty("jmh.include").orNull?.let { args(it) }
 }

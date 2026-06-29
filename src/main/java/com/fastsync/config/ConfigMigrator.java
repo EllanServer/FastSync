@@ -31,7 +31,7 @@ public class ConfigMigrator {
         this.plugin = plugin;
     }
 
-    private static final int CURRENT_CONFIG_VERSION = 2;
+    private static final int CURRENT_CONFIG_VERSION = 3;
 
     /**
      * Check and migrate the config file if needed.
@@ -56,7 +56,7 @@ public class ConfigMigrator {
 
         boolean changed = false;
 
-        // v1 → v2: Added config_version, language, zstd-level
+        // v1 → v2: Added config_version, language and multi-codec compression.
         if (currentVersion < 2) {
             if (!yaml.contains("language")) {
                 yaml.set("language", "en");
@@ -71,6 +71,13 @@ public class ConfigMigrator {
                 yaml.set("compression.type", "LZ4");
                 changed = true;
             }
+        }
+
+        // v2 -> v3: correct the advertised wrapper format. Runtime v2 remains
+        // backward-readable with all v1 LZ4 blobs.
+        if (currentVersion < 3) {
+            yaml.set("serialization.format-version", 2);
+            changed = true;
         }
 
         // Update config version

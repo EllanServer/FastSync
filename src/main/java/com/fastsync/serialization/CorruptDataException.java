@@ -1,9 +1,9 @@
 package com.fastsync.serialization;
 
 /**
- * Thrown when a wrapped (optionally LZ4-compressed) byte[] cannot be safely
+ * Thrown when a wrapped (optionally LZ4/ZSTD-compressed) byte[] cannot be safely
  * unwrapped — for example because the declared original length is missing,
- * non-positive, exceeds the configured cap, or because LZ4 decompression
+ * non-positive, exceeds the configured cap, or because codec decompression
  * itself failed.
  *
  * <p>This is a data-corruption signal, not a normal control-flow path. The

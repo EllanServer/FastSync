@@ -1,4 +1,5 @@
 # FastSync E2E test config for paper-a
+config_version: 3
 server-name: "paper-a"
 
 database:
@@ -78,10 +79,11 @@ snapshot:
 compression:
   enabled: true
   type: "LZ4"
+  zstd-level: 3
   min-size: 128
 
 serialization:
-  format-version: 1
+  format-version: 2
 
 debug: true
 log-timing: true

@@ -6,6 +6,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Locale;
 import java.util.logging.Logger;
 
 /**
@@ -219,7 +220,21 @@ public class ConfigManager {
         plugin.saveDefaultConfig();
         File configFile = new File(plugin.getDataFolder(), "config.yml");
 
-        // Single path: parse with sparrow-yaml (preserves comments, typed access).
+        // Validate with the strict parser before migration. Bukkit's migration
+        // parser is intentionally lenient and could otherwise turn malformed
+        // YAML into an empty config and overwrite the operator's file.
+        try {
+            yaml.load(configFile);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to parse config.yml with sparrow-yaml: "
+                + e.getMessage(), e);
+        }
+
+        // Migration may rewrite the file, so parse the post-migration bytes
+        // again. The old implementation kept the pre-migration document and
+        // did not apply migrated values until the next restart.
+        new ConfigMigrator(plugin).checkAndMigrate(configFile);
+
         // Clean-slate: there is NO Bukkit FileConfiguration fallback. A parse
         // failure is a hard error — the plugin cannot start with an unreadable
         // config. Previously a silent Bukkit fallback masked schema drift and
@@ -231,9 +246,6 @@ public class ConfigManager {
             throw new RuntimeException("Failed to parse config.yml with sparrow-yaml: "
                 + e.getMessage(), e);
         }
-
-        // Config version migration — handle renamed/removed/added keys
-        new ConfigMigrator(plugin).checkAndMigrate(configFile);
 
         this.doc = loaded;
 
@@ -342,15 +354,6 @@ public class ConfigManager {
                     + "on the event thread can block the game tick under DB "
                     + "latency. Recommended: set allow-sync-fallback=false and "
                     + "rely on the spool + replay service.");
-            }
-            // Component storage remains opt-in because its DB layout differs
-            // from the full-Blob path. Keep an operational reminder in
-            // production mode even though the hot path is fully fenced.
-            if (componentStorageEnabled) {
-                logger.warning("[Config] production.enabled=true with "
-                    + "sync.component-storage.enabled=true. Component storage is opt-in; "
-                    + "monitor version conflicts, "
-                    + "overlay completeness errors, and failed spool counts closely.");
             }
             logger.info("[Config] Production mode enabled. Redis required=" + productionRequireRedis
                 + ", cluster-id required=" + productionRequireClusterId
@@ -505,11 +508,10 @@ public class ConfigManager {
         apiMutationFullComponentScanInterval = Math.max(1, Math.min(
             source.getInt("sync.dirty-tracking.api-mutation-safety.full-component-scan-interval", 3), 20));
 
-        // Phase 2: per-component storage. When enabled, dirty components are
+        // Per-component storage. When enabled, dirty components are
         // written to the player_component table instead of rewriting the full
         // player_data Blob. Reads check component_bitmap to decide which path.
-        // Disabled by default — needs explicit opt-in until battle-tested.
-        componentStorageEnabled = source.getBoolean("sync.component-storage.enabled", false);
+        componentStorageEnabled = source.getBoolean("sync.component-storage.enabled", true);
         componentBatchSize = source.getInt("sync.component-storage.batch-size", 15);
         if (componentBatchSize < 1) componentBatchSize = 15;
 
@@ -659,12 +661,33 @@ public class ConfigManager {
 
         // Compression
         compressionEnabled = source.getBoolean("compression.enabled", true);
-        compressionType = source.getString("compression.type", "LZ4");
+        compressionType = source.getString("compression.type", "LZ4")
+            .trim().toUpperCase(Locale.ROOT);
+        if (!compressionType.equals("LZ4") && !compressionType.equals("ZSTD")) {
+            logger.warning("[Config] compression.type must be LZ4 or ZSTD; using LZ4.");
+            compressionType = "LZ4";
+        }
         compressionMinSize = source.getInt("compression.min-size", 128);
-        zstdLevel = source.getInt("compression.zstd-level", 3);
+        if (compressionMinSize < 0) {
+            logger.warning("[Config] compression.min-size must be >= 0; using 0.");
+            compressionMinSize = 0;
+        }
+        int configuredZstdLevel = source.getInt("compression.zstd-level", 3);
+        zstdLevel = Math.max(1, Math.min(22, configuredZstdLevel));
+        if (zstdLevel != configuredZstdLevel) {
+            logger.warning("[Config] compression.zstd-level must be 1-22; using "
+                + zstdLevel + ".");
+        }
 
         // Serialization
-        formatVersion = (byte) source.getInt("serialization.format-version", 1);
+        formatVersion = (byte) source.getInt("serialization.format-version",
+            com.fastsync.serialization.CompressionUtil.FORMAT_VERSION);
+        if (formatVersion != com.fastsync.serialization.CompressionUtil.FORMAT_VERSION) {
+            logger.warning("[Config] serialization.format-version is managed by FastSync; "
+                + "runtime format is "
+                + com.fastsync.serialization.CompressionUtil.FORMAT_VERSION + ".");
+            formatVersion = com.fastsync.serialization.CompressionUtil.FORMAT_VERSION;
+        }
         // Decompression bounds — guard against corrupted / poisoned blobs
         // triggering OOM on the login thread. Defaults match CompressionUtil.
         serializationMaxRawBytes = source.getInt("serialization.max-raw-bytes", 1 << 20);          // 1 MiB
@@ -674,17 +697,17 @@ public class ConfigManager {
         com.fastsync.serialization.CompressionUtil.configureLimits(
             serializationMaxRawBytes, serializationMaxWrappedBytes);
 
-        // Configure compression algorithm
-        if (compressionEnabled) {
-            if (isZstdCompression()) {
-                com.fastsync.serialization.CompressionUtil.setAlgorithm(
-                    com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.ZSTD);
-                com.fastsync.serialization.CompressionUtil.setZstdLevel(zstdLevel);
-            } else {
-                com.fastsync.serialization.CompressionUtil.setAlgorithm(
-                    com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.LZ4);
-            }
+        // Configure compression, including the disabled state on reload.
+        com.fastsync.serialization.CompressionUtil.setEnabled(compressionEnabled);
+        if (isZstdCompression()) {
+            com.fastsync.serialization.CompressionUtil.setAlgorithm(
+                com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.ZSTD);
+            com.fastsync.serialization.CompressionUtil.setZstdLevel(zstdLevel);
+        } else {
+            com.fastsync.serialization.CompressionUtil.setAlgorithm(
+                com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.LZ4);
         }
+        com.fastsync.serialization.CompressionUtil.verifyConfiguredCodec();
 
         // Debug
         debug = source.getBoolean("debug", false);
@@ -766,7 +789,7 @@ public class ConfigManager {
     public ApiMutationSafetyMode getApiMutationSafetyMode() { return apiMutationSafetyMode; }
     public int getApiMutationFullComponentScanInterval() { return apiMutationFullComponentScanInterval; }
 
-    /** Phase 2: per-component storage (writes dirty components to player_component table). */
+    /** Per-component storage (writes dirty components to player_component table). */
     public boolean isComponentStorageEnabled() { return componentStorageEnabled; }
     /** Max components per batch upsert transaction. */
     public int getComponentBatchSize() { return componentBatchSize; }
