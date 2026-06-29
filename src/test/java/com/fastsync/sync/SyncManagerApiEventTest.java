@@ -8,7 +8,9 @@ import com.fastsync.sync.strategy.PdcSyncStrategy;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.Event;
+import org.bukkit.event.HandlerList;
 import org.bukkit.plugin.PluginManager;
+import org.bukkit.plugin.RegisteredListener;
 import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
 
@@ -68,6 +70,14 @@ class SyncManagerApiEventTest {
         map(manager, "playerFencingTokens").put(uuid, 9L);
         map(manager, "playerLockSessions").put(uuid, "session-a");
 
+        // Ensure fireSaveEvent does not short-circuit on the empty-listener
+        // fast path.  When getRegisteredListeners() reports a non-empty list,
+        // the code proceeds to Bukkit.getPluginManager().callEvent(), which
+        // our mock below uses to cancel the save.
+        HandlerList handlerList = mock(HandlerList.class);
+        when(handlerList.getRegisteredListeners()).thenReturn(
+            new RegisteredListener[]{mock(RegisteredListener.class)});
+
         PluginManager pluginManager = mock(PluginManager.class);
         doAnswer(invocation -> {
             Event event = invocation.getArgument(0);
@@ -76,8 +86,11 @@ class SyncManagerApiEventTest {
             }
             return null;
         }).when(pluginManager).callEvent(any(Event.class));
-        try (MockedStatic<Bukkit> bukkit = mockStatic(Bukkit.class)) {
+        try (MockedStatic<Bukkit> bukkit = mockStatic(Bukkit.class);
+             MockedStatic<FastSyncEvents.FastSyncSaveEvent> eventStatic =
+                 mockStatic(FastSyncEvents.FastSyncSaveEvent.class)) {
             bukkit.when(Bukkit::getPluginManager).thenReturn(pluginManager);
+            eventStatic.when(FastSyncEvents.FastSyncSaveEvent::getHandlerList).thenReturn(handlerList);
             manager.collectAndSavePlayerData(player);
         }
 
