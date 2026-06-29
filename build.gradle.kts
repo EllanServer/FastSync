@@ -223,7 +223,7 @@ dependencies {
     add("velocityOnly", "org.slf4j:slf4j-api:2.0.18")
     // Adventure exposes JetBrains annotations in its public API but does not
     // publish them transitively for this custom compile-only configuration.
-    add("velocityOnly", "org.jetbrains:annotations:26.0.2-1")
+    add("velocityOnly", "org.jetbrains:annotations:26.1.0")
     // Netty BOM as platform (see main dependencies block for rationale)
     add("velocityOnly", platform("io.netty:netty-bom:4.2.15.Final"))
     add("velocityOnly", "io.netty:netty-transport:4.2.15.Final")
