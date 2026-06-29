@@ -99,7 +99,7 @@ dependencies {
     implementation("net.momirealms:sparrow-yaml:1.0.7")
 
     // Test
-    testImplementation(platform("org.junit:junit-bom:6.1.0"))
+    testImplementation(platform("org.junit:junit-bom:6.1.1"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     // Gradle 9.x no longer auto-adds the JUnit Platform launcher.
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
