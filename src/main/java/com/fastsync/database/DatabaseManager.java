@@ -1471,7 +1471,8 @@ public class DatabaseManager implements DatabaseBackend {
                     conn.setAutoCommit(oldAutoCommit);
                     return ComponentBatchResult.rejected("stale collected version (expected: "
                         + expectedVersion + ", actual: " + currentVersion + ")",
-                        ComponentRejectReason.STALE_VERSION);
+                        ComponentRejectReason.STALE_VERSION, currentVersion,
+                        currentBitmap, generation);
                 }
 
                 // 3. Upsert component rows with current generation

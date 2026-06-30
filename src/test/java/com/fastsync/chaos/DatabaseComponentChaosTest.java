@@ -161,6 +161,32 @@ class DatabaseComponentChaosTest {
     }
 
     @Test
+    void staleVersionRejectionReturnsAuthoritativeRecoveryCursor() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        String server = "server-A";
+        String session = "stale-version-session";
+        var lock = databaseManager.acquireLock(uuid, server, session);
+        assertTrue(lock.acquired());
+
+        Map<String, byte[]> components = Map.of("FOOD", new byte[]{1, 2, 3});
+        Map<String, Long> checksums = Map.of("FOOD", 123L);
+        long foodBit = 1L << 3;
+
+        var saved = databaseManager.upsertComponentsIfLockHeld(
+            uuid, components, checksums, server, lock.fencingToken(), session, 0L, foodBit);
+        assertTrue(saved.success());
+
+        var stale = databaseManager.upsertComponentsIfLockHeld(
+            uuid, components, checksums, server, lock.fencingToken(), session, 0L, foodBit);
+
+        assertFalse(stale.success());
+        assertEquals(DatabaseManager.ComponentRejectReason.STALE_VERSION, stale.reason());
+        assertEquals(saved.newVersion(), stale.newVersion());
+        assertEquals(saved.componentBitmap(), stale.componentBitmap());
+        assertEquals(saved.generation(), stale.generation());
+    }
+
+    @Test
     void testComponentSaveWithStaleFencingRejected() throws SQLException {
         UUID uuid = UUID.randomUUID();
         String serverA = "server-A";

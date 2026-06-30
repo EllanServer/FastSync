@@ -384,12 +384,15 @@ public class PlayerDataSerializer {
         ItemStack[] items = new ItemStack[list.size()];
         for (int i = 0; i < list.size(); i++) {
             Tag element = list.get(i);
-            if (element instanceof net.momirealms.sparrow.nbt.ByteArrayTag baTag) {
-                // ItemStackCompat.deserialize returns null for an empty payload
-                // (a real air slot) and throws ItemSerializationException on
-                // genuine corruption. Both behaviors are correct here.
-                items[i] = ItemStackCompat.deserialize(baTag.getAsByteArray());
+            if (!(element instanceof net.momirealms.sparrow.nbt.ByteArrayTag baTag)) {
+                throw new ItemSerializationException("Invalid item tag at slot " + i
+                    + ": expected ByteArrayTag, got "
+                    + (element == null ? "null" : element.getClass().getSimpleName()));
             }
+            // ItemStackCompat.deserialize returns null for an empty payload
+            // (a real air slot) and throws ItemSerializationException on
+            // genuine corruption. Both behaviors are correct here.
+            items[i] = ItemStackCompat.deserialize(baTag.getAsByteArray());
         }
         return items;
     }

@@ -224,6 +224,12 @@ class SyncManagerRound15Test {
 
         // Verify getLockState was called after each failed attempt (2 times).
         verify(databaseManager, times(2)).getLockState(eq(uuid));
+
+        // No authoritative component cursor was loaded in this test. A full
+        // save must not invent generation=1; real hot-reload sessions may be at
+        // any generation, so the compatibility DB read must seed it later.
+        ConcurrentHashMap<UUID, ?> componentCursors = getField("componentCursors");
+        assertFalse(componentCursors.containsKey(uuid));
     }
 
     /**
@@ -346,6 +352,8 @@ class SyncManagerRound15Test {
         PlayerData data = (PlayerData) method.invoke(syncManager, player, snapshot);
 
         assertTrue(data.isComponentSubset());
+        assertTrue(data.isComponentCollected(
+            com.fastsync.sync.dirty.ComponentDirtyMask.Component.FOOD.storageMask()));
         assertEquals(17, data.getFoodLevel());
         assertEquals(4.5F, data.getSaturation());
         assertNull(data.getInventory());
@@ -371,6 +379,99 @@ class SyncManagerRound15Test {
         assertFalse(result.success());
         verify(databaseManager, never()).saveDataKeepLockClearComponents(
             any(), any(), anyLong(), anyLong(), anyLong(), any(), any());
+    }
+
+    @Test
+    void configReloadCannotPersistUncollectedSubsetComponents() throws Exception {
+        UUID uuid = UUID.randomUUID();
+        long foodBit = com.fastsync.sync.dirty.ComponentDirtyMask.Component.FOOD.storageMask();
+
+        PlayerData partial = PlayerData.forComponentSubset();
+        partial.setVersion(3L);
+        partial.setFencingToken(5L);
+        partial.setFoodLevel(18);
+        partial.setSaturation(4.0F);
+        partial.markComponentCollected(foodBit);
+
+        when(config.isComponentStorageEnabled()).thenReturn(true);
+        when(config.getComponentBatchSize()).thenReturn(10);
+        // Simulate a reload after collection: FOOD was collected under the old
+        // config, while VITALS is enabled only now and is absent from `partial`.
+        when(config.isSyncFood()).thenReturn(false);
+        when(config.isSyncHealth()).thenReturn(true);
+
+        com.fastsync.sync.dirty.ComponentDirtyMask dirtyMask =
+            mock(com.fastsync.sync.dirty.ComponentDirtyMask.class);
+        when(dirtyMask.isAnyDirty(uuid)).thenReturn(true);
+        com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot snapshot =
+            mock(com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.class);
+        when(snapshot.isEmpty()).thenReturn(false);
+        when(snapshot.components()).thenReturn(java.util.Set.of(
+            com.fastsync.sync.dirty.ComponentDirtyMask.Component.FOOD,
+            com.fastsync.sync.dirty.ComponentDirtyMask.Component.VITALS));
+        injectField("dirtyMask", dirtyMask);
+        java.util.Set<UUID> baseline = getField("playersWithBaseline");
+        baseline.add(uuid);
+        ConcurrentHashMap<UUID, String> sessions = getField("playerLockSessions");
+        sessions.put(uuid, "reload-session");
+
+        when(databaseManager.upsertComponentsIfLockHeld(
+                eq(uuid), anyMap(), anyMap(), eq("test-server"), eq(5L),
+                eq("reload-session"), eq(3L), eq(foodBit)))
+            .thenReturn(DatabaseManager.ComponentBatchResult.success(3L, 4L, foodBit, 2L));
+
+        SyncManager.SaveResult result = invokePersistCollectedData(
+            uuid, partial, SyncManager.SaveKind.PERIODIC, snapshot);
+
+        assertTrue(result.success());
+        verify(databaseManager).upsertComponentsIfLockHeld(
+            eq(uuid), argThat(map -> map.keySet().equals(java.util.Set.of("FOOD"))),
+            argThat(map -> map.keySet().equals(java.util.Set.of("FOOD"))),
+            eq("test-server"), eq(5L), eq("reload-session"), eq(3L), eq(foodBit));
+        verify(dirtyMask).clearDirty(uuid, snapshot, foodBit);
+    }
+
+    @Test
+    void snapshotTriggerForcesFullBlobInsteadOfComponentFastPath() throws Exception {
+        UUID uuid = UUID.randomUUID();
+        PlayerData data = new PlayerData();
+        data.setVersion(3L);
+        data.setFencingToken(5L);
+
+        when(config.isComponentStorageEnabled()).thenReturn(true);
+        when(config.getMaxSnapshots()).thenReturn(16);
+        com.fastsync.sync.dirty.ComponentDirtyMask dirtyMask =
+            mock(com.fastsync.sync.dirty.ComponentDirtyMask.class);
+        when(dirtyMask.isAnyDirty(uuid)).thenReturn(true);
+        injectField("dirtyMask", dirtyMask);
+        injectField("snapshotTriggerSet", java.util.Set.of("death"));
+
+        ConcurrentHashMap<UUID, String> sessions = getField("playerLockSessions");
+        sessions.put(uuid, "snapshot-session");
+        when(databaseManager.saveDataKeepLockClearComponents(
+                eq(uuid), any(byte[].class), anyLong(), eq(3L), eq(5L),
+                eq("test-server"), eq("snapshot-session")))
+            .thenReturn(true);
+
+        SnapshotManager snapshots = mock(SnapshotManager.class);
+        when(snapshots.createSnapshot(eq(uuid), any(byte[].class), eq("death")))
+            .thenReturn(java.util.concurrent.CompletableFuture.completedFuture(1L));
+        when(snapshots.pruneSnapshots(uuid, 16))
+            .thenReturn(java.util.concurrent.CompletableFuture.completedFuture(null));
+        injectField("snapshotManager", snapshots);
+
+        SyncManager.SaveResult result = invokePersistCollectedData(
+            uuid, data, SyncManager.SaveKind.DEATH,
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY);
+
+        assertTrue(result.success());
+        verify(databaseManager).saveDataKeepLockClearComponents(
+            eq(uuid), any(byte[].class), anyLong(), eq(3L), eq(5L),
+            eq("test-server"), eq("snapshot-session"));
+        verify(databaseManager, never()).upsertComponentsIfLockHeld(
+            any(UUID.class), anyMap(), anyMap(), anyString(), anyLong(),
+            anyString(), anyLong(), anyLong());
+        verify(snapshots).createSnapshot(eq(uuid), any(byte[].class), eq("death"));
     }
 
     /**
@@ -418,7 +519,8 @@ class SyncManagerRound15Test {
         // STALE_VERSION rejection.
         DatabaseManager.ComponentBatchResult rejected =
             DatabaseManager.ComponentBatchResult.rejected(
-                "stale collected version", DatabaseManager.ComponentRejectReason.STALE_VERSION);
+                "stale collected version", DatabaseManager.ComponentRejectReason.STALE_VERSION,
+                4L, 0x5L, 7L);
         when(databaseManager.upsertComponentsIfLockHeld(
                 any(UUID.class), anyMap(), anyMap(), any(String.class), anyLong(),
                 any(String.class), anyLong(), anyLong()))
@@ -438,6 +540,21 @@ class SyncManagerRound15Test {
         // Must be VERSION_CONFLICT (the mapping from STALE_VERSION in persistCollectedData).
         assertEquals(SyncManager.SaveFailureReason.VERSION_CONFLICT,
             result.failureReason(), "Stale version must map to VERSION_CONFLICT, not fall back");
+
+        // The DB rejection is authoritative only after the same lock/fencing/
+        // session was verified. Refresh both local cursors so the next cycle
+        // does not repeat expectedVersion=3 forever.
+        ConcurrentHashMap<UUID, Long> playerVersions = getField("playerVersions");
+        assertEquals(4L, playerVersions.get(uuid));
+        ConcurrentHashMap<UUID, ?> componentCursors = getField("componentCursors");
+        Object cursor = componentCursors.get(uuid);
+        assertNotNull(cursor);
+        Method generation = cursor.getClass().getDeclaredMethod("generation");
+        Method bitmap = cursor.getClass().getDeclaredMethod("bitmap");
+        generation.setAccessible(true);
+        bitmap.setAccessible(true);
+        assertEquals(7L, generation.invoke(cursor));
+        assertEquals(0x5L, bitmap.invoke(cursor));
 
         // Full Blob save must NOT be called.
         verify(databaseManager, never())

@@ -293,6 +293,18 @@ class ComponentDirtyMaskTest {
         assertTrue(dirty.contains(ComponentDirtyMask.Component.INVENTORY));
     }
 
+    @Test
+    void persistedBitFilterDoesNotClearUnwrittenSnapshotComponents() {
+        mask.markDirty(player1, ComponentDirtyMask.Component.VITALS);
+        mask.markDirty(player1, ComponentDirtyMask.Component.FOOD);
+        ComponentDirtyMask.DirtySnapshot snapshot = mask.snapshotDirty(player1);
+
+        mask.clearDirty(player1, snapshot,
+            ComponentDirtyMask.Component.VITALS.storageMask());
+
+        assertEquals(Set.of(ComponentDirtyMask.Component.FOOD), mask.getDirty(player1));
+    }
+
     /**
      * Verifies that snapshotDirty on a player with no mask returns EMPTY
      * (not null) and clearDirty(EMPTY) is a no-op.

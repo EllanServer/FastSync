@@ -79,6 +79,10 @@ public class PlayerData {
     // Runtime-only marker: this instance contains only a dirty component
     // subset and must never be serialized as the authoritative full Blob.
     private boolean componentSubset;
+    // Runtime-only mask of components actually collected into a subset. This
+    // freezes the entity-thread config decision across the async persistence
+    // boundary, where a config reload may otherwise enable an uncollected field.
+    private long collectedComponentMask;
 
     public PlayerData() {
         this(true);
@@ -209,6 +213,10 @@ public class PlayerData {
 
     public boolean isComponentSubset() { return componentSubset; }
     public void setComponentSubset(boolean componentSubset) { this.componentSubset = componentSubset; }
+    public void markComponentCollected(long storageMask) { collectedComponentMask |= storageMask; }
+    public boolean isComponentCollected(long storageMask) {
+        return (collectedComponentMask & storageMask) != 0L;
+    }
 
     // ==================== Inner Data Classes ====================
 

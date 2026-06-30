@@ -166,7 +166,13 @@ public class ComponentDirtyMask {
      */
     public void clearDirty(UUID uuid, DirtySnapshot snapshot) {
         PlayerDirtyState state = masks.get(uuid);
-        if (state != null) state.clearIfEpochMatches(snapshot);
+        if (state != null) state.clearIfEpochMatches(snapshot, ~0L);
+    }
+
+    /** Clear only successfully persisted snapshot components. */
+    public void clearDirty(UUID uuid, DirtySnapshot snapshot, long persistedBits) {
+        PlayerDirtyState state = masks.get(uuid);
+        if (state != null) state.clearIfEpochMatches(snapshot, persistedBits);
     }
 
     /**
@@ -286,10 +292,10 @@ public class ComponentDirtyMask {
             return bits == 0 ? DirtySnapshot.EMPTY : new DirtySnapshot(bits, snapshotStates);
         }
 
-        void clearIfEpochMatches(DirtySnapshot snapshot) {
+        void clearIfEpochMatches(DirtySnapshot snapshot, long persistedBits) {
             if (snapshot == null || snapshot.isEmpty()) return;
             for (Component component : Component.values()) {
-                if (!snapshot.contains(component)) continue;
+                if (!snapshot.contains(component) || (persistedBits & bit(component)) == 0L) continue;
                 int index = component.ordinal();
                 long expected = snapshot.states[index];
                 states.compareAndSet(index, expected, expected & ~DIRTY_FLAG);

@@ -301,6 +301,28 @@ class PlayerDataSerializerComponentTest {
     }
 
     @Test
+    void inventoryComponentRejectsNonByteArrayItemTags() throws IOException {
+        net.momirealms.sparrow.nbt.CompoundTag wrapper =
+            net.momirealms.sparrow.nbt.NBT.createCompound();
+        net.momirealms.sparrow.nbt.CompoundTag inventory =
+            net.momirealms.sparrow.nbt.NBT.createCompound();
+        net.momirealms.sparrow.nbt.ListTag invalidItems =
+            net.momirealms.sparrow.nbt.NBT.createList();
+        invalidItems.add(net.momirealms.sparrow.nbt.NBT.createString("not-an-item-payload"));
+        inventory.put("inventory", invalidItems);
+        inventory.putBoolean("offhandPresent", false);
+        inventory.putBoolean("_present", true);
+        wrapper.put("INVENTORY", inventory);
+
+        byte[] bytes = net.momirealms.sparrow.nbt.NBT.toBytes(wrapper);
+
+        ItemSerializationException error = assertThrows(ItemSerializationException.class,
+            () -> PlayerDataSerializer.deserializeComponent("INVENTORY", bytes, new PlayerData()));
+        assertTrue(error.getMessage().contains("slot 0"));
+        assertTrue(error.getMessage().contains("ByteArrayTag"));
+    }
+
+    @Test
     void testComponentIsolation() throws IOException {
         PlayerData original = new PlayerData();
         original.setHealth(15.0);

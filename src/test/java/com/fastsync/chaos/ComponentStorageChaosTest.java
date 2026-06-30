@@ -1,5 +1,6 @@
 package com.fastsync.chaos;
 
+import com.fastsync.sync.dirty.ComponentDirtyMask;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -82,6 +83,53 @@ class ComponentStorageChaosTest {
 
             // Check all invariants after every operation
             checkInvariants(uuid, iter);
+        }
+    }
+
+    @Test
+    void dirtyAcknowledgementChaosNeverClearsUncommittedOrConcurrentChanges() {
+        ComponentDirtyMask mask = new ComponentDirtyMask(5);
+        UUID uuid = UUID.fromString("00000000-0000-0000-0000-000000000999");
+        ComponentDirtyMask.Component[] components = ComponentDirtyMask.Component.values();
+        Random interleaving = new Random(0xFA57C0DEL);
+
+        for (int iteration = 0; iteration < ITERATIONS; iteration++) {
+            mask.clearAll(uuid);
+            long initialBits = 0L;
+            for (ComponentDirtyMask.Component component : components) {
+                if (interleaving.nextBoolean()) {
+                    mask.markDirty(uuid, component);
+                    initialBits |= component.storageMask();
+                }
+            }
+            if (initialBits == 0L) {
+                ComponentDirtyMask.Component component = components[interleaving.nextInt(components.length)];
+                mask.markDirty(uuid, component);
+                initialBits |= component.storageMask();
+            }
+
+            ComponentDirtyMask.DirtySnapshot snapshot = mask.snapshotDirty(uuid);
+            long persistedBits = 0L;
+            long concurrentBits = 0L;
+            for (ComponentDirtyMask.Component component : components) {
+                if ((initialBits & component.storageMask()) != 0L && interleaving.nextBoolean()) {
+                    persistedBits |= component.storageMask();
+                }
+                if (interleaving.nextInt(5) == 0) {
+                    mask.markDirty(uuid, component);
+                    concurrentBits |= component.storageMask();
+                }
+            }
+
+            mask.clearDirty(uuid, snapshot, persistedBits);
+
+            for (ComponentDirtyMask.Component component : components) {
+                long bit = component.storageMask();
+                boolean mustRemainDirty = (concurrentBits & bit) != 0L
+                    || ((initialBits & bit) != 0L && (persistedBits & bit) == 0L);
+                assertEquals(mustRemainDirty, mask.getDirty(uuid).contains(component),
+                    "iteration=" + iteration + ", component=" + component);
+            }
         }
     }
 

@@ -277,7 +277,7 @@ public class SyncManager {
     private volatile List<org.bukkit.entity.EntityType> aliveEntities; // isAlive() == true
 
     // Parsed snapshot trigger set (computed once at init/reload, O(1) lookup per save).
-    private volatile java.util.Set<String> snapshotTriggerSet;
+    private volatile java.util.Set<String> snapshotTriggerSet = java.util.Set.of();
 
     // Sync strategies (initialized in initialize())
     private com.fastsync.sync.strategy.PdcSyncStrategy pdcStrategy;
@@ -660,6 +660,8 @@ public class SyncManager {
                 databaseManager.loadPlayerDataRow(uuid);
             componentCursors.put(uuid,
                 new ComponentCursor(loaded.componentGeneration(), loaded.componentBitmap()));
+            verifyComponentBaselineConsistency(uuid, loaded.hasData(),
+                loaded.componentBitmap(), loaded.componentGeneration());
             long loadElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
             latencyMonitor.recordLoad(loadElapsedMs);
 
@@ -1670,12 +1672,16 @@ public class SyncManager {
             data.setArmor(snapshotItemContents(inventory.getArmorContents()));
             org.bukkit.inventory.ItemStack offhand = inventory.getItemInOffHand();
             data.setOffhand(offhand != null && !offhand.getType().isAir() ? offhand.clone() : null);
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.INVENTORY);
         }
 
         // Ender chest
         if (collects(requested, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ENDER_CHEST)
                 && config.isSyncEnderChest()) {
             data.setEnderChest(snapshotItemContents(player.getEnderChest().getStorageContents()));
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.ENDER_CHEST);
         }
 
         // Vitals
@@ -1707,6 +1713,8 @@ public class SyncManager {
             boolean dead = deathState != null || player.isDead() || currentHealth <= 0;
             data.setHealth(healthForSave(dead, currentHealth, effectiveMaxHealth));
             data.setMaxHealth(baseMaxHealth);
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.VITALS);
         }
         if (collects(requested, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FOOD)
                 && config.isSyncFood()) {
@@ -1720,6 +1728,8 @@ public class SyncManager {
                 data.setSaturation(player.getSaturation());
                 data.setExhaustion(player.getExhaustion());
             }
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.FOOD);
         }
 
         // Experience
@@ -1738,6 +1748,8 @@ public class SyncManager {
                 data.setExpProgress(player.getExp());
                 data.setTotalExperience(player.getTotalExperience());
             }
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.EXPERIENCE);
         }
 
         // Potion effects
@@ -1750,16 +1762,22 @@ public class SyncManager {
                 }
             }
             data.setPotionEffects(effects);
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.POTION_EFFECTS);
         }
 
         // Extra
         if (collects(requested, com.fastsync.sync.dirty.ComponentDirtyMask.Component.GAME_MODE)
                 && config.isSyncGameMode()) {
             data.setGameMode(player.getGameMode());
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.GAME_MODE);
         }
         if (collects(requested, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FIRE_TICKS)
                 && config.isSyncFireTicks()) {
             data.setFireTicks(deathState != null || player.isDead() ? 0 : player.getFireTicks());
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.FIRE_TICKS);
         }
         if (collects(requested, com.fastsync.sync.dirty.ComponentDirtyMask.Component.AIR)
                 && config.isSyncAir()) {
@@ -1767,6 +1785,8 @@ public class SyncManager {
             data.setMaximumAir(maximumAir);
             data.setRemainingAir(
                 deathState != null || player.isDead() ? maximumAir : player.getRemainingAir());
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.AIR);
         }
 
         // Flight status
@@ -1792,24 +1812,32 @@ public class SyncManager {
             }
             data.setFlying(flying);
             data.setAllowFlight(allowFlight);
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.FLIGHT);
         }
 
         // Advancements (using Bukkit API - iterates all advancement criteria)
         if (collects(requested, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS)
                 && config.isSyncAdvancements()) {
             collectAdvancements(player, data);
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
         }
 
         // Statistics (basic UNTYPED stats always synced; typed stats via strategy)
         if (collects(requested, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS)
                 && config.isSyncStatistics()) {
             collectStatistics(player, data);
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
         }
 
         // Attributes
         if (collects(requested, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES)
                 && config.isSyncAttributes()) {
             collectAttributes(player, data);
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
         }
 
         // Persistent Data Container (via strategy)
@@ -1825,6 +1853,8 @@ public class SyncManager {
             } else {
                 data.setPersistentDataContainer(new HashMap<>());
             }
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
         }
 
         // Location (optional)
@@ -1838,6 +1868,8 @@ public class SyncManager {
             data.setZ(loc.getZ());
             data.setYaw(loc.getYaw());
             data.setPitch(loc.getPitch());
+            markComponentCollected(data,
+                com.fastsync.sync.dirty.ComponentDirtyMask.Component.LOCATION);
         }
 
         data.setTimestamp(System.currentTimeMillis());
@@ -1849,6 +1881,13 @@ public class SyncManager {
             com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot requested,
             com.fastsync.sync.dirty.ComponentDirtyMask.Component component) {
         return requested == null || requested.contains(component);
+    }
+
+    private static void markComponentCollected(PlayerData data,
+            com.fastsync.sync.dirty.ComponentDirtyMask.Component component) {
+        if (data.isComponentSubset()) {
+            data.markComponentCollected(component.storageMask());
+        }
     }
 
     /**
@@ -1875,6 +1914,7 @@ public class SyncManager {
     private boolean canCollectComponentsOnly(UUID uuid, SaveKind kind,
             com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot snapshot) {
         if (!config.isComponentStorageEnabled() || dirtyMask == null || kind.releaseLock
+                || (snapshotManager != null && shouldCreateSnapshot(kind.causeName))
                 || snapshot == null || snapshot.isEmpty()
                 || !playersWithBaseline.contains(uuid) || !componentCursors.containsKey(uuid)) {
             return false;
@@ -3439,8 +3479,15 @@ public class SyncManager {
 
             for (com.fastsync.sync.dirty.ComponentDirtyMask.Component c : dirty) {
                 String name = c.name();
-                // Skip components that are disabled in config
-                if (!isComponentSyncEnabled(c)) continue;
+                // A selective carrier freezes the entity-thread collection
+                // decision. Re-reading config here is unsafe: a reload between
+                // collect and async persistence could enable an uncollected
+                // primitive field and write its Java default as authoritative.
+                if (data.isComponentSubset()) {
+                    if (!data.isComponentCollected(c.storageMask())) continue;
+                } else if (!isComponentSyncEnabled(c)) {
+                    continue;
+                }
 
                 byte[] serialized = PlayerDataSerializer.serializeComponent(name, data);
                 if (serialized == null) continue;  // component has no data
@@ -3532,8 +3579,16 @@ public class SyncManager {
                         // Our collected snapshot is behind the DB version.
                         // Skip THIS online save — do NOT fall back to a full
                         // Blob save with the stale snapshot (it would clobber
-                        // the newer state). The next periodic cycle re-collects
-                        // against the current version.
+                        // the newer state). The rejection carries metadata read
+                        // only after lock/fencing/session validation, so advance
+                        // the session-local version/cursor before the next cycle.
+                        // Without this refresh every later component CAS repeats
+                        // the same stale expectedVersion forever.
+                        if (batchResult.newVersion() > data.getVersion()) {
+                            playerVersions.put(uuid, batchResult.newVersion());
+                            componentCursors.put(uuid, new ComponentCursor(
+                                batchResult.generation(), batchResult.componentBitmap()));
+                        }
                         logger.warning("[Component] Save rejected for " + uuid
                             + " (STALE_VERSION): " + batchResult.errorMessage()
                             + " — skipping this online save; next cycle re-collects.");
@@ -3589,7 +3644,7 @@ public class SyncManager {
             // concurrent markDirty bumped an epoch during the DB write, that
             // component stays dirty and the next periodic save will re-serialize
             // and re-write it with the latest state.
-            dirtyMask.clearDirty(uuid, dirtySnapshot);
+            dirtyMask.clearDirty(uuid, dirtySnapshot, dirtyBits);
 
             if (config.isDebug()) {
                 logger.info("Component save " + kind + " for " + uuid + ": "
@@ -3774,6 +3829,7 @@ public class SyncManager {
         if (config.isComponentStorageEnabled()
             && dirtyMask != null
             && !kind.releaseLock
+            && (snapshotManager == null || !shouldCreateSnapshot(data.getSaveCause()))
             && dirtyMask.isAnyDirty(uuid)) {
             // Pass the caller-provided snapshot (taken before collectPlayerData)
             // so persistComponentsOnly's clearDirty after the DB write protects
@@ -4035,8 +4091,13 @@ public class SyncManager {
             // From this point on, component-only saves are safe for this player
             // for the remainder of the session.
             playersWithBaseline.add(uuid);
-            componentCursors.compute(uuid, (ignored, current) ->
-                new ComponentCursor(current == null ? 1L : current.generation() + 1L, 0L));
+            // Advance only a cursor that was loaded authoritatively. Inventing
+            // generation=1 when the cursor is absent is wrong after a hot reload
+            // if the DB row is already at generation N. Leaving it absent makes
+            // the next component save use the compatibility transaction, which
+            // locks the row, reads the real generation, and seeds a correct cursor.
+            componentCursors.computeIfPresent(uuid, (ignored, current) ->
+                new ComponentCursor(current.generation() + 1L, 0L));
 
             // Clear dirty flags using the pre-save snapshot's epoch.
             //
@@ -4494,6 +4555,16 @@ public class SyncManager {
         if (!missingComponents.isEmpty()) {
             throw new IOException("component_bitmap references missing rows for " + uuid
                 + " (gen=" + generation + "): " + missingComponents);
+        }
+    }
+
+    static void verifyComponentBaselineConsistency(
+            UUID uuid, boolean hasBaselineData, long componentBitmap,
+            long generation) throws IOException {
+        if (!hasBaselineData && componentBitmap != 0L) {
+            throw new IOException("component_bitmap is non-zero without a full-Blob baseline for "
+                + uuid + " (gen=" + generation + ", bitmap=0x"
+                + Long.toHexString(componentBitmap) + ")");
         }
     }
 

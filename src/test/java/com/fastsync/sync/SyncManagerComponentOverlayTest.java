@@ -57,4 +57,19 @@ class SyncManagerComponentOverlayTest {
         assertTrue(ex.getMessage().contains("gen=9"),
             "Error must include the component generation for diagnosis");
     }
+
+    @Test
+    void nonZeroBitmapWithoutBaselineFailsClosed() {
+        UUID uuid = UUID.randomUUID();
+
+        IOException error = assertThrows(IOException.class,
+            () -> SyncManager.verifyComponentBaselineConsistency(uuid, false, 0x4L, 9L));
+
+        assertTrue(error.getMessage().contains(uuid.toString()));
+        assertTrue(error.getMessage().contains("gen=9"));
+        assertDoesNotThrow(
+            () -> SyncManager.verifyComponentBaselineConsistency(uuid, true, 0x4L, 9L));
+        assertDoesNotThrow(
+            () -> SyncManager.verifyComponentBaselineConsistency(uuid, false, 0L, 9L));
+    }
 }
