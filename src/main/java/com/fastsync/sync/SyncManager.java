@@ -1914,7 +1914,7 @@ public class SyncManager {
     private boolean canCollectComponentsOnly(UUID uuid, SaveKind kind,
             com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot snapshot) {
         if (!config.isComponentStorageEnabled() || dirtyMask == null || kind.releaseLock
-                || (snapshotManager != null && shouldCreateSnapshot(kind.causeName))
+                || (snapshotManager != null && shouldTriggerSnapshot(kind.causeName))
                 || snapshot == null || snapshot.isEmpty()
                 || !playersWithBaseline.contains(uuid) || !componentCursors.containsKey(uuid)) {
             return false;
@@ -3829,7 +3829,7 @@ public class SyncManager {
         if (config.isComponentStorageEnabled()
             && dirtyMask != null
             && !kind.releaseLock
-            && (snapshotManager == null || !shouldCreateSnapshot(data.getSaveCause()))
+            && (snapshotManager == null || !shouldTriggerSnapshot(data.getSaveCause()))
             && dirtyMask.isAnyDirty(uuid)) {
             // Pass the caller-provided snapshot (taken before collectPlayerData)
             // so persistComponentsOnly's clearDirty after the DB write protects
