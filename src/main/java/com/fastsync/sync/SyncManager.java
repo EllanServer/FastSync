@@ -342,11 +342,9 @@ public class SyncManager {
 
         // Round 16 (P0 #3): dedicated final-save executor. 2 threads so a
         // stuck save on one thread does not head-of-line block the next QUIT
-        // save; queue is 4x the main queue so QUIT saves rarely fall back to
-        // synchronous execution on the event thread.
-        // Round 14: final-save executor uses configurable threads + queue capacity.
-        int finalThreads = Math.max(2, config.getFinalSaveThreads());
-        int finalQueue = Math.max(1024, config.getFinalSaveQueueCapacity());
+        // save. Both its thread count and bounded queue are operator-configurable.
+        int finalThreads = config.getFinalSaveThreads();
+        int finalQueue = config.getFinalSaveQueueCapacity();
         finalSaveExecutor = new AsyncExecutor(logger, "FastSync-FinalSave", finalThreads, finalQueue);
 
         // Login backpressure semaphore — limits concurrent pre-login loads
@@ -366,6 +364,13 @@ public class SyncManager {
         // Initialize snapshot system if enabled
         if (config.isSnapshotEnabled()) {
             snapshotManager = new SnapshotManager(logger, config);
+            // Login loads can consume at most poolSize-2 connections. Bound
+            // snapshot work to the remaining non-critical budget while always
+            // leaving at least one connection for final saves/heartbeats.
+            int snapshotDbPermits = Math.max(1, Math.min(2,
+                config.getPoolSize() - config.getMaxConcurrentLoads() - 1));
+            snapshotManager.setDbWorkSemaphore(
+                new java.util.concurrent.Semaphore(snapshotDbPermits, true));
             snapshotManager.initialize(databaseManager);
             logger.info("Snapshot/backup system enabled (max " + config.getMaxSnapshots() + " per player).");
         }
@@ -379,6 +384,7 @@ public class SyncManager {
                     config.getServerName(), config.getClusterId(), config.getRedisChannelPrefix(),
                     config.isRedisSsl(), config.getRedisTimeout(), config.isStreamsEnabled(),
                     config.getRedisStreamMaxLen(), config.isRedisStreamTrimApprox());
+                redissonManager.setDebug(config.isDebug());
                 // Register listener BEFORE initialize() — initialize() starts the
                 // consumer loop and recovers pending entries, which can dispatch
                 // stream events immediately. If the listener isn't registered yet,
@@ -460,6 +466,9 @@ public class SyncManager {
         // attributes / advancements are picked up on the next collect.
         cachedAttributes = null;
         cachedAdvancements = null;
+        if (redissonManager != null) {
+            redissonManager.setDebug(config.isDebug());
+        }
     }
 
     /**
@@ -3119,6 +3128,12 @@ public class SyncManager {
                 && !pendingEmptyData.contains(uuid)
                 && !pendingBypass.contains(uuid);
         });
+
+        if (snapshotManager != null) {
+            long retention = Math.max(5 * 60 * 1000L,
+                config.getSnapshotBackupFrequencyMs());
+            snapshotManager.cleanupSnapshotReservations(retention);
+        }
     }
 
     // ==================== Shutdown ====================
@@ -4055,15 +4070,36 @@ public class SyncManager {
                 }
             }
 
-                if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {
-                    try {
-                        snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
-                            .thenRun(() -> snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots()));
-                    } catch (Exception snapshotEx) {
-                        // Post-commit side effect failure must NOT turn a
-                        // successful DB save into a retry/failure. The DB
-                        // commit is authoritative — the snapshot is best-effort.
-                        logger.log(Level.WARNING, kind + " save succeeded but snapshot creation failed for " + uuid, snapshotEx);
+                if (snapshotManager != null && shouldTriggerSnapshot(data.getSaveCause())) {
+                    long reservation = snapshotManager.reserveSnapshot(
+                        uuid, config.getSnapshotBackupFrequencyMs());
+                    if (reservation >= 0) {
+                        try {
+                            snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
+                                .whenComplete((snapshotId, snapshotError) -> {
+                                    if (snapshotError == null) {
+                                        snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots())
+                                            .whenComplete((ignored, pruneError) -> {
+                                                if (pruneError != null) {
+                                                    logger.log(Level.WARNING, kind
+                                                        + " save and snapshot succeeded but pruning failed for "
+                                                        + uuid, pruneError);
+                                                }
+                                            });
+                                    } else {
+                                        snapshotManager.releaseSnapshotReservation(uuid, reservation);
+                                        logger.log(Level.WARNING, kind
+                                            + " save succeeded but snapshot creation failed for "
+                                            + uuid, snapshotError);
+                                    }
+                                });
+                        } catch (Exception snapshotEx) {
+                            snapshotManager.releaseSnapshotReservation(uuid, reservation);
+                            // Post-commit side effect failure must NOT turn a
+                            // successful DB save into a retry/failure. The DB
+                            // commit is authoritative — the snapshot is best-effort.
+                            logger.log(Level.WARNING, kind + " save succeeded but snapshot creation failed for " + uuid, snapshotEx);
+                        }
                     }
                 }
 
@@ -4145,7 +4181,7 @@ public class SyncManager {
      * <p>The trigger string is parsed into a {@link Set} once at
      * {@link #initialize()}/{@link #reload()} time, so this method is O(1).
      */
-    private boolean shouldCreateSnapshot(String saveCause) {
+    private boolean shouldTriggerSnapshot(String saveCause) {
         java.util.Set<String> triggers = snapshotTriggerSet;
         if (triggers.isEmpty()) return false;
         if (triggers.contains("always")) return true;

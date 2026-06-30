@@ -95,6 +95,37 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             + " (lock-timeout=" + configManager.getLockTimeout() + "s).");
     }
 
+    /** Start, stop, or reschedule periodic saves after a validated reload. */
+    private void restartPeriodicSaveTask() {
+        if (periodicSaveTask != null) {
+            SchedulerUtil.cancel(periodicSaveTask);
+            periodicSaveTask = null;
+        }
+        if (!configManager.isPeriodicSave()) {
+            getLogger().info("Periodic save disabled.");
+            return;
+        }
+
+        long intervalTicks = configManager.getPeriodicSaveIntervalSeconds() * 20L;
+        periodicSaveTask = SchedulerUtil.runGlobalTimer(this, () -> {
+            List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
+            final int batchSize = configManager.getPeriodicSaveBatchSize();
+            for (int i = 0; i < players.size(); i += batchSize) {
+                final int start = i;
+                final int end = Math.min(i + batchSize, players.size());
+                long delayTicks = i / batchSize;
+                SchedulerUtil.runGlobalDelayed(this, () -> {
+                    for (int j = start; j < end; j++) {
+                        syncManager.savePlayerAsync(players.get(j));
+                    }
+                }, delayTicks);
+            }
+        }, intervalTicks, intervalTicks);
+        getLogger().info("Periodic save scheduled: every "
+            + configManager.getPeriodicSaveIntervalSeconds() + " seconds, batch="
+            + configManager.getPeriodicSaveBatchSize() + ".");
+    }
+
     @Override
     public void onEnable() {
         instance = this;
@@ -128,15 +159,44 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         databaseManager = new DatabaseManager(getLogger(), configManager);
         try {
             databaseManager.initialize();
-        } catch (SQLException e) {
+        } catch (SQLException | RuntimeException e) {
             getLogger().log(Level.SEVERE, "Failed to initialize database! Check your config.yml.", e);
+            try {
+                databaseManager.close();
+            } catch (RuntimeException cleanupError) {
+                e.addSuppressed(cleanupError);
+                getLogger().log(Level.WARNING, "Database cleanup also failed", cleanupError);
+            }
+            databaseManager = null;
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
 
         // Initialize sync manager (creates thread pool + optional Redis)
         syncManager = new SyncManager(this, configManager, databaseManager);
-        syncManager.initialize();
+        try {
+            syncManager.initialize();
+        } catch (RuntimeException e) {
+            getLogger().log(Level.SEVERE, "Failed to initialize synchronization services — refusing to start.", e);
+            try {
+                syncManager.beginShutdown();
+                syncManager.shutdown();
+            } catch (RuntimeException cleanupError) {
+                e.addSuppressed(cleanupError);
+                getLogger().log(Level.WARNING, "Synchronization cleanup also failed", cleanupError);
+            } finally {
+                syncManager = null;
+                try {
+                    databaseManager.close();
+                } catch (RuntimeException cleanupError) {
+                    e.addSuppressed(cleanupError);
+                    getLogger().log(Level.WARNING, "Database cleanup also failed", cleanupError);
+                }
+                databaseManager = null;
+            }
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
 
         // Register plugin messaging channel for proxy handoff communication
         // This is optional — if no Velocity proxy with FastSync Proxy is installed,
@@ -179,45 +239,14 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         // Runs on async thread (DB I/O only, no Bukkit API calls).
         restartHeartbeatTask();
 
-        // Start periodic save task (if enabled)
-        if (configManager.isPeriodicSave()) {
-            long intervalTicks = configManager.getPeriodicSaveIntervalSeconds() * 20L;
-            periodicSaveTask = SchedulerUtil.runGlobalTimer(this, () -> {
-                // Snapshot online players on the global region thread, then save them
-                // in small batches spread across successive ticks to avoid a lag spike
-                // when many players are online (process at most 10 players per tick).
-                //
-                // CRITICAL (Folia-safety): the batched dispatch MUST run on the
-                // global region (runGlobalDelayed), NOT on an async thread
-                // (runAsyncDelayed). savePlayerAsync(player) reads
-                // player.getUniqueId() and calls SchedulerUtil.runAtEntity(plugin,
-                // player, ...) — both touch the Player object. On Folia, async
-                // threads must not touch Player entities; the global region is
-                // the safe context for these reads. The actual DB write still
-                // happens on the async executor (dispatched from inside
-                // runAtEntity), so the global region is only used for the
-                // brief per-player dispatch, not for the DB wait.
-                List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
-                final int batchSize = configManager.getPeriodicSaveBatchSize();
-                for (int i = 0; i < players.size(); i += batchSize) {
-                    final int start = i;
-                    final int end = Math.min(i + batchSize, players.size());
-                    long delayTicks = i / batchSize;
-                    SchedulerUtil.runGlobalDelayed(this, () -> {
-                        for (int j = start; j < end; j++) {
-                            syncManager.savePlayerAsync(players.get(j));
-                        }
-                    }, delayTicks);
-                }
-            }, intervalTicks, intervalTicks);
-            getLogger().info("Periodic save enabled: every " +
-                configManager.getPeriodicSaveIntervalSeconds() + " seconds");
-        }
+        // Start periodic save task (the same helper safely reschedules it on reload).
+        restartPeriodicSaveTask();
 
         getLogger().info("FastSync v" + getPluginMeta().getVersion() + " enabled!");
         getLogger().info("Server ID: " + configManager.getServerName());
         getLogger().info("Serialization: Paper native ItemStack byte serialization");
-        getLogger().info("Compression: " + (configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
+        getLogger().info("Compression: " + (configManager.isCompressionEnabled()
+            ? configManager.getCompressionType() : "Disabled"));
         getLogger().info("Redis: " + (configManager.isRedisEnabled() ? "Enabled" : "Disabled (DB polling)"));
     }
 
@@ -276,13 +305,27 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
 
         switch (args[0].toLowerCase()) {
             case "reload" -> {
-                configManager.reload();
+                ConfigManager.ReloadResult reloadResult;
+                try {
+                    reloadResult = configManager.reloadSafely();
+                } catch (RuntimeException e) {
+                    getLogger().log(Level.WARNING, "Configuration reload rejected", e);
+                    sendMessage(sender, RED + "[FastSync] Reload rejected: " + e.getMessage());
+                    return true;
+                }
+                if (!reloadResult.applied()) {
+                    sendMessage(sender, YELLOW + "[FastSync] Reload not applied; restart required for: "
+                        + String.join(", ", reloadResult.restartRequiredChanges()));
+                    return true;
+                }
                 // Refresh SyncManager caches that depend on config (e.g. snapshot trigger set)
                 if (syncManager != null) {
                     syncManager.refreshConfigCache();
                 }
                 // Restart heartbeat task — interval may have changed
                 restartHeartbeatTask();
+                // Periodic-save enable/interval/batch are live-reloadable.
+                restartPeriodicSaveTask();
                 // Reset protection mode on reload — only if DB is healthy
                 boolean resetOk = syncManager.resetProtectionMode();
                 if (resetOk) {
@@ -293,7 +336,8 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 sendMessage(sender, GREEN + "[FastSync] Configuration reloaded.");
                 sendMessage(sender, GRAY + "Server: " + configManager.getServerName());
                 sendMessage(sender, GRAY + "Compression: " +
-                    (configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
+                    (configManager.isCompressionEnabled()
+                        ? configManager.getCompressionType() : "Disabled"));
                 sendMessage(sender, GRAY + "Redis: " +
                     (configManager.isRedisEnabled() ? "Enabled" : "Disabled"));
                 sendMessage(sender, GRAY + "Heartbeat: every " +
@@ -302,11 +346,14 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             case "status" -> sendStatus(sender);
             case "debug" -> {
                 boolean newDebug = !configManager.isDebug();
-                getConfig().set("debug", newDebug);
-                saveConfig();
-                configManager.reload();
+                // Runtime-only by design. Re-saving Bukkit's cached config here
+                // used to overwrite external edits and Sparrow migrations with
+                // a stale in-memory copy of the whole YAML document.
+                configManager.setDebug(newDebug);
+                syncManager.refreshConfigCache();
                 sendMessage(sender, GREEN + "[FastSync] Debug mode: " +
                     (newDebug ? GREEN + "ON" : RED + "OFF"));
+                sendMessage(sender, GRAY + "Runtime only; edit config.yml to persist across restarts.");
             }
             case "saveall" -> {
                 sendMessage(sender, YELLOW + "[FastSync] Saving all online players...");

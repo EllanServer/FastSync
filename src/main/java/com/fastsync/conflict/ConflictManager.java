@@ -25,7 +25,9 @@ import java.util.logging.Logger;
  * case optimistic concurrency exists to prevent. Manual recovery of stale data
  * should go through the offline snapshot tool, not the live save path.
  *
- * In all cases, the lock is released so other servers can proceed.
+ * Lock ownership is intentionally outside this class. The caller keeps or
+ * expires the lock according to save kind; a failed final save must never
+ * release it and expose stale DB state as current.
  */
 public class ConflictManager {
 

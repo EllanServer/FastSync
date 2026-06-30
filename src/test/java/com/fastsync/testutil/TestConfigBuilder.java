@@ -39,7 +39,7 @@ public class TestConfigBuilder {
         set("redisPassword", "");
         set("redisDatabase", 0);
         set("redisSsl", false);
-        set("dbType", "mysql");
+        set("redisTimeout", 5000);
         set("dbHost", "localhost");
         set("dbPort", 3306);
         set("dbDatabase", "fastsync");
@@ -47,6 +47,7 @@ public class TestConfigBuilder {
         set("dbPassword", "root");
         set("dbParameters", "");
         set("poolSize", 10);
+        set("queueCapacity", 256);
         set("connectionTimeout", 30000L);
         set("idleTimeout", 600000L);
         set("maxLifetime", 1800000L);
@@ -54,7 +55,16 @@ public class TestConfigBuilder {
         set("saveOnDeath", false);
         set("saveOnWorldSave", false);
         set("periodicSave", false);
+        set("periodicSaveIntervalSeconds", 300);
+        set("periodicSaveBatchSize", 10);
+        set("maxConcurrentLoads", 6);
+        set("finalSaveThreads", 4);
+        set("finalSaveQueueCapacity", 1024);
         set("snapshotEnabled", false);
+        set("snapshotBackupFrequencyMs", 14_400_000L);
+        set("latencyWindowSize", 1_000);
+        set("serializationMaxRawBytes", 1 << 20);
+        set("serializationMaxWrappedBytes", 5 * (1 << 19));
         return this;
     }
 

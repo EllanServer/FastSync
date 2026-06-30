@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -88,6 +89,60 @@ class FileOperationLogManagerExecutorTest {
             "append() must run on a FastSync-OpLog-* thread, but ran on: " + threadName);
         assertFalse(threadName.contains("ForkJoinPool") && threadName.contains("commonPool"),
             "append() must NOT run on ForkJoinPool.commonPool, but ran on: " + threadName);
+    }
+
+    @Test
+    void failedDirectoryCreationDoesNotAdvertiseEnabledAuditLog() throws Exception {
+        Path regularFile = tempDir.resolve("not-a-directory");
+        Files.writeString(regularFile, "x");
+        manager = new FileOperationLogManager(regularFile, 100);
+
+        assertThrows(java.io.IOException.class, manager::initialize);
+        assertFalse(manager.isEnabled());
+    }
+
+    @Test
+    void discardedAppendCompletesItsFuture() throws Exception {
+        manager = new FileOperationLogManager(tempDir, 100);
+        manager.initialize();
+
+        java.lang.reflect.Field field =
+            FileOperationLogManager.class.getDeclaredField("appendExecutor");
+        field.setAccessible(true);
+        java.util.concurrent.ThreadPoolExecutor executor =
+            (java.util.concurrent.ThreadPoolExecutor) field.get(manager);
+
+        CountDownLatch blockerStarted = new CountDownLatch(1);
+        CountDownLatch releaseBlocker = new CountDownLatch(1);
+        executor.execute(() -> {
+            blockerStarted.countDown();
+            try {
+                releaseBlocker.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        assertTrue(blockerStarted.await(5, TimeUnit.SECONDS));
+
+        OperationLog entry = new OperationLog(
+            1L, java.util.UUID.randomUUID(), OperationType.SAVE, "test-server",
+            1L, 1L, 100, "queue-saturation", System.currentTimeMillis());
+
+        try {
+            java.util.concurrent.CompletableFuture<Void> first =
+                manager.append(entry).toCompletableFuture();
+            for (int i = 1; i <= manager.getQueueCapacity(); i++) {
+                manager.append(entry);
+            }
+
+            assertTrue(first.isDone(),
+                "discard-oldest must complete the future for the evicted append");
+            assertEquals(1L, manager.getDroppedCount());
+        } finally {
+            // Avoid turning this queue-policy test into thousands of file writes.
+            executor.getQueue().clear();
+            releaseBlocker.countDown();
+        }
     }
 
     /**

@@ -34,14 +34,14 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 /**
  * FastSync Velocity proxy plugin.
  *
  * <p>Acts as a cross-server coordinator on the proxy layer:
  * <ul>
  *   <li>Tracks which backend server each player is connected to</li>
- *   <li>Queries the old backend for lock status before allowing a server switch</li>
  *   <li>Notifies the new backend that a player is arriving from another server</li>
  *   <li>Aggregates FastSync status from all backends</li>
  *   <li>Provides a /fastsync command for status and management</li>
@@ -75,9 +75,6 @@ public class FastSyncProxy {
 
     /** Track player -> last server switch timestamp */
     private final ConcurrentHashMap<UUID, Long> lastSwitchTime = new ConcurrentHashMap<>();
-
-    /** Pending lock status responses: uuid -> future that completes when LOCK_STATUS arrives */
-    private final ConcurrentHashMap<UUID, CompletableFuture<HandoffProtocol.LockStatusData>> pendingLockQueries = new ConcurrentHashMap<>();
 
     /** Pending status responses: serverName -> future */
     private final ConcurrentHashMap<String, CompletableFuture<HandoffProtocol.StatusResponseData>> pendingStatusQueries = new ConcurrentHashMap<>();
@@ -113,8 +110,7 @@ public class FastSyncProxy {
             .repeat(5, TimeUnit.MINUTES)
             .schedule();
 
-        logger.info("FastSync Proxy initialized. Channel: fastsync:handoff, Smart handoff: {}",
-            config.isSmartHandoffEnabled());
+        logger.info("FastSync Proxy initialized. Channel: fastsync:handoff");
     }
 
     @Subscribe
@@ -122,7 +118,8 @@ public class FastSyncProxy {
         logger.info("FastSync Proxy shutting down. Tracked players: {}", playerServerMap.size());
         playerServerMap.clear();
         lastSwitchTime.clear();
-        pendingLockQueries.clear();
+        pendingStatusQueries.values().forEach(future ->
+            future.completeExceptionally(new IllegalStateException("Proxy is shutting down")));
         pendingStatusQueries.clear();
     }
 
@@ -166,7 +163,6 @@ public class FastSyncProxy {
         UUID uuid = player.getUniqueId();
         String server = playerServerMap.remove(uuid);
         lastSwitchTime.remove(uuid);
-        pendingLockQueries.remove(uuid);
 
         if (server != null) {
             logger.info("Player {} disconnected from {}", player.getUsername(), server);
@@ -174,32 +170,6 @@ public class FastSyncProxy {
     }
 
     // ==================== Plugin Messaging ====================
-
-    /**
-     * Query a backend server for the lock status of a player.
-     * Returns a future that completes when the LOCK_STATUS response arrives.
-     */
-    private CompletableFuture<HandoffProtocol.LockStatusData> queryLockStatus(
-            String serverName, UUID uuid) {
-        CompletableFuture<HandoffProtocol.LockStatusData> future = new CompletableFuture<>();
-        pendingLockQueries.put(uuid, future);
-
-        byte[] data = HandoffProtocol.encodeQueryLock(uuid, playerServerMap.get(uuid));
-        proxy.getServer(serverName).ifPresent(server -> {
-            server.sendPluginMessage(HANDOFF_CHANNEL, data);
-        });
-
-        // Timeout fallback
-        proxy.getScheduler().buildTask(this, () -> {
-            CompletableFuture<HandoffProtocol.LockStatusData> pending = pendingLockQueries.get(uuid);
-            if (pending != null && !pending.isDone()) {
-                pending.completeExceptionally(new TimeoutException("Lock query timed out"));
-                pendingLockQueries.remove(uuid);
-            }
-        }).delay((int) (config.getWaitTimeoutMs() / 2), TimeUnit.MILLISECONDS).schedule();
-
-        return future;
-    }
 
     /**
      * Send a HANDOFF_NOTIFY to the new backend server.
@@ -222,8 +192,16 @@ public class FastSyncProxy {
 
         for (RegisteredServer server : proxy.getAllServers()) {
             String name = server.getServerInfo().getName();
-            CompletableFuture<HandoffProtocol.StatusResponseData> raw = new CompletableFuture<>();
-            pendingStatusQueries.put(name, raw);
+            // The wire protocol has no request ID. Coalesce concurrent admin
+            // requests per backend instead of replacing the first future and
+            // forcing its caller to time out.
+            AtomicBoolean created = new AtomicBoolean(false);
+            CompletableFuture<HandoffProtocol.StatusResponseData> raw =
+                pendingStatusQueries.compute(name, (ignored, existing) -> {
+                    if (existing != null && !existing.isDone()) return existing;
+                    created.set(true);
+                    return new CompletableFuture<>();
+                });
 
             // Wrap with timeout + exceptionally so one slow backend
             // doesn't cause allOf to throw.
@@ -238,9 +216,12 @@ public class FastSyncProxy {
                    .whenComplete((result, ex) -> pendingStatusQueries.remove(name, raw));
             futures.add(safe);
 
-            boolean sent = server.sendPluginMessage(HANDOFF_CHANNEL, HandoffProtocol.encodeStatusQuery());
-            if (!sent) {
-                raw.complete(null);
+            if (created.get()) {
+                boolean sent = server.sendPluginMessage(
+                    HANDOFF_CHANNEL, HandoffProtocol.encodeStatusQuery());
+                if (!sent) {
+                    raw.complete(null);
+                }
             }
         }
 
@@ -272,7 +253,7 @@ public class FastSyncProxy {
         event.setResult(PluginMessageEvent.ForwardResult.handled());
 
         // Only accept messages from backend servers, not from player clients.
-        if (!(event.getSource() instanceof com.velocitypowered.api.proxy.ServerConnection)) {
+        if (!(event.getSource() instanceof com.velocitypowered.api.proxy.ServerConnection source)) {
             if (config != null && config.isDebug()) {
                 logger.warn("[Handoff] Rejected plugin message from non-server source: {}",
                     event.getSource().getClass().getName());
@@ -287,22 +268,26 @@ public class FastSyncProxy {
             switch (type) {
                 case HandoffProtocol.LOCK_STATUS -> {
                     HandoffProtocol.LockStatusData status = HandoffProtocol.decodeLockStatus(data);
-                    CompletableFuture<HandoffProtocol.LockStatusData> future =
-                        pendingLockQueries.remove(status.uuid());
-                    if (future != null) {
-                        future.complete(status);
-                    }
+                    String sourceName = source.getServerInfo().getName();
                     if (config.isDebug()) {
-                        logger.info("[Handoff] Lock status for {}: locked={} by {}",
-                            status.uuid(), status.locked(), status.serverName());
+                        logger.info("[Handoff] Unsolicited lock status from {} for {}: locked={} by {}",
+                            sourceName, status.uuid(), status.locked(), status.serverName());
                     }
                 }
                 case HandoffProtocol.STATUS_RESPONSE -> {
-                    HandoffProtocol.StatusResponseData status = HandoffProtocol.decodeStatusResponse(data);
+                    HandoffProtocol.StatusResponseData decoded = HandoffProtocol.decodeStatusResponse(data);
+                    String sourceName = source.getServerInfo().getName();
+                    // Treat the authenticated Velocity connection as identity;
+                    // the backend's self-reported name is display metadata and
+                    // must not be able to impersonate another registered server.
+                    HandoffProtocol.StatusResponseData status =
+                        new HandoffProtocol.StatusResponseData(
+                            sourceName, decoded.dbHealthy(), decoded.redisHealthy(),
+                            decoded.playerCount(), decoded.pendingSaves(), decoded.pendingLoads());
                     CompletableFuture<HandoffProtocol.StatusResponseData> future =
-                        pendingStatusQueries.remove(status.serverName());
-                    if (future != null) {
-                        future.complete(status);
+                        pendingStatusQueries.get(sourceName);
+                    if (future != null && future.complete(status)) {
+                        pendingStatusQueries.remove(sourceName, future);
                     }
                     if (config.isDebug()) {
                         logger.info("[Handoff] Status from {}: db={} redis={} players={}",
@@ -499,8 +484,7 @@ public class FastSyncProxy {
         }
 
         private void handleDebug(CommandSource source) {
-            // Toggle debug by reloading config with debug inverted
-            // Since we can't easily mutate the loaded config, just log
+            config.setDebug(!config.isDebug());
             source.sendMessage(msg("proxy.debug.state", config.isDebug()));
             source.sendMessage(msg("proxy.debug.hint"));
         }

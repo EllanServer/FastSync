@@ -224,8 +224,12 @@ tasks.named("build") {
 
 val ci = tasks.register("ci") {
     group = "ci"
-    description = "Full CI pipeline: clean, build, and test."
-    dependsOn("clean", "build", "check")
+    description = "Full CI pipeline: build, package, and test."
+    // Java's build lifecycle already depends on both assemble and check. Do not
+    // add clean as a sibling dependency: with org.gradle.parallel=true Gradle
+    // may delete class outputs while compileTestJava/shadowJar are reading them.
+    // Call `./gradlew clean ci` when an explicitly clean local build is needed.
+    dependsOn("build")
 }
 
 val testGroup = tasks.register("testGroup") {
@@ -272,6 +276,15 @@ dependencies {
     add("velocityOnly", "org.yaml:snakeyaml:2.6")
 }
 sourceSets["velocity"].compileClasspath += velocityOnly
+
+// Let the standard JUnit suite exercise protocol/config code from the custom
+// Velocity source set. Without this bridge, proxy behavior compiled but had no
+// executable regression tests at all.
+sourceSets["test"].compileClasspath += sourceSets["velocity"].output + velocityOnly
+sourceSets["test"].runtimeClasspath += sourceSets["velocity"].output + velocityOnly
+tasks.named<JavaCompile>("compileTestJava") {
+    dependsOn("velocityClasses")
+}
 
 val velocityJar = tasks.register<Jar>("velocityJar") {
     group = "build"

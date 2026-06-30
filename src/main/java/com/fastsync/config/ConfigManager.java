@@ -14,7 +14,7 @@ import java.util.logging.Logger;
  *
  * <p>Configuration is loaded from {@code config.yml} using the sparrow-yaml
  * library (which preserves comments). Clean-slate: there is no Bukkit
- * {@link FileConfiguration} fallback — a parse failure is a hard error and the
+ * {@link org.bukkit.configuration.file.FileConfiguration} fallback — a parse failure is a hard error and the
  * plugin refuses to start. The bundled sample values are additionally vetted by
  * {@link #validateProductionSafety()} before the database is opened.</p>
  */
@@ -29,7 +29,6 @@ public class ConfigManager {
     private String serverName;
 
     // Database
-    private String dbType;
     private String dbHost;
     private int dbPort;
     private String dbDatabase;
@@ -58,7 +57,6 @@ public class ConfigManager {
     private boolean redisSsl;
     private int redisTimeout;
     private String redisChannelPrefix;
-    private boolean redisCacheEnabled;
 
     // Sync
     private boolean syncInventory;
@@ -73,7 +71,6 @@ public class ConfigManager {
     private int lockTimeout;
     private long lockRetryIntervalMs;
     private int lockMaxRetries;
-    private int saveDelay;
     private boolean clearBeforeApply;
     private String loadFailKickMessage;
     private String lockTimeoutKickMessage;
@@ -138,12 +135,10 @@ public class ConfigManager {
     // Production mode
     private boolean productionEnabled;
     private boolean productionRequireRedis;
-    private boolean productionRequireClusterId;
 
     // Final-save executor
     private int finalSaveThreads;
     private int finalSaveQueueCapacity;
-    private int finalSaveShutdownTimeoutSeconds;
     private boolean finalSaveAllowSyncFallback;
 
     // Final-save spool (WAL for queue-full events)
@@ -252,9 +247,163 @@ public class ConfigManager {
         assignValues(new SparrowConfigSource(loaded));
     }
 
+    /**
+     * Compatibility wrapper for callers that cannot consume a ReloadResult.
+     * Restart-only changes fail explicitly instead of being half-applied.
+     */
     public void reload() {
-        // Re-read the config file (sparrow-yaml re-parses it inside load())
-        load();
+        ReloadResult result = reloadSafely();
+        if (!result.applied()) {
+            throw new IllegalStateException("Restart required for configuration changes: "
+                + String.join(", ", result.restartRequiredChanges()));
+        }
+    }
+
+    /** Result of a transactional live-reload attempt. */
+    public record ReloadResult(boolean applied, java.util.List<String> restartRequiredChanges) {
+        public ReloadResult {
+            restartRequiredChanges = java.util.List.copyOf(restartRequiredChanges);
+        }
+    }
+
+    /**
+     * Parse and validate a candidate configuration without mutating the active
+     * ConfigManager. Settings whose owners are constructed only during startup
+     * (DB pool, Redis client, executors, spool, etc.) are rejected as a group so
+     * the running process can never enter a half-old/half-new configuration.
+     *
+     * <p>Previously {@link #reload()} assigned every field immediately. Changing
+     * {@code server-name}, for example, made heartbeats and saves use the new
+     * name while the DB lock and Redis consumer still belonged to the old name.
+     * That reliably led to lock loss. This method either applies the whole safe
+     * subset or leaves the active object untouched and asks for a restart.</p>
+     */
+    public ReloadResult reloadSafely() {
+        ConfigManager candidate = new ConfigManager(plugin);
+        try {
+            candidate.load();
+            candidate.validateProductionSafety();
+        } catch (RuntimeException e) {
+            // candidate.load() configures the process-wide compression codec.
+            // Restore the active settings before surfacing a parse/validation
+            // failure so a rejected reload has zero runtime side effects.
+            applyCompressionRuntimeSettings();
+            throw e;
+        }
+
+        java.util.List<String> restartRequired = restartRequiredChanges(this, candidate);
+        if (!restartRequired.isEmpty()) {
+            applyCompressionRuntimeSettings();
+            return new ReloadResult(false, restartRequired);
+        }
+
+        copyLoadedStateFrom(candidate);
+        // Re-apply after the copy for clarity and to make this method robust if
+        // candidate loading ever stops configuring the global codec itself.
+        applyCompressionRuntimeSettings();
+        return new ReloadResult(true, java.util.List.of());
+    }
+
+    static java.util.List<String> restartRequiredChanges(
+            ConfigManager active, ConfigManager candidate) {
+        java.util.List<String> changes = new java.util.ArrayList<>();
+        if (!java.util.Objects.equals(active.serverName, candidate.serverName)) {
+            changes.add("server-name");
+        }
+        if (!java.util.Objects.equals(active.clusterId, candidate.clusterId)) {
+            changes.add("cluster-id");
+        }
+        if (!sameDatabaseRuntime(active, candidate)) {
+            changes.add("database.*");
+        }
+        if (!sameRedisRuntime(active, candidate)) {
+            changes.add("redis connection/stream settings");
+        }
+        if (active.poolSize != candidate.poolSize
+                || active.queueCapacity != candidate.queueCapacity
+                || active.maxConcurrentLoads != candidate.maxConcurrentLoads) {
+            changes.add("executor/login concurrency settings");
+        }
+        if (active.dirtyTrackingEnabled != candidate.dirtyTrackingEnabled
+                || active.dirtyValidationInterval != candidate.dirtyValidationInterval) {
+            changes.add("sync.dirty-tracking enabled/validation-interval");
+        }
+        if (active.snapshotEnabled != candidate.snapshotEnabled) {
+            changes.add("snapshot.enabled");
+        }
+        if (active.finalSaveThreads != candidate.finalSaveThreads
+                || active.finalSaveQueueCapacity != candidate.finalSaveQueueCapacity
+                || active.finalSaveSpoolEnabled != candidate.finalSaveSpoolEnabled
+                || !java.util.Objects.equals(active.finalSaveSpoolDir, candidate.finalSaveSpoolDir)
+                || active.finalSaveSpoolMaxFiles != candidate.finalSaveSpoolMaxFiles
+                || active.finalSaveSpoolMaxBytes != candidate.finalSaveSpoolMaxBytes
+                || active.finalSaveSpoolFsync != candidate.finalSaveSpoolFsync
+                || active.finalSaveSpoolReplayOnStartup != candidate.finalSaveSpoolReplayOnStartup
+                || active.finalSaveSpoolReplayIntervalTicks != candidate.finalSaveSpoolReplayIntervalTicks
+                || active.finalSaveSpoolReplayBatchSize != candidate.finalSaveSpoolReplayBatchSize
+                || active.finalSaveSpoolRetainFailedDays != candidate.finalSaveSpoolRetainFailedDays) {
+            changes.add("final-save executor/spool settings");
+        }
+        if (active.operationLogEnabled != candidate.operationLogEnabled) {
+            changes.add("operation-log.enabled");
+        }
+        if (active.latencyTrackingEnabled != candidate.latencyTrackingEnabled
+                || active.latencyWindowSize != candidate.latencyWindowSize) {
+            changes.add("latency enabled/window-size");
+        }
+        // Production mode changes startup failure policy. Applying it after a
+        // non-production startup could bless a failed Redis connection or spool
+        // initialization without rebuilding either subsystem.
+        if (active.productionEnabled != candidate.productionEnabled
+                || active.productionRequireRedis != candidate.productionRequireRedis) {
+            changes.add("production.*");
+        }
+        return changes;
+    }
+
+    private static boolean sameDatabaseRuntime(ConfigManager a, ConfigManager b) {
+        return java.util.Objects.equals(a.dbHost, b.dbHost)
+            && a.dbPort == b.dbPort
+            && java.util.Objects.equals(a.dbDatabase, b.dbDatabase)
+            && java.util.Objects.equals(a.dbUsername, b.dbUsername)
+            && java.util.Objects.equals(a.dbPassword, b.dbPassword)
+            && java.util.Objects.equals(a.tablePrefix, b.tablePrefix)
+            && a.connectionTimeout == b.connectionTimeout
+            && a.idleTimeout == b.idleTimeout
+            && a.maxLifetime == b.maxLifetime
+            && a.leakDetectionThreshold == b.leakDetectionThreshold
+            && java.util.Objects.equals(a.dbParameters, b.dbParameters)
+            && a.allowInsecureRemote == b.allowInsecureRemote;
+    }
+
+    private static boolean sameRedisRuntime(ConfigManager a, ConfigManager b) {
+        return a.redisEnabled == b.redisEnabled
+            && java.util.Objects.equals(a.redisHost, b.redisHost)
+            && a.redisPort == b.redisPort
+            && java.util.Objects.equals(a.redisPassword, b.redisPassword)
+            && a.redisDatabase == b.redisDatabase
+            && a.redisSsl == b.redisSsl
+            && a.redisTimeout == b.redisTimeout
+            && java.util.Objects.equals(a.redisChannelPrefix, b.redisChannelPrefix)
+            && a.streamsEnabled == b.streamsEnabled
+            && a.redisStreamMaxLen == b.redisStreamMaxLen
+            && a.redisStreamTrimApprox == b.redisStreamTrimApprox;
+    }
+
+    private void copyLoadedStateFrom(ConfigManager source) {
+        try {
+            for (java.lang.reflect.Field field : ConfigManager.class.getDeclaredFields()) {
+                int modifiers = field.getModifiers();
+                if (java.lang.reflect.Modifier.isStatic(modifiers)
+                        || java.lang.reflect.Modifier.isFinal(modifiers)) {
+                    continue;
+                }
+                field.setAccessible(true);
+                field.set(this, field.get(source));
+            }
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Failed to commit validated configuration", e);
+        }
     }
 
     /**
@@ -314,22 +463,18 @@ public class ConfigManager {
             }
         }
 
-        // 3) Multi-cluster DB isolation. v2 schema uses (cluster_id, uuid) PK,
-        //    so different clusters sharing the same table-prefix is now safe
-        //    at the DB level. But Redis pub/sub still needs distinct cluster-ids
-        //    for namespace isolation. Warn if cluster-id is empty in a multi-server setup.
+        // 3) Cluster identity is part of every DB primary key and Redis namespace.
+        //    A blank value is never a safe live configuration; assignValues()
+        //    rejects it too, but keep this guard so programmatic/test callers
+        //    cannot bypass the invariant.
         if (clusterId == null || clusterId.isBlank()) {
-            logger.warning("[Config] cluster-id is empty. Redis pub/sub will use the default namespace. "
-                + "If running multiple server clusters on the same Redis, set a distinct cluster-id per cluster.");
+            throw new RuntimeException(
+                "cluster-id must be explicitly set. All servers in the same FastSync "
+                    + "cluster must use the same non-empty value.");
         }
 
         // 4) Production mode checks (round 14)
         if (productionEnabled) {
-            if (productionRequireClusterId && (clusterId == null || clusterId.isBlank())) {
-                throw new RuntimeException(
-                    "production.require-cluster-id=true but cluster-id is empty. "
-                        + "Set a non-empty cluster-id in config.yml.");
-            }
             if (productionRequireRedis && !redisEnabled) {
                 throw new RuntimeException(
                     "production.require-redis=true but redis.enabled=false. "
@@ -356,7 +501,6 @@ public class ConfigManager {
                     + "rely on the spool + replay service.");
             }
             logger.info("[Config] Production mode enabled. Redis required=" + productionRequireRedis
-                + ", cluster-id required=" + productionRequireClusterId
                 + ", final-save spool=" + finalSaveSpoolEnabled
                 + ", final-save sync fallback allowed=" + finalSaveAllowSyncFallback);
         }
@@ -391,9 +535,14 @@ public class ConfigManager {
     private void assignValues(ConfigSource source) {
         // Server
         serverName = source.getString("server-name", "survival-1");
+        if (serverName == null || !serverName.trim().matches("[A-Za-z0-9_.-]{1,64}")) {
+            throw new RuntimeException(
+                "Invalid server-name '" + serverName + "'. "
+                    + "Allowed characters: A-Z a-z 0-9 _ . - , max 64 characters.");
+        }
+        serverName = serverName.trim();
 
         // Database
-        dbType = source.getString("database.type", "mysql");
         dbHost = source.getString("database.host", "localhost");
         dbPort = source.getInt("database.port", 3306);
         dbDatabase = source.getString("database.database", "minecraft");
@@ -427,7 +576,6 @@ public class ConfigManager {
         redisSsl = source.getBoolean("redis.ssl", false);
         redisTimeout = source.getInt("redis.timeout", 5000);
         redisChannelPrefix = source.getString("redis.channel-prefix", "fastsync:lock:");
-        redisCacheEnabled = source.getBoolean("redis.cache-enabled", false);
 
         // Sync
         syncInventory = source.getBoolean("sync.sync-inventory", true);
@@ -443,10 +591,10 @@ public class ConfigManager {
         // Round 16 (P1 #5): tightened defaults. Previously 1000ms x 30 = 30s
         // worst-case pre-login block, which caused severe UX under login storms
         // and DB hiccups. New defaults: 300ms x 15 = 4.5s worst-case. The
-        // Velocity handoff path is faster and does not wait the full window.
+        // Redis release notifications usually make the backend gate return
+        // earlier without weakening this bounded fallback window.
         lockRetryIntervalMs = source.getLong("sync.lock-retry-interval-ms", 300);
         lockMaxRetries = source.getInt("sync.lock-max-retries", 15);
-        saveDelay = source.getInt("sync.save-delay", 0);
         clearBeforeApply = source.getBoolean("sync.clear-before-apply", true);
         loadFailKickMessage = source.getString("sync.load-fail-kick-message",
             "&c[FastSync] Failed to load your player data. Please try reconnecting.");
@@ -596,12 +744,10 @@ public class ConfigManager {
         // Production mode
         productionEnabled = source.getBoolean("production.enabled", false);
         productionRequireRedis = source.getBoolean("production.require-redis", true);
-        productionRequireClusterId = source.getBoolean("production.require-cluster-id", true);
 
         // Final-save executor (single source of truth for sync-fallback gate)
         finalSaveThreads = source.getInt("final-save.threads", 4);
         finalSaveQueueCapacity = source.getInt("final-save.queue-capacity", 1024);
-        finalSaveShutdownTimeoutSeconds = source.getInt("final-save.shutdown-timeout-seconds", 60);
         finalSaveAllowSyncFallback = source.getBoolean("final-save.allow-sync-fallback", false);
 
         // Final-save spool (WAL for queue-full events)
@@ -614,18 +760,6 @@ public class ConfigManager {
         finalSaveSpoolReplayIntervalTicks = source.getLong("final-save.spool.replay-interval-ticks", 100);
         finalSaveSpoolReplayBatchSize = source.getInt("final-save.spool.replay-batch-size", 64);
         finalSaveSpoolRetainFailedDays = source.getInt("final-save.spool.retain-failed-days", 7);
-        if (finalSaveThreads < 1) {
-            logger.warning("[Config] final-save.threads must be >= 1. Using 1.");
-            finalSaveThreads = 1;
-        }
-        if (finalSaveQueueCapacity < 1) {
-            logger.warning("[Config] final-save.queue-capacity must be >= 1. Using 1.");
-            finalSaveQueueCapacity = 1;
-        }
-        if (finalSaveShutdownTimeoutSeconds < 1) {
-            logger.warning("[Config] final-save.shutdown-timeout-seconds must be >= 1. Using 1.");
-            finalSaveShutdownTimeoutSeconds = 1;
-        }
         if (finalSaveSpoolDir == null || finalSaveSpoolDir.isBlank()) {
             finalSaveSpoolDir = "final-save-spool";
         }
@@ -694,21 +828,6 @@ public class ConfigManager {
         serializationMaxWrappedBytes = source.getInt("serialization.max-wrapped-bytes", 5 * (1 << 19)); // 2.5 MiB
         if (serializationMaxRawBytes <= 0) serializationMaxRawBytes = 1 << 20;
         if (serializationMaxWrappedBytes <= 0) serializationMaxWrappedBytes = 5 * (1 << 19);
-        com.fastsync.serialization.CompressionUtil.configureLimits(
-            serializationMaxRawBytes, serializationMaxWrappedBytes);
-
-        // Configure compression, including the disabled state on reload.
-        com.fastsync.serialization.CompressionUtil.setEnabled(compressionEnabled);
-        if (isZstdCompression()) {
-            com.fastsync.serialization.CompressionUtil.setAlgorithm(
-                com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.ZSTD);
-            com.fastsync.serialization.CompressionUtil.setZstdLevel(zstdLevel);
-        } else {
-            com.fastsync.serialization.CompressionUtil.setAlgorithm(
-                com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.LZ4);
-        }
-        com.fastsync.serialization.CompressionUtil.verifyConfiguredCodec();
-
         // Debug
         debug = source.getBoolean("debug", false);
         logTiming = source.getBoolean("log-timing", false);
@@ -726,13 +845,142 @@ public class ConfigManager {
         streamsEnabled = source.getBoolean("redis.streams-enabled", true);
         redisStreamMaxLen = source.getInt("redis.stream-maxlen", 100000);
         redisStreamTrimApprox = source.getBoolean("redis.stream-trim-approx", true);
+
+        validateNumericRanges();
+        applyCompressionRuntimeSettings();
+    }
+
+    /**
+     * Clamp numeric settings that feed schedulers, bounded queues and network
+     * clients. These checks deliberately live in one final pass: several
+     * defaults depend on values parsed earlier (for example login concurrency
+     * depends on the DB pool size), and validating only at individual read sites
+     * previously left zero/negative values able to reach runtime code.
+     *
+     * <p>In particular, {@code periodic-save-batch-size=0} made FastSync's
+     * batching loop advance by zero forever, while non-positive retry/period
+     * values caused {@code Thread.sleep} or the Paper/Folia schedulers to throw
+     * on live login/save paths.</p>
+     */
+    void validateNumericRanges() {
+        if (dbPort < 1 || dbPort > 65_535) {
+            logger.warning("[Config] database.port must be in 1-65535. Using 3306.");
+            dbPort = 3306;
+        }
+        // These values feed Hikari and ArrayBlockingQueue constructors during
+        // startup. Bound both ends so a typo cannot create thousands of DB
+        // connections or allocate a multi-gigabyte queue before startup fails.
+        poolSize = clampWithWarning("database.pool-size", poolSize, 3, 256, 10);
+        queueCapacity = clampWithWarning(
+            "database.queue-capacity", queueCapacity, 1, 1_000_000, 256);
+        finalSaveThreads = clampWithWarning(
+            "final-save.threads", finalSaveThreads, 2, 128, 4);
+        finalSaveQueueCapacity = clampWithWarning(
+            "final-save.queue-capacity", finalSaveQueueCapacity, 1, 1_000_000, 1_024);
+        if (connectionTimeout != 0 && connectionTimeout < 250) {
+            logger.warning("[Config] database.connection-timeout must be 0 or >= 250ms. Using 250ms.");
+            connectionTimeout = 250;
+        }
+        if (idleTimeout != 0 && idleTimeout < 10_000) {
+            logger.warning("[Config] database.idle-timeout must be 0 or >= 10000ms. Using 10000ms.");
+            idleTimeout = 10_000;
+        }
+        if (maxLifetime != 0 && maxLifetime < 30_000) {
+            logger.warning("[Config] database.max-lifetime must be 0 or >= 30000ms. Using 30000ms.");
+            maxLifetime = 30_000;
+        }
+        if (leakDetectionThreshold != 0 && leakDetectionThreshold < 2_000) {
+            logger.warning("[Config] database.leak-detection-threshold must be 0 or >= 2000ms. Using 2000ms.");
+            leakDetectionThreshold = 2_000;
+        }
+
+        if (redisPort < 1 || redisPort > 65_535) {
+            logger.warning("[Config] redis.port must be in 1-65535. Using 6379.");
+            redisPort = 6379;
+        }
+        if (redisDatabase < 0) {
+            logger.warning("[Config] redis.database must be >= 0. Using 0.");
+            redisDatabase = 0;
+        }
+        if (redisTimeout < 100) {
+            logger.warning("[Config] redis.timeout must be >= 100ms. Using 100ms.");
+            redisTimeout = 100;
+        }
+
+        if (lockRetryIntervalMs < 1) {
+            logger.warning("[Config] sync.lock-retry-interval-ms must be >= 1. Using 1.");
+            lockRetryIntervalMs = 1;
+        }
+        if (lockMaxRetries < 1) {
+            logger.warning("[Config] sync.lock-max-retries must be >= 1. Using 1.");
+            lockMaxRetries = 1;
+        }
+        if (periodicSaveIntervalSeconds < 1) {
+            logger.warning("[Config] sync.periodic-save-interval-seconds must be >= 1. Using 1.");
+            periodicSaveIntervalSeconds = 1;
+        }
+        if (periodicSaveBatchSize < 1) {
+            logger.warning("[Config] sync.periodic-save-batch-size must be >= 1. Using 1.");
+            periodicSaveBatchSize = 1;
+        }
+        int safeLoadLimit = Math.max(1, poolSize - 2);
+        if (maxConcurrentLoads > safeLoadLimit) {
+            logger.warning("[Config] sync.max-concurrent-loads (" + maxConcurrentLoads
+                + ") leaves no DB capacity for saves/heartbeats. Using " + safeLoadLimit + ".");
+            maxConcurrentLoads = safeLoadLimit;
+        }
+
+        maxSnapshots = clampWithWarning(
+            "snapshot.max-snapshots", maxSnapshots, 1, 10_000, 16);
+        if (snapshotBackupFrequencyMs < 0) {
+            logger.warning("[Config] snapshot.backup-frequency-ms must be >= 0. Using 0.");
+            snapshotBackupFrequencyMs = 0;
+        }
+        latencyWindowSize = clampWithWarning(
+            "latency.window-size", latencyWindowSize, 16, 1_000_000, 1_000);
+        operationLogRetention = clampWithWarning(
+            "operation-log.retention", operationLogRetention, 1, 100_000, 100);
+        if (redisStreamMaxLen < 0) {
+            logger.warning("[Config] redis.stream-maxlen must be >= 0. Using 0 (no trimming).");
+            redisStreamMaxLen = 0;
+        }
+
+        // Bounds are themselves allocation limits. Cap them so a typo cannot
+        // turn a poisoned DB header into a multi-gigabyte allocation attempt.
+        serializationMaxRawBytes = clampWithWarning(
+            "serialization.max-raw-bytes", serializationMaxRawBytes,
+            1_024, 64 * 1_024 * 1_024, 1 << 20);
+        serializationMaxWrappedBytes = clampWithWarning(
+            "serialization.max-wrapped-bytes", serializationMaxWrappedBytes,
+            1_024, 64 * 1_024 * 1_024, 5 * (1 << 19));
+    }
+
+    private int clampWithWarning(String key, int value, int min, int max, int fallback) {
+        if (value >= min && value <= max) return value;
+        logger.warning("[Config] " + key + " must be in " + min + "-" + max
+            + ". Using " + fallback + ".");
+        return fallback;
+    }
+
+    private void applyCompressionRuntimeSettings() {
+        com.fastsync.serialization.CompressionUtil.configureLimits(
+            serializationMaxRawBytes, serializationMaxWrappedBytes);
+        com.fastsync.serialization.CompressionUtil.setEnabled(compressionEnabled);
+        if (isZstdCompression()) {
+            com.fastsync.serialization.CompressionUtil.setAlgorithm(
+                com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.ZSTD);
+            com.fastsync.serialization.CompressionUtil.setZstdLevel(zstdLevel);
+        } else {
+            com.fastsync.serialization.CompressionUtil.setAlgorithm(
+                com.fastsync.serialization.CompressionUtil.CompressionAlgorithm.LZ4);
+        }
+        com.fastsync.serialization.CompressionUtil.verifyConfiguredCodec();
     }
 
     // ==================== Getters ====================
 
     public String getServerName() { return serverName; }
 
-    public String getDbType() { return dbType; }
     public String getDbHost() { return dbHost; }
     public int getDbPort() { return dbPort; }
     public String getDbDatabase() { return dbDatabase; }
@@ -755,7 +1003,6 @@ public class ConfigManager {
     public boolean isRedisSsl() { return redisSsl; }
     public int getRedisTimeout() { return redisTimeout; }
     public String getRedisChannelPrefix() { return redisChannelPrefix; }
-    public boolean isRedisCacheEnabled() { return redisCacheEnabled; }
 
     public boolean isSyncInventory() { return syncInventory; }
     public boolean isSyncEnderChest() { return syncEnderChest; }
@@ -769,7 +1016,6 @@ public class ConfigManager {
     public int getLockTimeout() { return lockTimeout; }
     public long getLockRetryIntervalMs() { return lockRetryIntervalMs; }
     public int getLockMaxRetries() { return lockMaxRetries; }
-    public int getSaveDelay() { return saveDelay; }
     public boolean isClearBeforeApply() { return clearBeforeApply; }
     public String getLoadFailKickMessage() { return loadFailKickMessage; }
     public String getLockTimeoutKickMessage() { return lockTimeoutKickMessage; }
@@ -827,12 +1073,10 @@ public class ConfigManager {
     // Production mode
     public boolean isProductionEnabled() { return productionEnabled; }
     public boolean isProductionRequireRedis() { return productionRequireRedis; }
-    public boolean isProductionRequireClusterId() { return productionRequireClusterId; }
 
     // Final-save executor
     public int getFinalSaveThreads() { return finalSaveThreads; }
     public int getFinalSaveQueueCapacity() { return finalSaveQueueCapacity; }
-    public int getFinalSaveShutdownTimeoutSeconds() { return finalSaveShutdownTimeoutSeconds; }
     public boolean isFinalSaveAllowSyncFallback() { return finalSaveAllowSyncFallback; }
 
     // Final-save spool
@@ -859,6 +1103,8 @@ public class ConfigManager {
     public int getSerializationMaxWrappedBytes() { return serializationMaxWrappedBytes; }
 
     public boolean isDebug() { return debug; }
+    /** Toggle diagnostics for the current process without rewriting config.yml. */
+    public void setDebug(boolean debug) { this.debug = debug; }
     public boolean isLogTiming() { return logTiming; }
     public String getLanguage() { return language; }
 

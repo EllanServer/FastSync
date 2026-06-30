@@ -67,10 +67,9 @@ import java.util.logging.Logger;
  * </ul>
  *
  * <p>Thread-safety: the manager is safe to call concurrently from multiple
- * threads. Appends for the same UUID are serialized by a per-UUID lock to
- * ensure append ordering. {@link #queryHistory} is read-only and never blocks
- * appends. {@link #prune} should not run concurrently with an in-flight
- * {@link #append} for the same UUID.
+ * threads. Appends, reads and pruning for the same UUID are serialized by a
+ * per-UUID lock so readers never observe a partially-written record and prune
+ * cannot replace a file while an append is in flight.
  */
 public class FileOperationLogManager {
 
@@ -96,10 +95,11 @@ public class FileOperationLogManager {
      *
      * <p>This executor is single-threaded (log writes are sequential per
      * process; per-UUID locks handle ordering across threads) with a large
-     * bounded queue (4096) and {@code DiscardOldestPolicy} — under extreme
+     * bounded queue (4096) and a discard-oldest policy — under extreme
      * load we prefer to drop the oldest queued log entry rather than block
-     * the save/load path or throw. The SQL DB remains the source of truth;
-     * the operation log is an audit aid.
+     * the save/load path or throw. Dropped tasks explicitly complete their
+     * futures, avoiding callers waiting forever on work that left the queue.
+     * The SQL DB remains the source of truth; the operation log is an audit aid.
      */
     private final ThreadPoolExecutor appendExecutor;
 
@@ -140,33 +140,24 @@ public class FileOperationLogManager {
             factory,
             (task, executor) -> {
                 if (closed || executor.isShutdown()) {
-                    throw new java.util.concurrent.RejectedExecutionException(
-                        "FileOperationLogManager append executor is shutting down");
+                    discardTask(task);
+                    return;
                 }
                 Runnable dropped = executor.getQueue().poll();
                 if (dropped != null) {
-                    long drops = droppedCount.incrementAndGet();
-                    lastDropTimestamp.set(System.currentTimeMillis());
-                    if (drops == 1 || drops % 100 == 0) {
-                        logger.warning("[OpLog] Append queue full; dropped " + drops
-                            + " queued log entr" + (drops == 1 ? "y" : "ies")
-                            + " so far. This log is best-effort only.");
-                    }
+                    discardTask(dropped);
                 }
                 if (!executor.getQueue().offer(task)) {
-                    throw new java.util.concurrent.RejectedExecutionException(
-                        "FileOperationLogManager append queue remained full after dropping oldest entry");
+                    discardTask(task);
                 }
             });
     }
 
-    public void initialize() {
-        try {
-            Files.createDirectories(playerLogRoot);
-        } catch (IOException e) {
-            logger.log(Level.WARNING,
-                "[OpLog] Failed to create player-log directory: " + playerLogRoot, e);
-        }
+    public void initialize() throws IOException {
+        // Fail initialization instead of advertising an enabled audit log whose
+        // directory could not be created. OperationLogDelegate catches this and
+        // disables the optional subsystem cleanly.
+        Files.createDirectories(playerLogRoot);
         initialized = true;
         logger.info("[OpLog] File operation log enabled (dir=" + playerLogRoot
             + ", retention=" + retention + ", executor=dedicated single-thread bounded).");
@@ -189,24 +180,77 @@ public class FileOperationLogManager {
         return appendLocks.computeIfAbsent(uuid, id -> new Object());
     }
 
+    /** Runnable with an observable completion even when queue policy drops it. */
+    private final class AppendTask implements Runnable {
+        private final OperationLog entry;
+        private final CompletableFuture<Void> completion = new CompletableFuture<>();
+
+        private AppendTask(OperationLog entry) {
+            this.entry = entry;
+        }
+
+        @Override
+        public void run() {
+            try {
+                appendSync(entry);
+            } catch (Throwable t) {
+                logger.log(Level.WARNING,
+                    "[OpLog] Failed to append operation log for " + entry.uuid(), t);
+            } finally {
+                completion.complete(null);
+            }
+        }
+
+        private void completeAsDropped() {
+            completion.complete(null);
+        }
+    }
+
+    private void discardTask(Runnable task) {
+        if (task instanceof FileOperationLogManager.AppendTask appendTask) {
+            appendTask.completeAsDropped();
+        }
+        long drops = droppedCount.incrementAndGet();
+        lastDropTimestamp.set(System.currentTimeMillis());
+        if (drops == 1 || drops % 100 == 0) {
+            logger.warning("[OpLog] Append queue full; dropped " + drops
+                + " queued log entr" + (drops == 1 ? "y" : "ies")
+                + " so far. This log is best-effort only.");
+        }
+    }
+
+    private void discardTasks(java.util.List<Runnable> tasks) {
+        if (tasks.isEmpty()) return;
+        for (Runnable task : tasks) {
+            if (task instanceof FileOperationLogManager.AppendTask appendTask) {
+                appendTask.completeAsDropped();
+            }
+        }
+        droppedCount.addAndGet(tasks.size());
+        lastDropTimestamp.set(System.currentTimeMillis());
+    }
+
     public CompletableFuture<Void> append(OperationLog entry) {
         if (!isEnabled()) {
             return CompletableFuture.completedFuture(null);
         }
         // Round 16 (P0 #2): use the dedicated bounded appendExecutor instead
         // of ForkJoinPool.commonPool(). This keeps log writes under FastSync's
-        // thread-governance and shutdown ordering. DiscardOldestPolicy ensures
+        // thread-governance and shutdown ordering. The discard-oldest policy ensures
         // this never blocks the save/load path — under extreme load the oldest
         // queued log entry is silently dropped (the DB remains the source of
-        // truth; this log is an audit aid only).
-        return CompletableFuture.runAsync(() -> {
-            try {
-                appendSync(entry);
-            } catch (Throwable t) {
-                logger.log(Level.WARNING,
-                    "[OpLog] Failed to append operation log for " + entry.uuid(), t);
-            }
-        }, appendExecutor);
+        // truth; this log is an audit aid only). A custom task is used instead
+        // of CompletableFuture.runAsync so the rejection policy can complete a
+        // future whose queued task it discards.
+        AppendTask task = new AppendTask(entry);
+        try {
+            appendExecutor.execute(task);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Defensive fallback for executor implementations/policies that may
+            // still throw during a close race. Logging remains best-effort.
+            discardTask(task);
+        }
+        return task.completion;
     }
 
     private void appendSync(OperationLog entry) throws IOException {
@@ -236,23 +280,25 @@ public class FileOperationLogManager {
         if (!isEnabled() || limit <= 0 || uuid == null) {
             return List.of();
         }
-        Path path = getLogPath(uuid);
-        if (!Files.exists(path)) {
-            return List.of();
-        }
+        synchronized (getLock(uuid)) {
+            Path path = getLogPath(uuid);
+            if (!Files.exists(path)) {
+                return List.of();
+            }
 
-        List<OperationLog> all = readAll(path);
-        if (all.isEmpty()) {
-            return List.of();
-        }
+            List<OperationLog> all = readAll(path);
+            if (all.isEmpty()) {
+                return List.of();
+            }
 
-        int from = Math.max(0, all.size() - limit);
-        List<OperationLog> tail = all.subList(from, all.size());
-        List<OperationLog> result = new ArrayList<>(tail.size());
-        for (int i = tail.size() - 1; i >= 0; i--) {
-            result.add(tail.get(i));
+            int from = Math.max(0, all.size() - limit);
+            List<OperationLog> tail = all.subList(from, all.size());
+            List<OperationLog> result = new ArrayList<>(tail.size());
+            for (int i = tail.size() - 1; i >= 0; i--) {
+                result.add(tail.get(i));
+            }
+            return result;
         }
-        return result;
     }
 
     public void prune(UUID uuid, int keepCount) {
@@ -267,28 +313,25 @@ public class FileOperationLogManager {
     }
 
     private void pruneSync(UUID uuid, int keepCount) throws IOException {
-        Path path = getLogPath(uuid);
-        if (!Files.exists(path)) {
-            return;
-        }
-
-        List<OperationLog> all = readAll(path);
-        if (all.size() <= keepCount) {
-            return;
-        }
-
-        if (keepCount == 0) {
-            synchronized (getLock(uuid)) {
-                Files.deleteIfExists(path);
-            }
-            return;
-        }
-
-        List<OperationLog> keep = new ArrayList<>(
-            all.subList(all.size() - keepCount, all.size()));
-
-        Path tmp = path.resolveSibling(uuid.toString() + ".tmp");
         synchronized (getLock(uuid)) {
+            Path path = getLogPath(uuid);
+            if (!Files.exists(path)) {
+                return;
+            }
+
+            List<OperationLog> all = readAll(path);
+            if (all.size() <= keepCount) {
+                return;
+            }
+
+            if (keepCount == 0) {
+                Files.deleteIfExists(path);
+                return;
+            }
+
+            List<OperationLog> keep = new ArrayList<>(
+                all.subList(all.size() - keepCount, all.size()));
+            Path tmp = path.resolveSibling(uuid.toString() + ".tmp");
             try (var out = new DataOutputStream(new BufferedOutputStream(
                     Files.newOutputStream(tmp,
                         StandardOpenOption.CREATE,
@@ -298,15 +341,19 @@ public class FileOperationLogManager {
                 }
                 out.flush();
             }
-            // Atomic replace
-            Files.move(tmp, path,
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-        }
+            try {
+                Files.move(tmp, path,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                Files.move(tmp, path,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
 
-        if (logger.isLoggable(Level.FINE)) {
-            logger.fine("[OpLog] Compacted " + uuid + ": kept " + keep.size()
-                + " of " + all.size() + " entries.");
+            if (logger.isLoggable(Level.FINE)) {
+                logger.fine("[OpLog] Compacted " + uuid + ": kept " + keep.size()
+                    + " of " + all.size() + " entries.");
+            }
         }
     }
 
@@ -395,7 +442,9 @@ public class FileOperationLogManager {
         appendExecutor.shutdown();
         try {
             if (!appendExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
-                int remaining = appendExecutor.shutdownNow().size();
+                java.util.List<Runnable> abandoned = appendExecutor.shutdownNow();
+                int remaining = abandoned.size();
+                discardTasks(abandoned);
                 if (remaining > 0) {
                     logger.warning("[OpLog] Forced shutdown of append executor; "
                         + remaining + " pending log entries were discarded.");
@@ -405,7 +454,7 @@ public class FileOperationLogManager {
                 }
             }
         } catch (InterruptedException e) {
-            appendExecutor.shutdownNow();
+            discardTasks(appendExecutor.shutdownNow());
             Thread.currentThread().interrupt();
         }
 

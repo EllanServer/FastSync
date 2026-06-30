@@ -47,6 +47,13 @@ public class SnapshotManager {
     private ThreadPoolExecutor snapshotExecutor;
     private final AtomicLong rejectedSnapshotTasks = new AtomicLong();
     private java.util.concurrent.Semaphore dbWorkSemaphore;
+    /** Last accepted snapshot time per player (also acts as an in-flight reservation). */
+    private final java.util.concurrent.ConcurrentHashMap<UUID, SnapshotReservation> snapshotReservations =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    /** Unique tokens prevent an older failure callback from releasing a newer reservation. */
+    private final AtomicLong snapshotReservationSequence = new AtomicLong();
+
+    private record SnapshotReservation(long token, long createdAtNanos) {}
 
     /** Hard cap on the snapshot work queue. */
     private static final int SNAPSHOT_QUEUE_CAPACITY = 4096;
@@ -149,6 +156,7 @@ public class SnapshotManager {
      * and in-flight tasks to complete. Safe to call multiple times.
      */
     public void close() {
+        snapshotReservations.clear();
         if (snapshotExecutor == null) {
             return;
         }
@@ -179,6 +187,45 @@ public class SnapshotManager {
     /** @return total number of snapshot tasks rejected since startup. */
     public long getRejectedCount() {
         return rejectedSnapshotTasks.get();
+    }
+
+    /**
+     * Reserve a snapshot slot if the configured minimum interval has elapsed.
+     * The atomic map update prevents concurrent save completions from creating
+     * duplicate snapshots for the same player.
+     *
+     * @return unique reservation token, or {@code -1} when rate-limited
+     */
+    public long reserveSnapshot(UUID uuid, long minimumIntervalMs) {
+        long now = System.nanoTime();
+        long interval = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+            Math.max(0L, minimumIntervalMs));
+        long token = snapshotReservationSequence.incrementAndGet();
+        java.util.concurrent.atomic.AtomicBoolean accepted =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+        snapshotReservations.compute(uuid, (ignored, previous) -> {
+            if (previous == null || interval == 0L || now - previous.createdAtNanos() >= interval) {
+                accepted.set(true);
+                return new SnapshotReservation(token, now);
+            }
+            return previous;
+        });
+        return accepted.get() ? token : -1L;
+    }
+
+    /** Release a reservation after asynchronous snapshot creation fails. */
+    public void releaseSnapshotReservation(UUID uuid, long reservationToken) {
+        snapshotReservations.computeIfPresent(uuid, (ignored, current) ->
+            current.token() == reservationToken ? null : current);
+    }
+
+    /** Bound the in-memory rate-limit map by monotonic reservation age. */
+    public void cleanupSnapshotReservations(long maximumAgeMs) {
+        long now = System.nanoTime();
+        long maximumAge = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+            Math.max(0L, maximumAgeMs));
+        snapshotReservations.entrySet().removeIf(
+            entry -> now - entry.getValue().createdAtNanos() >= maximumAge);
     }
 
     /**

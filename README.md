@@ -113,7 +113,7 @@ Redis 只负责协调（通知谁该重试），数据库的 fencing token + ver
 代理插件不是必须的。后端插件可独立运行。安装后获得：
 - `/fastsync status`：代理端聚合查看所有后端健康状态
 - `/fastsync players`：查看所有玩家当前所在子服
-- 玩家切服通知
+- handoff 通知：代理记录切服关系并通知新后端；锁等待与最终放行由后端登录门禁完成
 
 ### 4. 基本配置
 
@@ -121,6 +121,7 @@ Redis 只负责协调（通知谁该重试），数据库的 fencing token + ver
 
 ```yaml
 server-name: "survival-1"    # 每个子服唯一标识
+cluster-id: "survival-main"  # 同一逻辑集群保持一致，不能为空
 
 database:
   host: "mysql.example.com"
@@ -171,7 +172,6 @@ redis:
 | `ssl` | `false` | SSL 加密 |
 | `timeout` | `5000` | 连接超时（ms） |
 | `channel-prefix` | `fastsync:lock:` | Pub/Sub 频道前缀 |
-| `cache-enabled` | `false` | Redis 数据缓存 |
 | `streams-enabled` | `true` | Redis Streams 可靠事件 |
 | `stream-maxlen` | `100000` | Stream 最大条数，0 = 不裁剪 |
 | `stream-trim-approx` | `true` | 近似裁剪（~MAXLEN），性能更好 |
@@ -199,7 +199,6 @@ redis:
 | `heartbeat-interval-seconds` | `10` | 心跳间隔（自动校正 ≤ lock-timeout/3） |
 | `lock-retry-interval-ms` | `300` | 锁重试间隔 |
 | `lock-max-retries` | `15` | 锁最大重试次数 |
-| `save-delay` | `0` | 保存延迟（tick） |
 | `clear-before-apply` | `true` | 应用前清空（防复制） |
 | `periodic-save` | `false` | 周期保存开关 |
 | `periodic-save-interval-seconds` | `300` | 周期保存间隔 |
@@ -244,16 +243,16 @@ redis:
 |--------|--------|------|
 | `enabled` | `true` | 冲突快照开关 |
 | `max-snapshots` | `16` | 每玩家最大快照数 |
-| `backup-frequency-ms` | `14400000` | 定期备份间隔（4 小时） |
+| `backup-frequency-ms` | `14400000` | `save-trigger` 命中后的每玩家最小快照间隔（4 小时；设为 0 不限频） |
 | `save-trigger` | `never` | `never` / `always` / 逗号分隔原因列表 |
 
 ### 集群 (`cluster-id`)
 
 ```yaml
-cluster-id: ""
+cluster-id: "survival-main"
 ```
 
-cluster-id 只隔离 Redis 消息（topic/stream/consumer group），**不隔离数据库行**。非空 cluster-id + 默认 `fastsync_` table-prefix = **拒绝启动**。多集群必须使用不同 table-prefix 或不同 database。
+`cluster-id` 是必填的集群身份：它同时进入数据库复合主键，并隔离 Redis topic、stream 与 consumer group。同一逻辑集群的所有后端必须使用相同值；不同集群可在同一数据库与默认 `fastsync_` table-prefix 下安全共存。
 
 ### 操作日志 (`operation-log:`)
 
@@ -273,9 +272,9 @@ cluster-id 只隔离 Redis 消息（topic/stream/consumer group），**不隔离
 
 | 命令 | 说明 |
 |------|------|
-| `/fastsync reload` | 重载配置（重置心跳任务、保护模式） |
+| `/fastsync reload` | 事务式热重载；心跳/周期保存会重排，DB、cluster、Redis、线程池等启动期参数变化会拒绝并提示重启 |
 | `/fastsync status` | 查看 DB/Redis 状态、在线玩家、pending 数、final-save 队列/fallback 计数、OpLog 状态、HikariCP 池、延迟百分位 |
-| `/fastsync debug` | 开关调试模式 |
+| `/fastsync debug` | 开关本次运行期调试模式（持久化请编辑 config.yml） |
 | `/fastsync saveall` | 强制保存所有在线玩家（Folia 安全两阶段） |
 | `/fastsync log <player> [n]` | 查看玩家操作日志（默认 20 条，最多 50） |
 

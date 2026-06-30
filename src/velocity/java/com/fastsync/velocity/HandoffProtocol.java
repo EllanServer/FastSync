@@ -32,6 +32,29 @@ public final class HandoffProtocol {
 
     private HandoffProtocol() {}
 
+    private static DataInputStream decoder(byte[] data, int expectedType) {
+        if (data == null || data.length == 0) {
+            throw new IllegalArgumentException("Empty handoff message");
+        }
+        DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
+        try {
+            int actualType = in.readUnsignedByte();
+            if (actualType != expectedType) {
+                throw new IllegalArgumentException("Unexpected handoff message type "
+                    + actualType + " (expected " + expectedType + ")");
+            }
+            return in;
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Truncated handoff message", e);
+        }
+    }
+
+    private static void requireEnd(DataInputStream in) throws IOException {
+        if (in.read() != -1) {
+            throw new IllegalArgumentException("Trailing bytes in handoff message");
+        }
+    }
+
     // ==================== QUERY_LOCK ====================
     // [type=1][uuid][newServer]
 
@@ -51,13 +74,13 @@ public final class HandoffProtocol {
 
     public static QueryLockData decodeQueryLock(byte[] data) {
         try {
-            DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
-            in.readByte(); // type
+            DataInputStream in = decoder(data, QUERY_LOCK);
             UUID uuid = UUID.fromString(in.readUTF());
             String newServer = in.readUTF();
+            requireEnd(in);
             return new QueryLockData(uuid, newServer);
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new IllegalArgumentException("Invalid QUERY_LOCK message", e);
         }
     }
 
@@ -83,14 +106,14 @@ public final class HandoffProtocol {
 
     public static LockStatusData decodeLockStatus(byte[] data) {
         try {
-            DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
-            in.readByte(); // type
+            DataInputStream in = decoder(data, LOCK_STATUS);
             UUID uuid = UUID.fromString(in.readUTF());
             boolean locked = in.readBoolean();
             String serverName = in.readUTF();
+            requireEnd(in);
             return new LockStatusData(uuid, locked, serverName);
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new IllegalArgumentException("Invalid LOCK_STATUS message", e);
         }
     }
 
@@ -116,14 +139,14 @@ public final class HandoffProtocol {
 
     public static HandoffNotifyData decodeHandoffNotify(byte[] data) {
         try {
-            DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
-            in.readByte(); // type
+            DataInputStream in = decoder(data, HANDOFF_NOTIFY);
             UUID uuid = UUID.fromString(in.readUTF());
             String oldServer = in.readUTF();
             String newServer = in.readUTF();
+            requireEnd(in);
             return new HandoffNotifyData(uuid, oldServer, newServer);
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new IllegalArgumentException("Invalid HANDOFF_NOTIFY message", e);
         }
     }
 
@@ -154,7 +177,7 @@ public final class HandoffProtocol {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             DataOutputStream out = new DataOutputStream(baos);
             out.writeByte(STATUS_RESPONSE);
-            out.writeUTF(serverName);
+            out.writeUTF(serverName != null ? serverName : "");
             out.writeBoolean(dbHealthy);
             out.writeBoolean(redisHealthy);
             out.writeInt(playerCount);
@@ -169,18 +192,21 @@ public final class HandoffProtocol {
 
     public static StatusResponseData decodeStatusResponse(byte[] data) {
         try {
-            DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
-            in.readByte(); // type
+            DataInputStream in = decoder(data, STATUS_RESPONSE);
             String serverName = in.readUTF();
             boolean dbHealthy = in.readBoolean();
             boolean redisHealthy = in.readBoolean();
             int playerCount = in.readInt();
             int pendingSaves = in.readInt();
             int pendingLoads = in.readInt();
+            if (playerCount < 0 || pendingSaves < 0 || pendingLoads < 0) {
+                throw new IllegalArgumentException("Negative status counter in handoff message");
+            }
+            requireEnd(in);
             return new StatusResponseData(serverName, dbHealthy, redisHealthy,
                 playerCount, pendingSaves, pendingLoads);
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new IllegalArgumentException("Invalid STATUS_RESPONSE message", e);
         }
     }
 

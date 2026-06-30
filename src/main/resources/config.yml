@@ -28,11 +28,9 @@ cluster-id: "survival-main"
 # ------------------------------------------------------------
 # When enabled, enforces strict safety checks:
 # - require-redis: Redis must be enabled and healthy (no DB polling fallback)
-# - require-cluster-id: cluster-id must be non-empty
 production:
   enabled: false
   require-redis: true
-  require-cluster-id: true
 
 # ------------------------------------------------------------
 # Final-Save Executor
@@ -43,7 +41,6 @@ production:
 final-save:
   threads: 4
   queue-capacity: 1024
-  shutdown-timeout-seconds: 60
   # false: queue full → spool to disk for replay (safe, no tick blocking)
   # true: queue full → synchronous fallback on event thread (blocks tick, risky)
   allow-sync-fallback: false
@@ -137,9 +134,6 @@ redis:
   # Channel prefix for pub/sub messages
   channel-prefix: "fastsync:lock:"
 
-  # Whether to use Redis for data caching (reduces DB load for frequent reads)
-  cache-enabled: false
-
   # Redis Streams for critical, recoverable event delivery.
   # Unlike Pub/Sub (fire-and-forget), Streams persist events so they survive
   # consumer crashes and can be recovered via XAUTOCLAIM.
@@ -186,12 +180,10 @@ sync:
   # Round 16 (P1 #5): defaults tightened from 1000ms x 30 (30s worst-case
   # login wait) to 300ms x 15 (4.5s worst-case). A 30s pre-login block on
   # every retry slot causes severe UX under login storms and DB hiccups.
-  # Velocity handoff path is faster and does not wait the full window.
+  # Redis release notifications usually wake the backend gate before the
+  # bounded DB-polling fallback window is exhausted.
   lock-retry-interval-ms: 300
   lock-max-retries: 15
-
-  # Save delay on quit in ticks (0 = immediate, 20 = 1 second delay)
-  save-delay: 0
 
   # Whether to clear inventory before applying synced data (prevents item duplication)
   clear-before-apply: true
@@ -359,7 +351,8 @@ snapshot:
   # Maximum number of snapshots to keep per player (oldest non-pinned are deleted)
   max-snapshots: 16
 
-  # Minimum time between snapshot creation in milliseconds (default: 4 hours)
+  # Per-player minimum interval between snapshots whose save-trigger matched
+  # (default: 4 hours). Set to 0 to disable rate limiting.
   backup-frequency-ms: 14400000
 
   # When to create a snapshot on a successful save.

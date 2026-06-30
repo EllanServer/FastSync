@@ -17,13 +17,6 @@ public class ProxyConfig {
     private final Path dataDirectory;
     private final Logger logger;
 
-    // Smart handoff
-    private boolean smartHandoffEnabled = true;
-    private long waitTimeoutMs = 5000;
-    private long pollIntervalMs = 500;
-    private String waitingMessage = "&e[FastSync] Waiting for your data to be saved...";
-    private String timeoutMessage = "&c[FastSync] Data save timed out, transferring anyway.";
-
     // Status
     private long statusQueryTimeoutMs = 3000;
 
@@ -62,15 +55,6 @@ public class ProxyConfig {
 
             if (root == null) return;
 
-            Map<String, Object> handoff = getMap(root, "smart-handoff");
-            if (handoff != null) {
-                smartHandoffEnabled = getBool(handoff, "enabled", true);
-                waitTimeoutMs = getLong(handoff, "wait-timeout-ms", 5000);
-                pollIntervalMs = getLong(handoff, "poll-interval-ms", 500);
-                waitingMessage = getString(handoff, "waiting-message", waitingMessage);
-                timeoutMessage = getString(handoff, "timeout-message", timeoutMessage);
-            }
-
             Map<String, Object> status = getMap(root, "status");
             if (status != null) {
                 statusQueryTimeoutMs = getLong(status, "query-timeout-ms", 3000);
@@ -78,11 +62,22 @@ public class ProxyConfig {
 
             debug = getBool(root, "debug", false);
 
-            logger.info("Proxy config loaded: smart-handoff={}, wait-timeout={}ms, debug={}",
-                smartHandoffEnabled, waitTimeoutMs, debug);
+            validateRanges();
+
+            logger.info("Proxy config loaded: status-timeout={}ms, debug={}",
+                statusQueryTimeoutMs, debug);
 
         } catch (Exception e) {
             logger.warn("Failed to load proxy-config.yml, using defaults", e);
+        }
+    }
+
+    /** Keep the status-query scheduler delay bounded. */
+    void validateRanges() {
+        long configuredStatus = statusQueryTimeoutMs;
+        statusQueryTimeoutMs = Math.max(100L, Math.min(statusQueryTimeoutMs, 60_000L));
+        if (statusQueryTimeoutMs != configuredStatus) {
+            logger.warn("status.query-timeout-ms must be 100-60000; using {}", statusQueryTimeoutMs);
         }
     }
 
@@ -103,17 +98,8 @@ public class ProxyConfig {
         return def;
     }
 
-    private String getString(Map<String, Object> map, String key, String def) {
-        Object val = map.get(key);
-        return val instanceof String ? (String) val : def;
-    }
-
     // Getters
-    public boolean isSmartHandoffEnabled() { return smartHandoffEnabled; }
-    public long getWaitTimeoutMs() { return waitTimeoutMs; }
-    public long getPollIntervalMs() { return pollIntervalMs; }
-    public String getWaitingMessage() { return waitingMessage; }
-    public String getTimeoutMessage() { return timeoutMessage; }
     public long getStatusQueryTimeoutMs() { return statusQueryTimeoutMs; }
     public boolean isDebug() { return debug; }
+    public void setDebug(boolean debug) { this.debug = debug; }
 }

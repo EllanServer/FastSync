@@ -41,9 +41,4 @@ proxy:
   # ==================== /fastsync debug ====================
   debug:
     state: "<yellow>Debug mode: {0}"
-    hint: "<gray>(Edit proxy-config.yml and run /fastsync reload to change)"
-
-  # ==================== Handoff messages ====================
-  handoff:
-    waiting: "<yellow>[FastSync] Waiting for your data to be saved..."
-    timeout: "<red>[FastSync] Data save timed out, transferring anyway."
+    hint: "<gray>(Runtime only; edit proxy-config.yml to persist across restarts)"

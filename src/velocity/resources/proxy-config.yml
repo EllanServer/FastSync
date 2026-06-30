@@ -6,30 +6,6 @@
 # ============================================================
 
 # ------------------------------------------------------------
-# Smart Handoff Settings
-# ------------------------------------------------------------
-# When a player switches servers, the proxy asks the old backend
-# if it has finished saving the player's data. If not, the proxy
-# delays the transfer until the save completes or the timeout fires.
-smart-handoff:
-  # Enable smart handoff coordination
-  enabled: true
-
-  # Maximum time (ms) to wait for the old server to release the lock
-  # before allowing the transfer anyway (assume stale lock)
-  wait-timeout-ms: 5000
-
-  # Polling interval (ms) for re-checking lock status
-  poll-interval-ms: 500
-
-  # Message shown to the player while waiting for data save to complete
-  # (set to empty string to show no message)
-  waiting-message: "&e[FastSync] Waiting for your data to be saved..."
-
-  # Message shown when the wait times out
-  timeout-message: "&c[FastSync] Data save timed out, transferring anyway."
-
-# ------------------------------------------------------------
 # Status Aggregation Settings
 # ------------------------------------------------------------
 # The proxy can query all backend servers for their FastSync status
